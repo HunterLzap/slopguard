@@ -92,6 +92,23 @@ func copyFixtureInto(t *testing.T, name, dst string) {
 	if err := copyDir(src, dst); err != nil {
 		t.Fatalf("copy fixture %s: %v", name, err)
 	}
+	// .gitignore ignores runtime .slopguard directories, so the YAML fixture
+	// keeps its adapter in a visible adapters/ folder and materializes the
+	// project-local runtime layout only inside the temp fixture.
+	if name == "yaml-repo" {
+		adapterSrc := filepath.Join(dst, "adapters", "go.yaml")
+		adapterDst := filepath.Join(dst, ".slopguard", "adapters", "go.yaml")
+		data, err := os.ReadFile(adapterSrc)
+		if err != nil {
+			t.Fatalf("read yaml fixture adapter: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(adapterDst), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(adapterDst, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func copyDir(src, dst string) error {
@@ -458,8 +475,8 @@ func TestIncrementalVerifyGitRepo(t *testing.T) {
 	if res.Elapsed >= 3*time.Second {
 		t.Fatalf("incremental verify took %s, want < 3s", res.Elapsed)
 	}
-	if int64(result.Duration) >= 3000 {
-		t.Fatalf("reported duration = %d, want < 3000ms", int64(result.Duration))
+	if result.DurationMs >= 3000 {
+		t.Fatalf("reported duration = %d, want < 3000ms", result.DurationMs)
 	}
 	args, err := os.ReadFile(argsLog)
 	if err != nil {

@@ -335,3 +335,118 @@ func TestVerifyUnexpectedArgs(t *testing.T) {
 		t.Fatalf("code = %d, want 2", code)
 	}
 }
+
+func TestVerifyRecordWarningDoesNotChangeExitCode(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "src", "a.ts"), "const x = 1\n")
+	eng := &fakeEngine{listFiles: []string{"src/a.ts"}}
+	recorder := &fakeRecorder{err: errors.New("read-only database")}
+	withDependencies(t, dependencies{
+		engine:   eng,
+		adapters: &fakeAdapters{detected: []contract.Adapter{verifyAdapter()}},
+		recorder: recorder,
+	})
+	var stdout, stderr bytes.Buffer
+	code := runVerifyWith(verifyOptions{root: root, all: true, record: true}, &stdout, &stderr)
+	if code != ExitOK {
+		t.Fatalf("code = %d, want 0; stderr = %s", code, stderr.String())
+	}
+	if recorder.calls != 1 {
+		t.Fatalf("recorder calls = %d, want 1", recorder.calls)
+	}
+	if !strings.Contains(stderr.String(), "warning: record scan failed") {
+		t.Fatalf("stderr = %q, want non-blocking warning", stderr.String())
+	}
+}
+
+func TestVerifyRecordNotCalledWithoutFlag(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "src", "a.ts"), "const x = 1\n")
+	recorder := &fakeRecorder{}
+	withDependencies(t, dependencies{
+		engine:   &fakeEngine{listFiles: []string{"src/a.ts"}},
+		adapters: &fakeAdapters{detected: []contract.Adapter{verifyAdapter()}},
+		recorder: recorder,
+	})
+	var stdout, stderr bytes.Buffer
+	if code := runVerifyWith(verifyOptions{root: root, all: true}, &stdout, &stderr); code != ExitOK {
+		t.Fatalf("code = %d", code)
+	}
+	if recorder.calls != 0 {
+		t.Fatalf("recorder calls = %d, want 0", recorder.calls)
+	}
+}
+
+type fakeBaselineStateEngine struct {
+	*fakeEngine
+	state baselineState
+	err   error
+}
+
+func (f *fakeBaselineStateEngine) LoadBaselineState(string) (baselineState, error) {
+	return f.state, f.err
+}
+
+func TestVerifySuppressesBaselineFiles(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "src", "a.ts"), "const x = 1\n")
+	writeFile(t, filepath.Join(root, "src", "generated.ts"), "// @ts-ignore\n")
+	adp := &stubAdapter{
+		name:    "typescript",
+		exts:    []string{".ts"},
+		escapes: []contract.EscapePattern{{Name: "ts_ignore", Regex: `@ts-ignore`}},
+	}
+	engine := &fakeBaselineStateEngine{
+		fakeEngine: &fakeEngine{listFiles: []string{"src/a.ts", "src/generated.ts"}, escapes: map[string]int{"ts_ignore": 0}},
+		state: baselineState{
+			Metrics:         map[string]int{"ts_ignore": 0},
+			IsSuppressed:    func(file string) bool { return file == "src/generated.ts" },
+			HasSuppressions: true,
+		},
+	}
+	withDependencies(t, dependencies{engine: engine, adapters: &fakeAdapters{detected: []contract.Adapter{adp}}})
+	var stdout, stderr bytes.Buffer
+	code := runVerifyWith(verifyOptions{root: root, all: true, json: true}, &stdout, &stderr)
+	if code != ExitOK {
+		t.Fatalf("code = %d, stderr = %s", code, stderr.String())
+	}
+	var result contract.VerifyResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Suppressed != 1 {
+		t.Fatalf("suppressed = %d, want 1", result.Suppressed)
+	}
+	if result.Escapes["ts_ignore"] != 0 {
+		t.Fatalf("escapes = %v", result.Escapes)
+	}
+}
+
+func TestVerifySkippedDetails(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "src", "a.ts"), "const x = 1\n")
+	eng := &fakeEngine{listFiles: []string{"src/a.ts"}}
+	adp := &fakeAdapters{
+		detected: []contract.Adapter{verifyAdapter()},
+		plan: checkPlan{
+			Runnable: []contract.Check{{ID: "fake-check", Cmd: []string{"fake"}}},
+			Skipped:  []string{"knip"},
+			SkippedDetails: []contract.SkippedDetail{
+				{ID: "knip", Tool: "knip", Reason: "npm install -D knip"},
+			},
+		},
+	}
+	withDeps(t, eng, adp)
+	var stdout, stderr bytes.Buffer
+	code := runVerifyWith(verifyOptions{root: root, all: true, json: true}, &stdout, &stderr)
+	if code != ExitOK {
+		t.Fatalf("code = %d, stderr = %s", code, stderr.String())
+	}
+	var result contract.VerifyResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.SkippedDetails) != 1 || result.SkippedDetails[0].Tool != "knip" || !strings.Contains(result.SkippedDetails[0].Reason, "npm install") {
+		t.Fatalf("skipped details = %+v", result.SkippedDetails)
+	}
+}

@@ -38,6 +38,10 @@ func Execute(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runInit(args[1:], stdin, stdout, stderr)
 	case "verify":
 		return runVerify(args[1:], stdout, stderr)
+	case "baseline":
+		return runBaseline(args[1:], stdin, stdout, stderr)
+	case "radar":
+		return runRadar(args[1:], stdout, stderr)
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return ExitOK
@@ -52,8 +56,10 @@ func printUsage(w io.Writer) {
 	fmt.Fprint(w, `SlopGuard - deterministic AI code-quality guardrails
 
 Usage:
-  slopguard init   [--yes] [--root DIR]
-  slopguard verify [--all] [--json] [--jobs N] [--root DIR]
+  slopguard init     [--yes] [--root DIR]
+  slopguard verify   [--all] [--json] [--jobs N] [--record] [--root DIR]
+  slopguard baseline [--tighten | --reset] [--yes] [--root DIR]
+  slopguard radar    [--top N] [--json] [--root DIR]
 
 Exit codes:
   0  checks passed

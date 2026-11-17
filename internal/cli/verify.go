@@ -18,10 +18,11 @@ import (
 )
 
 type verifyOptions struct {
-	root string
-	all  bool
-	json bool
-	jobs int
+	root   string
+	all    bool
+	json   bool
+	jobs   int
+	record bool
 }
 
 func runVerify(args []string, stdout, stderr io.Writer) int {
@@ -30,6 +31,7 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 	all := fs.Bool("all", false, "scan all project files instead of only git-changed files")
 	jsonOut := fs.Bool("json", false, "emit a structured contract.VerifyResult as JSON")
 	jobs := fs.Int("jobs", 0, "maximum concurrent checks (default: config value or 2)")
+	record := fs.Bool("record", false, "record a scan_runs row after a passing verify")
 	rootFlag := fs.String("root", ".", "project root directory")
 	help, err := parseFlags(fs, args)
 	if err != nil {
@@ -54,10 +56,11 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 	}
 
 	return runVerifyWith(verifyOptions{
-		root: root,
-		all:  *all,
-		json: *jsonOut,
-		jobs: *jobs,
+		root:   root,
+		all:    *all,
+		json:   *jsonOut,
+		jobs:   *jobs,
+		record: *record,
 	}, stdout, stderr)
 }
 
@@ -111,7 +114,7 @@ func runVerifyWith(opts verifyOptions, stdout, stderr io.Writer) int {
 		}
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := newCommandContext(deps.engine)
 	defer stop()
 
 	extensions := collectExtensions(adapters)
@@ -235,9 +238,14 @@ func runVerifyWith(opts verifyOptions, stdout, stderr io.Writer) int {
 		Escapes:        escapes,
 		Baseline:       baseline.Metrics,
 		Suppressed:     countUniqueFiles(suppressedFromChecks, suppressedFromEscapes),
-		Duration:       time.Duration(time.Since(started).Milliseconds()),
+		DurationMs:     time.Since(started).Milliseconds(),
 		Skipped:        skippedIDs,
 		SkippedDetails: skippedDetails,
+	}
+	if result.Passed && opts.record && deps.recorder != nil {
+		if err := deps.recorder.RecordScan(ctx, opts.root, result.DurationMs, sumEscapes(result.Escapes), true); err != nil {
+			fmt.Fprintf(stderr, "slopguard: warning: record scan failed: %v\n", err)
+		}
 	}
 	writeResult(stdout, opts.json, result)
 	if result.Passed {
@@ -248,10 +256,10 @@ func runVerifyWith(opts verifyOptions, stdout, stderr io.Writer) int {
 
 func emptyResult(started time.Time) contract.VerifyResult {
 	return contract.VerifyResult{
-		Passed:   true,
-		Findings: []contract.Finding{},
-		Escapes:  map[string]int{},
-		Duration: time.Duration(time.Since(started).Milliseconds()),
+		Passed:     true,
+		Findings:   []contract.Finding{},
+		Escapes:    map[string]int{},
+		DurationMs: time.Since(started).Milliseconds(),
 	}
 }
 
@@ -266,6 +274,15 @@ func loadBaselineForVerify(engine engineClient, path string) (baselineState, err
 		return baselineState{}, err
 	}
 	return baselineState{Metrics: metrics}, nil
+}
+
+// newCommandContext prefers the engine's signal-aware context (Ctrl+C and
+// SIGTERM) and falls back to os.Interrupt for simple test doubles.
+func newCommandContext(engine engineClient) (context.Context, context.CancelFunc) {
+	if provider, ok := engine.(signalContextProvider); ok {
+		return provider.SignalContext(context.Background())
+	}
+	return signal.NotifyContext(context.Background(), os.Interrupt)
 }
 
 func writeResult(w io.Writer, asJSON bool, result contract.VerifyResult) {
@@ -319,7 +336,7 @@ func printHumanResult(w io.Writer, result contract.VerifyResult) {
 		status = "FAIL"
 	}
 	fmt.Fprintf(w, "slopguard verify: %s (%d findings, %dms)\n",
-		status, len(result.Findings), int64(result.Duration))
+		status, len(result.Findings), result.DurationMs)
 }
 
 func firstNonEmptyLine(values ...string) string {
@@ -389,6 +406,14 @@ func countUniqueFiles(groups ...[]string) int {
 		}
 	}
 	return len(seen)
+}
+
+func sumEscapes(escapes map[string]int) int {
+	total := 0
+	for _, count := range escapes {
+		total += count
+	}
+	return total
 }
 
 func collectExtensions(adapters []contract.Adapter) []string {

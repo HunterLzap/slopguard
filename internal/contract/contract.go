@@ -112,8 +112,9 @@ type VerifyResult struct {
 	// Baseline 是基线里对应指标的上限（无基线项省略）。
 	Baseline map[string]int `json:"baseline,omitempty"`
 	// Suppressed 是被 baseline.suppressed_files 过滤掉的文件数。
-	Suppressed int           `json:"suppressed,omitempty"`
-	Duration   time.Duration `json:"duration_ms"`
+	Suppressed int `json:"suppressed,omitempty"`
+	// DurationMs 是本次 verify 的实际耗时（毫秒）。
+	DurationMs int64 `json:"duration_ms"`
 	// Skipped 保留为检查 ID 数组，兼容既有消费者。
 	Skipped []string `json:"skipped,omitempty"`
 	// SkippedDetails 提供跳过检查的工具与原因（Phase 1 新增）。

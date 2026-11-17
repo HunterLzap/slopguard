@@ -61,6 +61,12 @@ type baselineProvider interface {
 	LoadBaselineState(path string) (baselineState, error)
 }
 
+// signalContextProvider is an optional engine capability for graceful
+// Ctrl+C/SIGTERM cancellation.
+type signalContextProvider interface {
+	SignalContext(parent context.Context) (context.Context, context.CancelFunc)
+}
+
 // checkPlan is the result of probing tool availability before execution.
 type checkPlan struct {
 	Runnable       []contract.Check
@@ -80,9 +86,44 @@ type adapterProvider interface {
 	ParseFindings(a contract.Adapter, checkID string, result contract.RunResult) []contract.Finding
 }
 
+// radarHotspot is the CLI-facing view of one radar hotspot.
+type radarHotspot struct {
+	File       string `json:"file"`
+	RiskScore  int    `json:"risk_score"`
+	References int    `json:"references"`
+	Complexity int    `json:"complexity"`
+	Escapes    int    `json:"escapes"`
+	Rework     int    `json:"rework"`
+	DeadCode   bool   `json:"dead_code"`
+	Duplicate  bool   `json:"duplicate"`
+}
+
+type radarSkipped struct {
+	Dimension string `json:"dimension"`
+	Tool      string `json:"tool,omitempty"`
+	Reason    string `json:"reason"`
+}
+
+type radarResult struct {
+	Hotspots []radarHotspot `json:"hotspots"`
+	Skipped  []radarSkipped `json:"skipped,omitempty"`
+}
+
+// radarProvider is the narrow port the CLI needs from the radar package.
+type radarProvider interface {
+	Scan(ctx context.Context, root string, top int) (radarResult, error)
+}
+
+// scanRecorder records a completed verify run into the global store.
+type scanRecorder interface {
+	RecordScan(ctx context.Context, projectPath string, durationMs int64, escapes int, passed bool) error
+}
+
 type dependencies struct {
 	engine   engineClient
 	adapters adapterProvider
+	radar    radarProvider
+	recorder scanRecorder
 }
 
 // newDependencies is replaced in wire.go with the production wiring. Tests can

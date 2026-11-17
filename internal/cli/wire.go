@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,8 @@ import (
 	"github.com/HunterLzap/slopguard/internal/adapter"
 	"github.com/HunterLzap/slopguard/internal/contract"
 	"github.com/HunterLzap/slopguard/internal/engine"
+	"github.com/HunterLzap/slopguard/internal/radar"
+	"github.com/HunterLzap/slopguard/internal/store"
 )
 
 // defaultDependencies wires the CLI to the production engine and adapter
@@ -20,6 +23,8 @@ func defaultDependencies() (dependencies, error) {
 	return dependencies{
 		engine:   productionEngine{runner: runner},
 		adapters: productionAdapters{runner: runner},
+		radar:    productionRadar{runner: runner},
+		recorder: productionRecorder{},
 	}, nil
 }
 
@@ -39,6 +44,10 @@ func (p productionEngine) ListFiles(root string, extensions []string) ([]string,
 	return engine.ListFiles(root, extensions)
 }
 
+func (p productionEngine) SignalContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return engine.SignalContext(parent)
+}
+
 func (p productionEngine) RunChecks(ctx context.Context, root string, jobs int, tasks []checkTask) ([]checkOutcome, error) {
 	if len(tasks) == 0 {
 		return nil, nil
@@ -47,7 +56,7 @@ func (p productionEngine) RunChecks(ctx context.Context, root string, jobs int, 
 	for i, task := range tasks {
 		checks[i] = task.Check
 	}
-	results := engine.RunChecks(ctx, p.runner, root, checks, jobs)
+	results := engine.RunChecksConcurrent(ctx, p.runner, root, checks, jobs)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -101,6 +110,54 @@ func (p productionEngine) Ratchet(escapes, baseline map[string]int) []contract.F
 	return findings
 }
 
+func (p productionEngine) LoadBaselineDocument(path string) (baselineDocument, error) {
+	baseline, err := engine.LoadBaseline(path)
+	if err != nil {
+		return baselineDocument{}, err
+	}
+	return baselineDocumentFromEngine(baseline), nil
+}
+
+func (p productionEngine) TightenBaseline(path string, current map[string]int) (baselineDocument, error) {
+	baseline, err := engine.LoadBaseline(path)
+	if err != nil {
+		return baselineDocument{}, err
+	}
+	baseline.Tighten(current, time.Now())
+	return baselineDocumentFromEngine(baseline), nil
+}
+
+func (p productionEngine) ResetBaseline(path string, current map[string]int) (baselineDocument, error) {
+	baseline, err := engine.LoadBaseline(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			baseline = engine.NewBaseline(time.Now())
+		} else {
+			return baselineDocument{}, err
+		}
+	}
+	baseline.Reset(current, time.Now())
+	return baselineDocumentFromEngine(baseline), nil
+}
+
+func (p productionEngine) SaveBaselineDocument(path string, doc baselineDocument) error {
+	return engine.SaveBaseline(path, &engine.Baseline{
+		Version:         doc.Version,
+		UpdatedAt:       doc.UpdatedAt,
+		Metrics:         doc.Metrics,
+		SuppressedFiles: doc.SuppressedFiles,
+	})
+}
+
+func baselineDocumentFromEngine(baseline *engine.Baseline) baselineDocument {
+	return baselineDocument{
+		Version:         baseline.Version,
+		UpdatedAt:       baseline.UpdatedAt,
+		Metrics:         baseline.Metrics,
+		SuppressedFiles: baseline.SuppressedFiles,
+	}
+}
+
 type productionAdapters struct {
 	runner contract.Runner
 }
@@ -151,4 +208,59 @@ func (p productionAdapters) PlanChecks(root string, checks []contract.Check) (ch
 
 func (p productionAdapters) ParseFindings(a contract.Adapter, checkID string, result contract.RunResult) []contract.Finding {
 	return adapter.ParseFindings(a, checkID, result)
+}
+
+type productionRadar struct {
+	runner contract.Runner
+}
+
+func (p productionRadar) Scan(ctx context.Context, root string, top int) (radarResult, error) {
+	report, err := radar.ScanReport(ctx, radar.Options{
+		Root:   root,
+		Top:    top,
+		Runner: p.runner,
+	})
+	if err != nil {
+		return radarResult{}, err
+	}
+	out := radarResult{
+		Hotspots: make([]radarHotspot, 0, len(report.Hotspots)),
+		Skipped:  make([]radarSkipped, 0, len(report.Skipped)),
+	}
+	for _, hotspot := range report.Hotspots {
+		out.Hotspots = append(out.Hotspots, radarHotspot{
+			File:       hotspot.File,
+			RiskScore:  hotspot.RiskScore,
+			References: hotspot.References,
+			Complexity: hotspot.Complexity,
+			Escapes:    hotspot.Escapes,
+			Rework:     hotspot.Rework,
+			DeadCode:   hotspot.DeadCode,
+			Duplicate:  hotspot.Duplicate,
+		})
+	}
+	for _, skipped := range report.Skipped {
+		out.Skipped = append(out.Skipped, radarSkipped{
+			Dimension: skipped.Dimension,
+			Tool:      skipped.Tool,
+			Reason:    skipped.Reason,
+		})
+	}
+	return out, nil
+}
+
+// productionRecorder writes a passing verify run into the global SQLite store.
+// Open/record failures are returned to the caller, which treats them as a
+// non-blocking warning.
+type productionRecorder struct{}
+
+func (productionRecorder) RecordScan(ctx context.Context, projectPath string, durationMs int64, escapes int, passed bool) error {
+	db, err := store.OpenDefault()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	recordCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	return db.RecordScan(recordCtx, projectPath, durationMs, escapes, passed)
 }

@@ -7,7 +7,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -113,6 +115,126 @@ func (g *Git) ChangedFiles(ctx context.Context) ([]string, error) {
 	}
 
 	return existingFiles(g.dir, set), nil
+}
+
+// HotfixFiles 统计最近 days 天内 message 含 fix/bug/hotfix 等关键词的提交
+// 触及的文件次数。days <= 0 时默认 30 天。返回的 key 是相对仓库根目录、
+// 使用正斜杠（filepath.ToSlash）的文件路径，便于 radar 与 Hotspot.File 对齐。
+func (g *Git) HotfixFiles(ctx context.Context, days int) (map[string]int, error) {
+	if days <= 0 {
+		days = 30
+	}
+	counts := map[string]int{}
+	if g == nil || !g.hasHEAD(ctx) {
+		return counts, nil
+	}
+	out, err := g.output(ctx, "log",
+		fmt.Sprintf("--since=%d.days", days),
+		"--name-only",
+		"--pretty=format:%H%x09%s",
+	)
+	if err != nil {
+		return nil, err
+	}
+	return parseHotfixLog(out), nil
+}
+
+// parseHotfixLog 解析 git log --name-only 输出。兼容普通换行格式与 -z 的
+// NUL 分隔格式，保证不同调用方/测试桩都能正确处理文件名。
+func parseHotfixLog(out string) map[string]int {
+	counts := map[string]int{}
+	if strings.Contains(out, "\x00") {
+		for _, token := range strings.Split(out, "\x00") {
+			if token == "" {
+				continue
+			}
+			lines := strings.Split(strings.ReplaceAll(token, "\r\n", "\n"), "\n")
+			if len(lines) == 0 {
+				continue
+			}
+			hash, subject, ok := splitLogHeader(strings.TrimRight(lines[0], "\r"))
+			if !ok || !isHexHash(hash) || !fixCommitPattern.MatchString(subject) {
+				continue
+			}
+			seen := map[string]struct{}{}
+			for _, line := range lines[1:] {
+				file := normalizeGitPath(line)
+				if file == "" || file == "." {
+					continue
+				}
+				if _, ok := seen[file]; ok {
+					continue
+				}
+				seen[file] = struct{}{}
+				counts[file]++
+			}
+		}
+		return counts
+	}
+
+	currentFix := false
+	seenThisCommit := map[string]struct{}{}
+	for _, rawLine := range strings.Split(out, "\n") {
+		line := strings.TrimRight(rawLine, "\r")
+		if line == "" {
+			continue
+		}
+		if hash, subject, ok := splitLogHeader(line); ok && isHexHash(hash) {
+			currentFix = fixCommitPattern.MatchString(subject)
+			seenThisCommit = map[string]struct{}{}
+			continue
+		}
+		if !currentFix {
+			continue
+		}
+		file := normalizeGitPath(line)
+		if file == "" || file == "." {
+			continue
+		}
+		if _, ok := seenThisCommit[file]; ok {
+			continue
+		}
+		seenThisCommit[file] = struct{}{}
+		counts[file]++
+	}
+	return counts
+}
+
+// normalizeGitPath 去除 git 对非 ASCII/特殊文件名添加的 C 风格引号。
+func normalizeGitPath(value string) string {
+	value = strings.TrimSpace(strings.TrimRight(value, "\r"))
+	if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+		if unquoted, err := strconv.Unquote(value); err == nil {
+			value = unquoted
+		}
+	}
+	return filepath.ToSlash(filepath.Clean(value))
+}
+
+var fixCommitPattern = regexp.MustCompile(`(?i)(^|[^a-z0-9])(fix|fixes|fixed|bug|bugs|bugfix|hotfix|hotfixes)([^a-z0-9]|$)`)
+
+func splitLogHeader(line string) (hash, subject string, ok bool) {
+	index := strings.IndexByte(line, '\t')
+	if index < 0 {
+		return "", "", false
+	}
+	return line[:index], line[index+1:], true
+}
+
+func isHexHash(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	for _, r := range value {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'f':
+		case r >= 'A' && r <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // ListFiles 遍历 projectRoot 返回全部匹配扩展名的文件（相对路径，已排序）。

@@ -128,11 +128,37 @@ func (s *stubAdapter) ParseOutput(checkID, output string) []contract.Finding {
 
 func withDeps(t *testing.T, eng engineClient, adp adapterProvider) {
 	t.Helper()
+	withDependencies(t, dependencies{engine: eng, adapters: adp})
+}
+
+func withDependencies(t *testing.T, deps dependencies) {
+	t.Helper()
 	old := newDependencies
-	newDependencies = func() (dependencies, error) {
-		return dependencies{engine: eng, adapters: adp}, nil
-	}
+	newDependencies = func() (dependencies, error) { return deps, nil }
 	t.Cleanup(func() { newDependencies = old })
+}
+
+type fakeRecorder struct {
+	calls int
+	err   error
+}
+
+func (f *fakeRecorder) RecordScan(context.Context, string, int64, int, bool) error {
+	f.calls++
+	return f.err
+}
+
+type fakeRadar struct {
+	result   radarResult
+	err      error
+	lastRoot string
+	lastTop  int
+}
+
+func (f *fakeRadar) Scan(_ context.Context, root string, top int) (radarResult, error) {
+	f.lastRoot = root
+	f.lastTop = top
+	return f.result, f.err
 }
 
 func writeFile(t *testing.T, path, content string) {

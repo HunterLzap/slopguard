@@ -277,6 +277,7 @@ var installHints = map[string]string{
 	"ruff":          "pip install ruff（或 uv add --dev ruff）",
 	"pyright":       "pip install pyright（或 npm install -D pyright）",
 	"semgrep":       "pip install semgrep",
+	"vulture":       "pip install vulture",
 	"golangci-lint": "brew install golangci-lint（或参考官方安装文档）",
 }
 

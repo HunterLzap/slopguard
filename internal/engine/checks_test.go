@@ -2,7 +2,9 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -65,6 +67,55 @@ func TestRunChecksNilRunner(t *testing.T) {
 func TestRunChecksEmpty(t *testing.T) {
 	if results := RunChecks(context.Background(), &stubRunner{}, ".", nil, 2); len(results) != 0 {
 		t.Fatalf("len(results) = %d", len(results))
+	}
+	if results := RunChecksConcurrent(context.Background(), &stubRunner{}, ".", nil, 2); len(results) != 0 {
+		t.Fatalf("concurrent len(results) = %d", len(results))
+	}
+}
+
+func TestRunChecksConcurrentOrderAndLimit(t *testing.T) {
+	const total = 6
+	var active, maxSeen int32
+	runner := &stubRunner{runFn: func(contract.RunSpec) contract.RunResult {
+		current := atomic.AddInt32(&active, 1)
+		for {
+			observed := atomic.LoadInt32(&maxSeen)
+			if current <= observed || atomic.CompareAndSwapInt32(&maxSeen, observed, current) {
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+		atomic.AddInt32(&active, -1)
+		return contract.RunResult{ExitCode: 0}
+	}}
+	checks := make([]contract.Check, total)
+	for i := range checks {
+		checks[i] = contract.Check{ID: fmt.Sprintf("check-%d", i), Cmd: []string{"tool"}}
+	}
+	results := RunChecksConcurrent(context.Background(), runner, ".", checks, 2)
+	if len(results) != total {
+		t.Fatalf("len(results) = %d", len(results))
+	}
+	for i := range results {
+		if results[i].Check.ID != checks[i].ID {
+			t.Fatalf("results[%d].Check.ID = %q, want %q", i, results[i].Check.ID, checks[i].ID)
+		}
+	}
+	if got := atomic.LoadInt32(&maxSeen); got > 2 {
+		t.Fatalf("max concurrency = %d, want <= 2", got)
+	}
+}
+
+func TestRunChecksConcurrentErrors(t *testing.T) {
+	results := RunChecksConcurrent(context.Background(), nil, ".", []contract.Check{
+		{ID: "empty"},
+		{ID: "runner", Cmd: []string{"tool"}},
+	}, 2)
+	if results[0].Result.Err == nil || !strings.Contains(results[0].Result.Err.Error(), "empty command") {
+		t.Fatalf("empty cmd result = %+v", results[0].Result)
+	}
+	if results[1].Result.Err == nil || !strings.Contains(results[1].Result.Err.Error(), "nil runner") {
+		t.Fatalf("nil runner result = %+v", results[1].Result)
 	}
 }
 

@@ -1,5 +1,5 @@
-// Package store 预留 SlopGuard 全局持久化层（SQLite）。
+// Package store 实现 SlopGuard 全局持久化层（SQLite，纯 Go）。
 //
-// 按实施路线图，Phase 1 不实现存储；Phase 2 才会引入 modernc.org/sqlite
-// 并实现 contract.Store。本文件仅占位以固定目录结构。
+// 使用 modernc.org/sqlite 以保持零 CGO；数据库默认位于
+// ~/.slopguard/slopguard.db，打开时自动完成 schema 迁移并开启 WAL。
 package store

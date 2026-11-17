@@ -239,3 +239,67 @@ func TestListFilesErrors(t *testing.T) {
 		t.Fatal("expected error for non-directory root")
 	}
 }
+
+func TestParseHotfixLog(t *testing.T) {
+	hash1 := strings.Repeat("a", 40)
+	hash2 := strings.Repeat("b", 40)
+	hash3 := strings.Repeat("c", 40)
+	out := hash1 + "\tFix bug\r\nsrc/a.ts\r\nsrc/b.ts\r\n" +
+		hash2 + "\tfeature work\r\nsrc/c.ts\r\n" +
+		hash3 + "\tHotfix: crash\r\nsrc/a.ts\r\n"
+	counts := parseHotfixLog(out)
+	if counts["src/a.ts"] != 2 || counts["src/b.ts"] != 1 {
+		t.Fatalf("counts = %v, want a=2 b=1", counts)
+	}
+	if _, exists := counts["src/c.ts"]; exists {
+		t.Fatalf("non-fix commit file counted: %v", counts)
+	}
+}
+
+func TestParseHotfixLogDeduplicatesWithinCommit(t *testing.T) {
+	hash := strings.Repeat("d", 40)
+	out := hash + "\tfix: repeated file\r\nsrc/a.ts\r\nsrc/a.ts\r\n"
+	counts := parseHotfixLog(out)
+	if counts["src/a.ts"] != 1 {
+		t.Fatalf("counts = %v, want one count per commit", counts)
+	}
+}
+
+func TestGitHotfixFiles(t *testing.T) {
+	hash := strings.Repeat("e", 40)
+	runner := &stubRunner{runFn: func(spec contract.RunSpec) contract.RunResult {
+		joined := strings.Join(spec.Args, " ")
+		switch {
+		case strings.Contains(joined, "rev-parse"):
+			return contract.RunResult{ExitCode: 0, Stdout: "true\n"}
+		case strings.Contains(joined, "log"):
+			return contract.RunResult{ExitCode: 0, Stdout: hash + "\tfix bug\nsrc/a.ts\n"}
+		default:
+			return contract.RunResult{ExitCode: 0}
+		}
+	}}
+	counts, err := NewGit(runner, ".").HotfixFiles(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("HotfixFiles error: %v", err)
+	}
+	if counts["src/a.ts"] != 1 {
+		t.Fatalf("counts = %v", counts)
+	}
+	calls := runner.Calls()
+	if len(calls) < 2 || !strings.Contains(strings.Join(calls[1].Args, " "), "--since=30.days") {
+		t.Fatalf("git log args = %#v", calls)
+	}
+}
+
+func TestGitHotfixFilesNoHEAD(t *testing.T) {
+	runner := &stubRunner{runFn: func(contract.RunSpec) contract.RunResult {
+		return contract.RunResult{ExitCode: 128, Stderr: "no HEAD"}
+	}}
+	counts, err := NewGit(runner, ".").HotfixFiles(context.Background(), 30)
+	if err != nil {
+		t.Fatalf("HotfixFiles error: %v", err)
+	}
+	if len(counts) != 0 {
+		t.Fatalf("counts = %v, want empty", counts)
+	}
+}

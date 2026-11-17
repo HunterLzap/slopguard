@@ -170,13 +170,13 @@ escape_patterns:
 
 ### 5.1 CLI 命令面
 * `slopguard init [--yes]`：检测技术栈并补齐配置与基线。
-* `slopguard verify [--all] [--json] [--jobs N]`：运行门禁检查（Exit `0` 通过，`1` 检查失败，`2` 工具链缺失或系统错误）。
+* `slopguard verify [--all] [--json] [--jobs N] [--record]`：运行门禁检查（Exit `0` 通过，`1` 检查失败，`2` 工具链缺失或系统错误）；通过后加 `--record` 记录一条 `scan_runs`，本地数据库不可用时仅警告、不影响退出码。
 * `slopguard radar [--top 3] [--json]`：输出坏样本雷达与热点文件。
 * `slopguard record --summary "..." [--bad "..."] [--good "..."]`：录入一次 AI 错题。
-* `slopguard baseline [--tighten | --reset]`：更新棘轮基线。
+* `slopguard baseline [--tighten | --reset] [--yes]`：更新棘轮基线，操作前打印 Diff 并确认。
 * `slopguard mcp`：以 `stdio` 模式启动 MCP Server。
 
-`verify --json` 输出 `contract.VerifyResult`：`skipped` 保留为被跳过检查的 ID 数组（兼容既有消费者），`skipped_details` 新增 `{id, tool, reason}` 跳过明细；`suppressed` 为被 `.slopguard/baseline.json` 的 `suppressed_files` 过滤掉的文件数。
+`verify --json` 输出 `contract.VerifyResult`：`duration_ms` 为 int64 毫秒（`DurationMs`）；`skipped` 保留为被跳过检查的 ID 数组（兼容既有消费者），`skipped_details` 新增 `{id, tool, reason}` 跳过明细；`suppressed` 为被 `.slopguard/baseline.json` 的 `suppressed_files` 过滤掉的文件数。
 
 ### 5.2 MCP Server 暴露工具（供宿主 Agent 调用）
 1. `sg_verify`：参数 `{ all?: bool, paths?: string[] }` → 返回结构化错误列表（文件、行号、规则、修复提示）及基线对比。

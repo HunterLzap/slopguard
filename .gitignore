@@ -1,0 +1,24 @@
+# Build artifacts
+dist/
+bin/
+*.exe
+*.test
+*.out
+
+# Go
+/vendor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# SlopGuard runtime (project-local state)
+.slopguard/
+
+# Temp fixtures
+sg space*/

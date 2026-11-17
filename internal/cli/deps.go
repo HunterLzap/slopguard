@@ -1,0 +1,90 @@
+package cli
+
+import (
+	"context"
+
+	"github.com/HunterLzap/slopguard/internal/contract"
+)
+
+// checkTask couples one adapter check with the adapter that owns it so output
+// can be parsed by the right implementation after concurrent execution.
+type checkTask struct {
+	AdapterName string
+	Check       contract.Check
+}
+
+// checkOutcome is the result of executing one check task.
+type checkOutcome struct {
+	Task   checkTask
+	Result contract.RunResult
+}
+
+// baselineState is the project baseline as seen by the CLI: metric upper
+// bounds plus a predicate for suppressed files.
+type baselineState struct {
+	Metrics         map[string]int
+	IsSuppressed    func(file string) bool
+	HasSuppressions bool
+}
+
+// Suppresses reports whether file is excluded by baseline.suppressed_files.
+func (b baselineState) Suppresses(file string) bool {
+	return b.IsSuppressed != nil && b.IsSuppressed(file)
+}
+
+// engineClient is the narrow port the CLI needs from the core engine. Keeping
+// this interface here lets the CLI layer stay stable while the engine package
+// fixes its exported API, and keeps command code free of engine internals.
+type engineClient interface {
+	// ChangedFiles returns files changed in the working tree (including
+	// untracked files) relative to root.
+	ChangedFiles(ctx context.Context, root string) ([]string, error)
+	// ListFiles returns all files under root matching the given extensions.
+	ListFiles(root string, extensions []string) ([]string, error)
+	// RunChecks executes check tasks with a bounded worker pool.
+	RunChecks(ctx context.Context, root string, jobs int, tasks []checkTask) ([]checkOutcome, error)
+	// LoadBaseline reads .slopguard/baseline.json metric upper bounds.
+	LoadBaseline(path string) (map[string]int, error)
+	// SaveBaseline writes a new baseline document with the given metrics.
+	SaveBaseline(path string, metrics map[string]int) error
+	// ComputeEscapes counts escape-hatch matches across files.
+	ComputeEscapes(root string, files []string, patterns []contract.EscapePattern) (map[string]int, error)
+	// Ratchet compares current escape counts with the baseline and returns
+	// findings for any metric that increased.
+	Ratchet(escapes, baseline map[string]int) []contract.Finding
+}
+
+// baselineProvider is an optional extension implemented by the production
+// engine to expose suppressed_files alongside baseline metrics. Keeping it
+// optional preserves compatibility with simpler test doubles.
+type baselineProvider interface {
+	LoadBaselineState(path string) (baselineState, error)
+}
+
+// checkPlan is the result of probing tool availability before execution.
+type checkPlan struct {
+	Runnable       []contract.Check
+	Skipped        []string
+	SkippedDetails []contract.SkippedDetail
+}
+
+// adapterProvider is the narrow port the CLI needs from the adapter registry.
+type adapterProvider interface {
+	// Detect returns adapters applicable to the given project root.
+	Detect(root string) ([]contract.Adapter, error)
+	// PlanChecks resolves local tools and splits checks into runnable and
+	// gracefully skipped ones. A missing required tool is an error.
+	PlanChecks(root string, checks []contract.Check) (checkPlan, error)
+	// ParseFindings converts one check's raw output into findings, using the
+	// owning adapter's parser and a generic fallback.
+	ParseFindings(a contract.Adapter, checkID string, result contract.RunResult) []contract.Finding
+}
+
+type dependencies struct {
+	engine   engineClient
+	adapters adapterProvider
+}
+
+// newDependencies is replaced in wire.go with the production wiring. Tests can
+// swap it for fakes without touching command code.
+var newDependencies = defaultDependencies

@@ -176,6 +176,8 @@ escape_patterns:
 * `slopguard baseline [--tighten | --reset]`：更新棘轮基线。
 * `slopguard mcp`：以 `stdio` 模式启动 MCP Server。
 
+`verify --json` 输出 `contract.VerifyResult`：`skipped` 保留为被跳过检查的 ID 数组（兼容既有消费者），`skipped_details` 新增 `{id, tool, reason}` 跳过明细；`suppressed` 为被 `.slopguard/baseline.json` 的 `suppressed_files` 过滤掉的文件数。
+
 ### 5.2 MCP Server 暴露工具（供宿主 Agent 调用）
 1. `sg_verify`：参数 `{ all?: bool, paths?: string[] }` → 返回结构化错误列表（文件、行号、规则、修复提示）及基线对比。
 2. `sg_radar`：参数 `{ top?: number }` → 返回 Top-N 坏样本文件与指标明细。

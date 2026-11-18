@@ -75,20 +75,9 @@ func ScanReport(ctx context.Context, opts Options) (Result, error) {
 		return Result{}, err
 	}
 
-	registry, err := adapter.NewDefaultRegistry()
+	registry, err := adapter.LoadMergedRegistry(root)
 	if err != nil {
-		return Result{}, fmt.Errorf("radar: build adapter registry: %w", err)
-	}
-	customDir := filepath.Join(root, ".slopguard", "adapters")
-	if info, statErr := os.Stat(customDir); statErr == nil {
-		if !info.IsDir() {
-			return Result{}, fmt.Errorf("radar: %s is not a directory", customDir)
-		}
-		if err := registry.RegisterYAMLDir(customDir); err != nil {
-			return Result{}, err
-		}
-	} else if !os.IsNotExist(statErr) {
-		return Result{}, fmt.Errorf("radar: inspect custom adapters: %w", statErr)
+		return Result{}, fmt.Errorf("radar: load adapter registry: %w", err)
 	}
 
 	adapters := registry.Detect(root)

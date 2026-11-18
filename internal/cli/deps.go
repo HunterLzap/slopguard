@@ -119,11 +119,56 @@ type scanRecorder interface {
 	RecordScan(ctx context.Context, projectPath string, durationMs int64, escapes int, passed bool) error
 }
 
+// presetMergeItem is the CLI-facing view of one global rule preset merge.
+type presetMergeItem struct {
+	Engine     string
+	RuleID     string
+	ConfigPath string
+	BackupPath string
+	Diff       string
+	Reason     string
+}
+
+// presetMergePlan is a preview of a global preset sync; Raw keeps the
+// provider-specific plan that ApplyPresets consumes.
+type presetMergePlan struct {
+	Written []presetMergeItem
+	Skipped []presetMergeItem
+	Diffs   []string
+	Raw     any
+}
+
+// presetMergeResult summarizes a global preset sync.
+type presetMergeResult struct {
+	Written []presetMergeItem
+	Skipped []presetMergeItem
+	Backups []string
+	Diffs   []string
+}
+
+// presetProvider previews and applies ~/.slopguard/presets merges.
+type presetProvider interface {
+	PlanPresets(globalDir, projectDir string) (presetMergePlan, error)
+	ApplyPresets(plan presetMergePlan) (presetMergeResult, error)
+}
+
+// uiOptions is the CLI-facing input for a Playwright UI smoke run.
+type uiOptions struct {
+	ProjectRoot string
+}
+
+// uiProvider runs the optional Playwright UI smoke validation.
+type uiProvider interface {
+	RunUISmoke(ctx context.Context, opts uiOptions) (contract.UISmokeResult, error)
+}
+
 type dependencies struct {
 	engine   engineClient
 	adapters adapterProvider
 	radar    radarProvider
 	recorder scanRecorder
+	presets  presetProvider
+	ui       uiProvider
 }
 
 // newDependencies is replaced in wire.go with the production wiring. Tests can

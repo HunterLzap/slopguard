@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/HunterLzap/slopguard/internal/adapter"
@@ -25,6 +24,8 @@ func defaultDependencies() (dependencies, error) {
 		adapters: productionAdapters{runner: runner},
 		radar:    productionRadar{runner: runner},
 		recorder: productionRecorder{},
+		presets:  productionEngine{runner: runner},
+		ui:       productionUI{runner: runner},
 	}, nil
 }
 
@@ -89,6 +90,51 @@ func (p productionEngine) LoadBaselineState(path string) (baselineState, error) 
 
 func (p productionEngine) SaveBaseline(path string, metrics map[string]int) error {
 	return engine.SaveBaseline(path, engine.NewBaselineFromMetrics(metrics, time.Now()))
+}
+
+func (p productionEngine) PlanPresets(globalDir, projectDir string) (presetMergePlan, error) {
+	plan, err := engine.PlanPresets(globalDir, projectDir)
+	if err != nil {
+		return presetMergePlan{}, err
+	}
+	return presetMergePlan{
+		Written: mapPresetItems(plan.Written),
+		Skipped: mapPresetItems(plan.Skipped),
+		Diffs:   append([]string(nil), plan.Diffs...),
+		Raw:     plan,
+	}, nil
+}
+
+func (p productionEngine) ApplyPresets(plan presetMergePlan) (presetMergeResult, error) {
+	enginePlan, ok := plan.Raw.(engine.MergePlan)
+	if !ok {
+		return presetMergeResult{}, errors.New("preset plan was not produced by PlanPresets")
+	}
+	merged, err := engine.ApplyPresets(enginePlan)
+	if err != nil {
+		return presetMergeResult{}, err
+	}
+	return presetMergeResult{
+		Written: mapPresetItems(merged.Written),
+		Skipped: mapPresetItems(merged.Skipped),
+		Backups: append([]string(nil), merged.Backups...),
+		Diffs:   append([]string(nil), merged.Diffs...),
+	}, nil
+}
+
+func mapPresetItems(items []engine.MergeItem) []presetMergeItem {
+	out := make([]presetMergeItem, 0, len(items))
+	for _, item := range items {
+		out = append(out, presetMergeItem{
+			Engine:     item.Engine,
+			RuleID:     item.RuleID,
+			ConfigPath: item.ConfigPath,
+			BackupPath: item.BackupPath,
+			Diff:       item.Diff,
+			Reason:     item.Reason,
+		})
+	}
+	return out
 }
 
 func (p productionEngine) ComputeEscapes(root string, files []string, patterns []contract.EscapePattern) (map[string]int, error) {
@@ -158,34 +204,24 @@ func baselineDocumentFromEngine(baseline *engine.Baseline) baselineDocument {
 	}
 }
 
+type productionUI struct {
+	runner contract.Runner
+}
+
+func (p productionUI) RunUISmoke(ctx context.Context, opts uiOptions) (contract.UISmokeResult, error) {
+	return adapter.RunUISmoke(ctx, p.runner, adapter.UIOptions{ProjectRoot: opts.ProjectRoot})
+}
+
 type productionAdapters struct {
 	runner contract.Runner
 }
 
 func (p productionAdapters) Detect(root string) ([]contract.Adapter, error) {
-	registry, err := adapter.NewDefaultRegistry()
+	registry, err := adapter.LoadMergedRegistry(root)
 	if err != nil {
 		return nil, err
 	}
-	if err := loadProjectAdapters(registry, root); err != nil {
-		return nil, err
-	}
 	return adapter.NewService(registry, p.runner).Detect(root)
-}
-
-// loadProjectAdapters loads project-local YAML adapters. Errors are returned
-// because a broken project adapter is a configuration error for this project.
-func loadProjectAdapters(registry *adapter.Registry, root string) error {
-	dir := filepath.Join(root, ".slopguard", "adapters")
-	if info, err := os.Stat(dir); err == nil {
-		if !info.IsDir() {
-			return fmt.Errorf("%s is not a directory", dir)
-		}
-		return registry.RegisterYAMLDir(dir)
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	return nil
 }
 
 func (p productionAdapters) PlanChecks(root string, checks []contract.Check) (checkPlan, error) {

@@ -45,6 +45,8 @@ func runInit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	yes := fs.Bool("yes", false, "apply changes to an existing config file without prompting")
+	presets := fs.Bool("presets", false, "merge global rule presets into project config")
+	ui := fs.Bool("ui", false, "scaffold Playwright UI smoke configuration")
 	rootFlag := fs.String("root", ".", "project root directory")
 	help, err := parseFlags(fs, args)
 	if err != nil {
@@ -145,6 +147,17 @@ func runInit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return commandError(stderr, "write %s: %v", baselineRelPath, err)
 		}
 		fmt.Fprintf(stdout, "Created %s (%s)\n", baselineRelPath, formatMetrics(metrics))
+	}
+
+	if *presets {
+		if code := runPresetSync(deps, root, *yes, stdin, stdout, stderr); code != ExitOK {
+			return code
+		}
+	}
+	if *ui {
+		if code := runUIScaffold(root, stdout, stderr); code != ExitOK {
+			return code
+		}
 	}
 
 	fmt.Fprintln(stdout, "init complete.")

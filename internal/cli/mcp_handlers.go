@@ -24,16 +24,18 @@ func buildMCPTools(root string) []mcp.Tool {
 			InputSchema: objectSchema(map[string]any{
 				"all":   map[string]any{"type": "boolean", "description": "scan all files instead of git-changed files"},
 				"paths": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "optional explicit file paths"},
+				"ui":    map[string]any{"type": "boolean", "description": "also run Playwright UI smoke checks after regular checks pass"},
 			}),
 			Handler: func(ctx context.Context, args json.RawMessage) (any, error) {
 				var a struct {
 					All   bool     `json:"all"`
 					Paths []string `json:"paths"`
+					UI    bool     `json:"ui"`
 				}
 				if err := decodeMCPArgs(args, &a); err != nil {
 					return nil, err
 				}
-				return verifyForMCP(root, a.All, a.Paths)
+				return verifyForMCP(root, a.All, a.Paths, a.UI)
 			},
 		},
 		{
@@ -145,12 +147,13 @@ func decodeMCPArgs(raw json.RawMessage, target any) error {
 	return nil
 }
 
-func verifyForMCP(root string, all bool, paths []string) (contract.VerifyResult, error) {
+func verifyForMCP(root string, all bool, paths []string, ui bool) (contract.VerifyResult, error) {
 	var stdout, stderr bytes.Buffer
 	code := runVerifyWith(verifyOptions{
 		root:  root,
 		all:   all,
 		json:  true,
+		ui:    ui,
 		paths: paths,
 	}, &stdout, &stderr)
 	if code == ExitError {

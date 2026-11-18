@@ -1,0 +1,7 @@
+# SlopGuard UI 烟雾验证配置（复制到项目 .slopguard/ui.yaml）
+base_url: http://127.0.0.1:3000
+routes:
+  - /
+  - /health
+screenshot_dir: .slopguard/ui-screenshots
+timeout_sec: 60

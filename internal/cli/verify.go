@@ -23,6 +23,7 @@ type verifyOptions struct {
 	json   bool
 	jobs   int
 	record bool
+	ui     bool
 	paths  []string
 }
 
@@ -33,6 +34,7 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 	jsonOut := fs.Bool("json", false, "emit a structured contract.VerifyResult as JSON")
 	jobs := fs.Int("jobs", 0, "maximum concurrent checks (default: config value or 2)")
 	record := fs.Bool("record", false, "record a scan_runs row after a passing verify")
+	ui := fs.Bool("ui", false, "run Playwright UI smoke checks after the regular checks pass")
 	rootFlag := fs.String("root", ".", "project root directory")
 	help, err := parseFlags(fs, args)
 	if err != nil {
@@ -62,6 +64,7 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 		json:   *jsonOut,
 		jobs:   *jobs,
 		record: *record,
+		ui:     *ui,
 	}, stdout, stderr)
 }
 
@@ -72,6 +75,8 @@ func runVerifyWith(opts verifyOptions, stdout, stderr io.Writer) int {
 	if err != nil {
 		return commandError(stderr, "prepare engine: %v", err)
 	}
+	ctx, stop := newCommandContext(deps.engine)
+	defer stop()
 
 	jobs := opts.jobs
 	cfg, cfgErr := loadConfig(opts.root)
@@ -98,8 +103,27 @@ func runVerifyWith(opts verifyOptions, stdout, stderr io.Writer) int {
 			return commandError(stderr, "none of the configured adapters %v apply to this project; run slopguard init", cfg.Adapters)
 		}
 		result := emptyResult(started)
+		if opts.ui {
+			uiResult, uiErr := runUISmokeForVerify(ctx, deps, opts.root)
+			if uiErr != nil {
+				return commandError(stderr, "run ui smoke: %v", uiErr)
+			}
+			result.UI = &uiResult
+			if !uiResult.Skipped && !uiResult.Passed {
+				result.Passed = false
+			}
+			result.DurationMs = time.Since(started).Milliseconds()
+		}
+		if result.Passed && opts.record && deps.recorder != nil {
+			if err := deps.recorder.RecordScan(ctx, opts.root, result.DurationMs, 0, true); err != nil {
+				fmt.Fprintf(stderr, "slopguard: warning: record scan failed: %v\n", err)
+			}
+		}
 		writeResult(stdout, opts.json, result)
-		return ExitOK
+		if result.Passed {
+			return ExitOK
+		}
+		return ExitFindings
 	}
 
 	patterns := collectEscapePatterns(adapters)
@@ -114,9 +138,6 @@ func runVerifyWith(opts verifyOptions, stdout, stderr io.Writer) int {
 			return commandError(stderr, "load baseline: %v", err)
 		}
 	}
-
-	ctx, stop := newCommandContext(deps.engine)
-	defer stop()
 
 	extensions := collectExtensions(adapters)
 	var files []string
@@ -246,6 +267,17 @@ func runVerifyWith(opts verifyOptions, stdout, stderr io.Writer) int {
 		Skipped:        skippedIDs,
 		SkippedDetails: skippedDetails,
 	}
+	if opts.ui && result.Passed {
+		uiResult, uiErr := runUISmokeForVerify(ctx, deps, opts.root)
+		if uiErr != nil {
+			return commandError(stderr, "run ui smoke: %v", uiErr)
+		}
+		result.UI = &uiResult
+		if !uiResult.Skipped && !uiResult.Passed {
+			result.Passed = false
+		}
+		result.DurationMs = time.Since(started).Milliseconds()
+	}
 	if result.Passed && opts.record && deps.recorder != nil {
 		if err := deps.recorder.RecordScan(ctx, opts.root, result.DurationMs, sumEscapes(result.Escapes), true); err != nil {
 			fmt.Fprintf(stderr, "slopguard: warning: record scan failed: %v\n", err)
@@ -334,10 +366,20 @@ func printHumanResult(w io.Writer, result contract.VerifyResult) {
 	} else if len(result.Skipped) > 0 {
 		fmt.Fprintf(w, "skipped checks: %s\n", strings.Join(result.Skipped, ", "))
 	}
+	printUISmokeResult(w, result.UI)
 
 	status := "PASS"
 	if !result.Passed {
 		status = "FAIL"
+	}
+	uiIssues := 0
+	if result.UI != nil && !result.UI.Skipped {
+		uiIssues = len(result.UI.Findings)
+	}
+	if uiIssues > 0 {
+		fmt.Fprintf(w, "slopguard verify: %s (%d findings, %d ui issues, %dms)\n",
+			status, len(result.Findings), uiIssues, result.DurationMs)
+		return
 	}
 	fmt.Fprintf(w, "slopguard verify: %s (%d findings, %dms)\n",
 		status, len(result.Findings), result.DurationMs)

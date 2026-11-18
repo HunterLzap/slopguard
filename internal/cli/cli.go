@@ -60,8 +60,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprint(w, `SlopGuard - deterministic AI code-quality guardrails
 
 Usage:
-  slopguard init     [--yes] [--root DIR]
-  slopguard verify   [--all] [--json] [--jobs N] [--record] [--root DIR]
+  slopguard init     [--yes] [--presets] [--ui] [--root DIR]
+  slopguard verify   [--all] [--json] [--jobs N] [--record] [--ui] [--root DIR]
   slopguard baseline [--tighten | --reset] [--yes] [--root DIR]
   slopguard radar    [--top N] [--json] [--root DIR]
   slopguard record   --summary TEXT [--category C] [--bad-snippet S] [--good-snippet S] [--project DIR]

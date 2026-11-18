@@ -103,6 +103,22 @@ type SkippedDetail struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// UISmokeResult 是一次 Playwright UI 烟雾验证的结果。
+type UISmokeResult struct {
+	// Skipped 表示项目未配置 UI 或 Playwright 未安装，验证被优雅跳过。
+	Skipped bool `json:"skipped"`
+	// Reason 是跳过原因或失败摘要。
+	Reason string `json:"reason,omitempty"`
+	// Passed 表示烟雾验证是否全部通过；Skipped 时无意义。
+	Passed bool `json:"passed"`
+	// Findings 是 console.error、pageerror、5xx 等结构化问题。
+	Findings []Finding `json:"findings,omitempty"`
+	// Screenshots 是失败截图路径（成功时可为空）。
+	Screenshots []string `json:"screenshots,omitempty"`
+	// DurationMs 是本次 UI 烟雾验证耗时（毫秒）。
+	DurationMs int64 `json:"duration_ms"`
+}
+
 // VerifyResult 是一次 verify 运行的聚合结果。
 type VerifyResult struct {
 	Passed   bool      `json:"passed"`
@@ -119,6 +135,8 @@ type VerifyResult struct {
 	Skipped []string `json:"skipped,omitempty"`
 	// SkippedDetails 提供跳过检查的工具与原因（Phase 1 新增）。
 	SkippedDetails []SkippedDetail `json:"skipped_details,omitempty"`
+	// UI 是启用 --ui 时的 Playwright 烟雾验证结果；未启用时省略。
+	UI *UISmokeResult `json:"ui,omitempty"`
 }
 
 // ---------------------------------------------------------------------------

@@ -16,7 +16,7 @@ MCP 使用 stdio，传输为**换行分隔的 JSON-RPC 2.0**：每行一个 JSON
 
 | 工具 | 参数 | 用途 |
 | --- | --- | --- |
-| `sg_verify` | `{ all?: bool, paths?: string[] }` | 执行确定性门禁，返回 `contract.VerifyResult` |
+| `sg_verify` | `{ all?: bool, paths?: string[], ui?: bool }` | 执行确定性门禁，返回 `contract.VerifyResult`；`ui: true` 追加 UI 烟雾验证 |
 | `sg_radar` | `{ top?: number }` | 返回 Top N 坏样本热点与降级明细 |
 | `sg_record_mistake` | `{ category, summary, bad_snippet?, good_snippet? }` | 记录一次 AI 错题；相同指纹累计计数 |
 | `sg_list_candidates` | `{ min_count?: number }` | 列出累计次数达到阈值的待提炼错题 |
@@ -25,7 +25,7 @@ MCP 使用 stdio，传输为**换行分隔的 JSON-RPC 2.0**：每行一个 JSON
 
 ## 标准工作流
 
-1. **改完代码先验证**：调用 `sg_verify`。默认只检查 Git 变更文件；需要全量时传 `all: true`，需要定点检查时传 `paths`。
+1. **改完代码先验证**：调用 `sg_verify`。默认只检查 Git 变更文件；需要全量时传 `all: true`，需要定点检查时传 `paths`，需要 UI 烟雾验证时传 `ui: true`（未配置或未装 Playwright 会跳过，不影响 passed）。
 2. **失败先修复**：读取 `findings`，修复后再次 `sg_verify`，直到 `passed: true`。
 3. **记录重复错误**：若同一类 AI 错误再次出现，调用 `sg_record_mistake`，提供 `category`、`summary`，尽量附上 `bad_snippet` 与 `good_snippet`。相同指纹会累计 `count`。
 4. **召回候选**：当同类错误累计达到 2 次，调用 `sg_list_candidates` 获取待提炼错题簇。
@@ -37,7 +37,7 @@ MCP 使用 stdio，传输为**换行分隔的 JSON-RPC 2.0**：每行一个 JSON
 ## CLI 等价入口
 
 - `slopguard record --summary "..." [--category ...] [--bad-snippet ...] [--good-snippet ...]`：人工或脚本录入错题。
-- `slopguard verify [--all] [--json]`：本地门禁。
+- `slopguard verify [--all] [--json] [--ui]`：本地门禁；`--ui` 追加 Playwright UI 烟雾验证。
 - `slopguard radar [--top 3] [--json]`：坏样本雷达。
 
 ## 约束

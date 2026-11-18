@@ -179,6 +179,8 @@ escape_patterns:
 `verify --json` 输出 `contract.VerifyResult`：`duration_ms` 为 int64 毫秒（`DurationMs`）；`skipped` 保留为被跳过检查的 ID 数组（兼容既有消费者），`skipped_details` 新增 `{id, tool, reason}` 跳过明细；`suppressed` 为被 `.slopguard/baseline.json` 的 `suppressed_files` 过滤掉的文件数。
 
 ### 5.2 MCP Server 暴露工具（供宿主 Agent 调用）
+`slopguard mcp` 使用换行分隔的 JSON-RPC 2.0 帧，`stdout` 只输出协议帧，所有日志/警告走 `stderr`。
+
 1. `sg_verify`：参数 `{ all?: bool, paths?: string[] }` → 返回结构化错误列表（文件、行号、规则、修复提示）及基线对比。
 2. `sg_radar`：参数 `{ top?: number }` → 返回 Top-N 坏样本文件与指标明细。
 3. `sg_record_mistake`：参数 `{ category, summary, bad_snippet?, good_snippet? }` → 写入 SQLite 并返回当前同类累计次数。

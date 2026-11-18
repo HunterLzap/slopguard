@@ -1,7 +1,7 @@
 # presets
 
-Phase 1 仅保留目录占位，不包含预设规则或模板。
+Phase 1/2 仅保留目录占位，不包含预设规则或模板。
 
-后续阶段将在此提供：
-- 通用默认规则与基线模板（Phase 2）
-- Playwright 通用烟雾验证模板与全局规则同步（Phase 4）
+Phase 3 的全局规则模板由 adapter 规则写入能力管理，位置为
+`~/.slopguard/presets/<engine>/rules.json`（engine 支持 eslint / ruff / semgrep）；
+仓库内该目录继续作为后续内置模板的占位。

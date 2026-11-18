@@ -42,6 +42,10 @@ func Execute(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runBaseline(args[1:], stdin, stdout, stderr)
 	case "radar":
 		return runRadar(args[1:], stdout, stderr)
+	case "record":
+		return runRecord(args[1:], stdout, stderr)
+	case "mcp":
+		return runMCP(args[1:], stdin, stdout, stderr)
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return ExitOK
@@ -60,6 +64,8 @@ Usage:
   slopguard verify   [--all] [--json] [--jobs N] [--record] [--root DIR]
   slopguard baseline [--tighten | --reset] [--yes] [--root DIR]
   slopguard radar    [--top N] [--json] [--root DIR]
+  slopguard record   --summary TEXT [--category C] [--bad-snippet S] [--good-snippet S] [--project DIR]
+  slopguard mcp      [--root DIR]
 
 Exit codes:
   0  checks passed

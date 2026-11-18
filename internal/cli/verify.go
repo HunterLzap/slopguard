@@ -23,6 +23,7 @@ type verifyOptions struct {
 	json   bool
 	jobs   int
 	record bool
+	paths  []string
 }
 
 func runVerify(args []string, stdout, stderr io.Writer) int {
@@ -119,9 +120,12 @@ func runVerifyWith(opts verifyOptions, stdout, stderr io.Writer) int {
 
 	extensions := collectExtensions(adapters)
 	var files []string
-	if opts.all {
+	switch {
+	case len(opts.paths) > 0:
+		files = filterFilesByExtensions(resolveScopePaths(opts.root, opts.paths), extensions)
+	case opts.all:
 		files, err = deps.engine.ListFiles(opts.root, extensions)
-	} else {
+	default:
 		files, err = deps.engine.ChangedFiles(ctx, opts.root)
 		if err == nil {
 			files = filterFilesByExtensions(files, extensions)
@@ -467,6 +471,43 @@ func filterFilesByExtensions(files []string, extensions []string) []string {
 		if _, ok := set[strings.ToLower(filepath.Ext(file))]; ok {
 			out = append(out, file)
 		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// resolveScopePaths normalizes explicit file paths (relative or absolute) into
+// repository-relative paths suitable for engine checks and escape counting.
+func resolveScopePaths(root string, paths []string) []string {
+	seen := make(map[string]struct{}, len(paths))
+	out := make([]string, 0, len(paths))
+	for _, raw := range paths {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		file := raw
+		if filepath.IsAbs(file) {
+			rel, err := filepath.Rel(root, file)
+			if err != nil {
+				continue
+			}
+			file = rel
+		} else {
+			file = filepath.Clean(filepath.FromSlash(file))
+		}
+		if file == "." || filepath.IsAbs(file) || strings.HasPrefix(file, ".."+string(filepath.Separator)) {
+			continue
+		}
+		info, err := os.Stat(filepath.Join(root, file))
+		if err != nil || info.IsDir() {
+			continue
+		}
+		if _, ok := seen[file]; ok {
+			continue
+		}
+		seen[file] = struct{}{}
+		out = append(out, file)
 	}
 	sort.Strings(out)
 	return out

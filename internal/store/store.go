@@ -20,7 +20,7 @@ import (
 
 const (
 	driverName     = "sqlite"
-	schemaVersion  = 1
+	schemaVersion  = 2
 	defaultDirName = ".slopguard"
 	defaultDBName  = "slopguard.db"
 )
@@ -171,6 +171,15 @@ var migrations = []migration{
 			)`,
 			`CREATE INDEX IF NOT EXISTS idx_scan_runs_project_created
 				ON scan_runs(project_path, created_at DESC)`,
+		},
+	},
+	{
+		version: 2,
+		statements: []string{
+			`ALTER TABLE rules ADD COLUMN source TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE rules ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`,
+			`ALTER TABLE rules ADD COLUMN applied_at DATETIME`,
+			`CREATE INDEX IF NOT EXISTS idx_rules_status ON rules(status)`,
 		},
 	},
 }

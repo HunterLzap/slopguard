@@ -170,11 +170,12 @@ escape_patterns:
 
 ### 5.1 CLI 命令面
 * `slopguard init [--yes] [--presets] [--ui]`：检测技术栈并补齐配置与基线；`--presets` 预览并确认合并 `~/.slopguard/presets/` 全局规则模板，`--ui` 生成 `.slopguard/ui.yaml` UI 烟雾配置。
-* `slopguard verify [--all] [--json] [--jobs N] [--record] [--ui]`：运行门禁检查（Exit `0` 通过，`1` 检查失败，`2` 工具链缺失或系统错误）；通过后加 `--record` 记录一条 `scan_runs`，本地数据库不可用时仅警告、不影响退出码；`--ui` 在常规检查通过后追加 Playwright UI 烟雾验证（默认关闭，未配置或未安装 Playwright 时跳过且不影响退出码）。
+* `slopguard verify [--all] [--json] [--jobs N] [--record] [--ui]`：运行门禁检查（Exit `0` 通过，`1` 检查失败，`2` 工具链缺失或系统错误）；运行后加 `--record` 记录一条 `scan_runs`（通过/失败都记录，供看板统计拦截失败），本地数据库不可用时仅警告、不影响退出码；`--ui` 在常规检查通过后追加 Playwright UI 烟雾验证（默认关闭，未配置或未安装 Playwright 时跳过且不影响退出码）。
 * `slopguard radar [--top 3] [--json]`：输出坏样本雷达与热点文件。
 * `slopguard record --summary "..." [--bad "..."] [--good "..."]`：录入一次 AI 错题。
 * `slopguard baseline [--tighten | --reset] [--yes]`：更新棘轮基线，操作前打印 Diff 并确认。
 * `slopguard mcp`：以 `stdio` 模式启动 MCP Server。
+* `slopguard ui [--port 7788] [--no-open]`：启动本地只读可视化看板，仅监听 `127.0.0.1`，前端资源 `//go:embed` 单二进制内置。
 
 `verify --json` 输出 `contract.VerifyResult`：`duration_ms` 为 int64 毫秒（`DurationMs`）；`skipped` 保留为被跳过检查的 ID 数组（兼容既有消费者），`skipped_details` 新增 `{id, tool, reason}` 跳过明细；`suppressed` 为被 `.slopguard/baseline.json` 的 `suppressed_files` 过滤掉的文件数；启用 `--ui` 时额外包含 `ui: {skipped, reason, passed, findings, screenshots, duration_ms}`。
 
@@ -213,6 +214,7 @@ slopguard/
 ├── internal/
 │   ├── cli/                       # CLI 子命令定义与 JSON/TTY 格式化
 │   ├── mcp/                       # stdio MCP Server 与 Tool 注册
+│   ├── ui/                        # 本地看板 HTTP 服务与 //go:embed 单页资源
 │   ├── engine/
 │   │   ├── scheduler.go           # 有界并发调度器 + 超时/进程组清理
 │   │   ├── git.go                 # Git 变更文件解析与高频 fix 统计
@@ -242,6 +244,7 @@ slopguard/
 | **Phase 2：`radar` 与 SQLite** | `modernc.org/sqlite` 存储层、逃生舱/复杂度/死代码/重复代码扫描、传染分排序 | 1. `radar --top 3 --json` 准确输出热点坏样本<br>2. 无新增长逃生舱时 `verify` 放行，新增 1 个 `@ts-ignore` 时 `verify` 拦截 |
 | **Phase 3：MCP 与 `learn` 闭环** | stdio MCP Server、`record_mistake`、候选规则 `dry_run` 沙箱、`apply_rule`、配套 `SKILL.md` | 1. 任意支持 MCP 的 Agent 可连接 `slopguard mcp`<br>2. 模拟录入 2 次同类错误 → Agent 起草 ESLint/Ruff 规则 → 沙箱试跑验证命中 → 写入生效 |
 | **Phase 4：UI 烟雾与全局同步** | Playwright 通用烟雾模板集成、`presets` 全局规则同步到新项目 | 新建测试项目运行 `slopguard init --presets --ui` 可一键继承全局通用规则与 UI 检查入口 |
+| **Phase 5：本地可视化看板** | `slopguard ui` 本地 HTTP 服务、`//go:embed` 单页资源、store 看板查询、项目 baseline/radar/截图展示 | 看板 4 个板块可用；API/embed/ignore/优雅退出单测与 6 平台交叉编译全绿 |
 
 ---
 

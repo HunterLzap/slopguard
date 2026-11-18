@@ -46,6 +46,8 @@ func Execute(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runRecord(args[1:], stdout, stderr)
 	case "mcp":
 		return runMCP(args[1:], stdin, stdout, stderr)
+	case "ui":
+		return runUI(args[1:], stdout, stderr)
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return ExitOK
@@ -66,6 +68,7 @@ Usage:
   slopguard radar    [--top N] [--json] [--root DIR]
   slopguard record   --summary TEXT [--category C] [--bad-snippet S] [--good-snippet S] [--project DIR]
   slopguard mcp      [--root DIR]
+  slopguard ui       [--port 7788] [--no-open]
 
 Exit codes:
   0  checks passed

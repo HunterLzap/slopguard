@@ -33,7 +33,7 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 	all := fs.Bool("all", false, "scan all project files instead of only git-changed files")
 	jsonOut := fs.Bool("json", false, "emit a structured contract.VerifyResult as JSON")
 	jobs := fs.Int("jobs", 0, "maximum concurrent checks (default: config value or 2)")
-	record := fs.Bool("record", false, "record a scan_runs row after a passing verify")
+	record := fs.Bool("record", false, "record a scan_runs row after verify (pass or fail)")
 	ui := fs.Bool("ui", false, "run Playwright UI smoke checks after the regular checks pass")
 	rootFlag := fs.String("root", ".", "project root directory")
 	help, err := parseFlags(fs, args)
@@ -114,8 +114,8 @@ func runVerifyWith(opts verifyOptions, stdout, stderr io.Writer) int {
 			}
 			result.DurationMs = time.Since(started).Milliseconds()
 		}
-		if result.Passed && opts.record && deps.recorder != nil {
-			if err := deps.recorder.RecordScan(ctx, opts.root, result.DurationMs, 0, true); err != nil {
+		if opts.record && deps.recorder != nil {
+			if err := deps.recorder.RecordScan(ctx, opts.root, result.DurationMs, 0, result.Passed); err != nil {
 				fmt.Fprintf(stderr, "slopguard: warning: record scan failed: %v\n", err)
 			}
 		}
@@ -278,8 +278,8 @@ func runVerifyWith(opts verifyOptions, stdout, stderr io.Writer) int {
 		}
 		result.DurationMs = time.Since(started).Milliseconds()
 	}
-	if result.Passed && opts.record && deps.recorder != nil {
-		if err := deps.recorder.RecordScan(ctx, opts.root, result.DurationMs, sumEscapes(result.Escapes), true); err != nil {
+	if opts.record && deps.recorder != nil {
+		if err := deps.recorder.RecordScan(ctx, opts.root, result.DurationMs, sumEscapes(result.Escapes), result.Passed); err != nil {
 			fmt.Fprintf(stderr, "slopguard: warning: record scan failed: %v\n", err)
 		}
 	}

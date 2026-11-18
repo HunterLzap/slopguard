@@ -169,6 +169,7 @@ type dependencies struct {
 	recorder scanRecorder
 	presets  presetProvider
 	ui       uiProvider
+	runner   contract.Runner
 }
 
 // newDependencies is replaced in wire.go with the production wiring. Tests can

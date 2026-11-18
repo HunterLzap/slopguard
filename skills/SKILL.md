@@ -39,6 +39,7 @@ MCP 使用 stdio，传输为**换行分隔的 JSON-RPC 2.0**：每行一个 JSON
 - `slopguard record --summary "..." [--category ...] [--bad-snippet ...] [--good-snippet ...]`：人工或脚本录入错题。
 - `slopguard verify [--all] [--json] [--ui]`：本地门禁；`--ui` 追加 Playwright UI 烟雾验证。
 - `slopguard radar [--top 3] [--json]`：坏样本雷达。
+- `slopguard ui [--port 7788] [--no-open]`：启动本地可视化看板（仅 127.0.0.1）。
 
 ## 约束
 

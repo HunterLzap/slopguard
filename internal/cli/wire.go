@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -12,7 +13,12 @@ import (
 	"github.com/HunterLzap/slopguard/internal/engine"
 	"github.com/HunterLzap/slopguard/internal/radar"
 	"github.com/HunterLzap/slopguard/internal/store"
+	"github.com/HunterLzap/slopguard/internal/ui"
 )
+
+func init() {
+	runDashboard = defaultRunDashboard
+}
 
 // defaultDependencies wires the CLI to the production engine and adapter
 // implementations. It is the only file in internal/cli that imports concrete
@@ -26,7 +32,18 @@ func defaultDependencies() (dependencies, error) {
 		recorder: productionRecorder{},
 		presets:  productionEngine{runner: runner},
 		ui:       productionUI{runner: runner},
+		runner:   runner,
 	}, nil
+}
+
+// defaultRunDashboard opens the global store and serves the local dashboard.
+func defaultRunDashboard(ctx context.Context, runner contract.Runner, opts dashboardOptions, stdout io.Writer) error {
+	db, err := store.OpenDefault()
+	if err != nil {
+		return fmt.Errorf("open store: %w", err)
+	}
+	defer db.Close()
+	return ui.Run(ctx, db, runner, ui.Options{Port: opts.port, NoOpen: opts.noOpen}, stdout)
 }
 
 type productionEngine struct {

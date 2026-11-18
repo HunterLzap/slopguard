@@ -52,6 +52,7 @@ slopguard init --ui        # 生成 .slopguard/ui.yaml（Playwright 烟雾验证
 | `slopguard radar [--top N] [--json] [--root DIR]` | 输出坏样本热点与传染风险分 TOP N |
 | `slopguard record --summary TEXT [--category C] [--bad-snippet S] [--good-snippet S] [--project DIR]` | 录入一次 AI 错题，重复指纹累计次数 |
 | `slopguard mcp [--root DIR]` | 以 stdio 模式启动 MCP Server |
+| `slopguard ui [--port 7788] [--no-open]` | 启动本地可视化看板（仅监听 127.0.0.1，前端资源全部嵌入二进制） |
 
 退出码：`0` 通过，`1` 检查失败，`2` 工具链缺失或系统错误。`--json` 的输出结构与 `contract.VerifyResult` 对齐。
 
@@ -86,6 +87,15 @@ Cursor（`.cursor/mcp.json`）配置格式相同。Windows 下 `command` 写成 
 | `sg_apply_rule` | 用户确认后写入项目配置或全局模板并记录台账 |
 
 配套宿主 Agent 工作流见 [skills/SKILL.md](skills/SKILL.md)：`sg_verify → sg_record_mistake → sg_list_candidates → sg_dry_run_rule → 用户确认 → sg_apply_rule`。
+
+## 本地看板
+
+```bash
+slopguard ui            # 默认 http://127.0.0.1:7788
+slopguard ui --port 9000 --no-open
+```
+
+看板展示效果总览、错题本与规则进化、规则台账、项目 radar/baseline 与 UI 截图；效果总览中的运行历史来自 `slopguard verify --record`。服务仅在运行时启动，前端资源通过 `//go:embed` 打进单二进制。
 
 ## 全局规则与适配器
 

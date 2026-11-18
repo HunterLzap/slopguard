@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SlopGuard Dashboard</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">SG</span>
+      <span class="brand-name">SlopGuard</span>
+      <span class="brand-sub">本地看板</span>
+    </div>
+    <div class="toolbar">
+      <label class="project-picker">
+        <span>项目</span>
+        <select id="project-select" aria-label="选择项目"></select>
+      </label>
+      <button id="refresh-button" class="button button-ghost" type="button">刷新</button>
+    </div>
+  </header>
+
+  <main class="page">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">DETERMINISTIC QUALITY GUARDRAILS</p>
+        <h1>代码质量护栏，<span>一眼看清。</span></h1>
+        <p class="hero-copy">运行记录、错题沉淀、规则生效与项目热点，全部来自本地 SQLite 与项目配置。</p>
+      </div>
+      <div class="hero-stamp">ZERO CGO<br><span>ZERO LLM</span></div>
+    </section>
+
+    <section class="section">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">01 · EFFECT</p>
+          <h2>效果总览</h2>
+        </div>
+        <span id="overview-scope" class="muted">全部项目</span>
+      </div>
+      <div id="overview-cards" class="stat-grid">
+        <article class="stat-card"><span class="stat-label">累计运行</span><strong id="stat-runs">—</strong><span class="stat-note">verify 次数</span></article>
+        <article class="stat-card"><span class="stat-label">拦截失败</span><strong id="stat-failed">—</strong><span class="stat-note">未通过门禁</span></article>
+        <article class="stat-card"><span class="stat-label">已沉淀规则</span><strong id="stat-rules">—</strong><span class="stat-note">active rules</span></article>
+        <article class="stat-card"><span class="stat-label">平均耗时</span><strong id="stat-duration">—</strong><span class="stat-note">ms / run</span></article>
+      </div>
+      <div class="panel chart-panel">
+        <div class="panel-heading">
+          <h3>逃生舱总量趋势</h3>
+          <span class="legend"><i class="dot dot-escapes"></i>escapes <i class="dot dot-runs"></i>runs</span>
+        </div>
+        <svg id="trend-chart" class="trend-chart" role="img" aria-label="逃生舱趋势图"></svg>
+        <p id="trend-empty" class="empty" hidden>暂无扫描记录。先运行一次 <code>slopguard verify --record</code>。</p>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">02 · LEARN</p>
+          <h2>错题本与规则进化</h2>
+        </div>
+        <span class="muted">按累计次数排序</span>
+      </div>
+      <div id="mistakes-list" class="mistake-list"></div>
+      <p id="mistakes-empty" class="empty" hidden>还没有错题记录。Agent 可通过 <code>sg_record_mistake</code> 录入。</p>
+    </section>
+
+    <section class="section">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">03 · LEDGER</p>
+          <h2>规则台账</h2>
+        </div>
+        <span class="muted">规则起了什么作用</span>
+      </div>
+      <div class="panel table-panel">
+        <table class="data-table">
+          <thead><tr><th>作用域</th><th>引擎</th><th>规则</th><th>理由</th><th>创建时间</th><th class="num">命中</th></tr></thead>
+          <tbody id="rules-body"></tbody>
+        </table>
+        <p id="rules-empty" class="empty" hidden>暂无已生效规则。完成 dry-run 与用户确认后，规则会出现在这里。</p>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">04 · RADAR</p>
+          <h2>项目雷达与 UI 截图</h2>
+        </div>
+        <span id="radar-project" class="muted">选择项目查看</span>
+      </div>
+      <div class="radar-grid">
+        <div class="panel">
+          <div class="panel-heading"><h3>Baseline 棘轮水位</h3><span id="baseline-state" class="pill">—</span></div>
+          <div id="baseline-list" class="metric-list"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-heading"><h3>Radar 热点</h3><span class="muted">Top 5</span></div>
+          <div id="hotspot-list" class="hotspot-list"></div>
+        </div>
+        <div class="panel screenshot-panel">
+          <div class="panel-heading"><h3>最近 UI 截图</h3><span class="muted">verify --ui</span></div>
+          <div id="screenshot-grid" class="screenshot-grid"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>SlopGuard · local-first dashboard</span>
+    <span id="last-updated"></span>
+  </footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>

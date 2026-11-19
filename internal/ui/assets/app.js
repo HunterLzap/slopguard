@@ -18,7 +18,9 @@
     verifyResult: null,
     verifying: false,
     guardStatus: null,
+    mcpData: null,
     diffPreview: null,
+    onboardingDismissed: localStorage.getItem("slopguard.onboardingDismissed") === "1",
   };
 
   const $ = (id) => document.getElementById(id);
@@ -63,6 +65,127 @@
     if (!path) return "全部项目";
     const parts = String(path).split(/[\\/]/).filter(Boolean);
     return parts.length ? parts[parts.length - 1] : path;
+  }
+
+  function shortPathDisplay(path) {
+    if (!path) return "";
+    return String(path).replace(/^\/(?:Users|home)\/[^/]+/, "~");
+  }
+
+  // 全局悬浮提示（规避卡片 overflow 裁切）
+  function initFloatingTooltips() {
+    const tipEl = $("global-tooltip");
+    if (!tipEl) return;
+    let activeTrigger = null;
+
+    function hideTip() {
+      activeTrigger = null;
+      tipEl.hidden = true;
+      tipEl.textContent = "";
+    }
+
+    function showTip(trigger) {
+      const text = trigger?.dataset?.tip;
+      if (!text) {
+        hideTip();
+        return;
+      }
+      activeTrigger = trigger;
+      tipEl.textContent = text;
+      tipEl.hidden = false;
+
+      const rect = trigger.getBoundingClientRect();
+      const tipRect = tipEl.getBoundingClientRect();
+      const pad = 8;
+      let left = rect.left + rect.width / 2 - tipRect.width / 2;
+      left = Math.max(pad, Math.min(left, window.innerWidth - tipRect.width - pad));
+
+      let top = rect.top - tipRect.height - 6;
+      if (top < pad) {
+        top = rect.bottom + 6;
+      }
+      if (top + tipRect.height > window.innerHeight - pad) {
+        top = Math.max(pad, window.innerHeight - tipRect.height - pad);
+      }
+      tipEl.style.left = `${Math.round(left)}px`;
+      tipEl.style.top = `${Math.round(top)}px`;
+    }
+
+    document.addEventListener("mouseover", (e) => {
+      const trigger = e.target.closest?.("[data-tip]");
+      if (trigger) {
+        showTip(trigger);
+      }
+    });
+    document.addEventListener("mouseout", (e) => {
+      if (!activeTrigger) return;
+      if (!e.relatedTarget || !activeTrigger.contains(e.relatedTarget)) {
+        hideTip();
+      }
+    });
+    document.addEventListener("focusin", (e) => {
+      const trigger = e.target.closest?.("[data-tip]");
+      if (trigger) showTip(trigger);
+    });
+    document.addEventListener("focusout", () => hideTip());
+    window.addEventListener("scroll", hideTip, true);
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") hideTip();
+    });
+  }
+
+  async function selectProject(projectPath) {
+    state.project = projectPath || "";
+    if (state.project) {
+      localStorage.setItem("slopguard.project", state.project);
+    } else {
+      localStorage.removeItem("slopguard.project");
+    }
+    const sel = $("project-select");
+    if (sel) sel.value = state.project;
+    updateTopbarProject();
+    await refresh();
+  }
+
+  function renderQuickProjectAction(container, emptyLabel) {
+    if (!container) return;
+    container.innerHTML = "";
+    if (!state.projects.length) {
+      const label = document.createElement("span");
+      label.className = "muted";
+      label.textContent = emptyLabel || "尚未添加项目";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn btn-sm btn-primary";
+      btn.textContent = "+ 添加项目";
+      btn.addEventListener("click", openAddProjectModal);
+      container.append(label, btn);
+      return;
+    }
+
+    const chips = document.createElement("div");
+    chips.className = "quick-project-chips";
+    const label = document.createElement("span");
+    label.className = "muted";
+    label.textContent = "选择项目：";
+    chips.appendChild(label);
+
+    for (const p of state.projects.slice(0, 5)) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "btn btn-sm btn-secondary";
+      chip.textContent = shortProject(p.project_path);
+      chip.title = p.project_path;
+      chip.addEventListener("click", () => selectProject(p.project_path));
+      chips.appendChild(chip);
+    }
+
+    const addBtn = document.createElement("button");
+    addBtn.type = "button";
+    addBtn.className = "btn btn-sm btn-ghost";
+    addBtn.textContent = "+ 添加项目";
+    addBtn.addEventListener("click", openAddProjectModal);
+    container.append(chips, addBtn);
   }
 
   function projectQuery(extra = {}) {
@@ -161,6 +284,13 @@
   }
 
   // 项目列表
+  function updateAddProjectButtonStyle() {
+    const addBtn = $("btn-open-add-project");
+    if (!addBtn) return;
+    const isEmpty = state.projects.length === 0;
+    addBtn.className = `btn ${isEmpty ? "btn-primary" : "btn-secondary"} btn-add-project`;
+  }
+
   async function loadProjects() {
     try {
       const data = await api("/api/projects");
@@ -185,6 +315,7 @@
         state.project = "";
       }
       select.value = state.project;
+      updateAddProjectButtonStyle();
       updateTopbarProject();
       renderProjectsTable(state.projects);
     } catch (error) {
@@ -195,14 +326,33 @@
   function updateTopbarProject() {
     const pathEl = $("current-project-path");
     const dot = $("project-health-dot");
+    const verifyBtn = $("btn-run-verify");
+    const verifyUIBtn = $("btn-run-verify-ui");
+
     if (!state.project) {
       pathEl.textContent = "全部项目";
       pathEl.title = "全部项目";
       dot.className = "health-dot neutral";
+      for (const b of [verifyBtn, verifyUIBtn]) {
+        if (b) {
+          b.disabled = true;
+          b.dataset.tip = "请先选择或添加项目";
+          b.title = "请先选择或添加项目";
+        }
+      }
       return;
     }
-    pathEl.textContent = state.project;
+
+    pathEl.textContent = shortPathDisplay(state.project);
     pathEl.title = state.project;
+    for (const b of [verifyBtn, verifyUIBtn]) {
+      if (b) {
+        b.disabled = state.verifying;
+        delete b.dataset.tip;
+        b.title = "";
+      }
+    }
+
     const proj = state.projects.find((p) => p.project_path === state.project);
     if (!proj) {
       dot.className = "health-dot neutral";
@@ -213,6 +363,37 @@
     } else {
       dot.className = "health-dot pass";
     }
+  }
+
+  function renderOnboardingCard() {
+    const card = $("onboarding-card");
+    if (!card) return;
+    const hasProjects = state.projects.length > 0;
+    const hasGuard = Number(state.guardStatus?.guarded_projects || 0) > 0 ||
+      Boolean(state.guardStatus?.status?.enabled || state.guardStatus?.status?.hook_installed);
+    const hasAgent = Boolean(
+      (state.mcpData?.clients || []).some((c) => c.configured) ||
+      (state.mcpData?.skills || []).some((s) => s.configured)
+    );
+
+    const stepProj = $("onboard-step-project");
+    const stepGuard = $("onboard-step-guard");
+    const stepAgent = $("onboard-step-agent");
+    if (stepProj) {
+      stepProj.textContent = hasProjects ? "已完成" : "待完成";
+      stepProj.className = `pill ${hasProjects ? "pass" : "warn"}`;
+    }
+    if (stepGuard) {
+      stepGuard.textContent = hasGuard ? "已开启" : "未开启";
+      stepGuard.className = `pill ${hasGuard ? "pass" : ""}`;
+    }
+    if (stepAgent) {
+      stepAgent.textContent = hasAgent ? "已接入" : "未接入";
+      stepAgent.className = `pill ${hasAgent ? "pass" : ""}`;
+    }
+
+    const allDone = hasProjects && hasGuard && hasAgent;
+    card.hidden = state.onboardingDismissed || allDone;
   }
 
   // 总览
@@ -390,7 +571,7 @@
       tr.innerHTML = `
         <td>
           <div style="font-weight:600">${escapeHTML(shortProject(p.project_path))}</div>
-          <div class="mono muted">${escapeHTML(p.project_path)}</div>
+          <div class="mono muted" title="${escapeHTML(p.project_path)}">${escapeHTML(shortPathDisplay(p.project_path))}</div>
         </td>
         <td class="mono muted">${escapeHTML(formatShortTime(p.last_scan_at))}</td>
         <td class="num">${runs}</td>
@@ -398,13 +579,7 @@
         <td class="num">${escapes}</td>
         <td class="num">${pending}</td>
         <td>${guardCell}</td>`;
-      tr.addEventListener("click", () => {
-        state.project = p.project_path;
-        localStorage.setItem("slopguard.project", state.project);
-        $("project-select").value = state.project;
-        updateTopbarProject();
-        refresh();
-      });
+      tr.addEventListener("click", () => selectProject(p.project_path));
       body.appendChild(tr);
     }
   }
@@ -569,10 +744,12 @@
         aiAdviceHTML = `
           <div class="ai-advice pending-ai">
             <div class="ai-advice-head">
-              <span class="ai-advice-title">等待 Agent 分析（通过 <code>sg_list_inbox</code> + <code>sg_submit_analysis</code>）</span>
-              <button class="btn btn-secondary btn-sm copy-prompt-btn" type="button">复制分析指令</button>
+              <div class="title-with-tip">
+                <span class="ai-advice-title">待 Agent 分析</span>
+                <button type="button" class="help-tip" data-tip="复制分析指令发给你的编程 Agent（通过 sg_list_inbox 与 sg_submit_analysis 评估），完成后将推送至「待我校验」" aria-label="分析说明">?</button>
+              </div>
+              <button class="btn btn-secondary btn-sm copy-prompt-btn" type="button">复制指令</button>
             </div>
-            <p class="ai-advice-reason muted">点击右侧按钮复制提示词发送给你的编程 Agent，Agent 将自动评估该错题并给出中文理由与规则草案。</p>
           </div>`;
       }
 
@@ -619,7 +796,7 @@
           try {
             await navigator.clipboard.writeText(prompt);
             copyBtn.textContent = "已复制";
-            setTimeout(() => { copyBtn.textContent = "复制分析指令"; }, 1800);
+            setTimeout(() => { copyBtn.textContent = "复制指令"; }, 1800);
           } catch {
             copyBtn.textContent = "复制失败";
           }
@@ -770,13 +947,13 @@
   // 坏样本雷达与基线棘轮
   function renderRadar(data) {
     state.radar = data || {};
-    $("radar-project-badge").textContent = state.project ? shortProject(state.project) : "请选择项目";
+    $("radar-project-badge").textContent = state.project ? shortProject(state.project) : "未选项目";
 
     const skipped = Array.isArray(data.skipped) ? data.skipped : [];
     const skipBanner = $("radar-skipped-banner");
     if (skipped.length) {
       skipBanner.hidden = false;
-      skipBanner.innerHTML = `<strong>雷达已跳过 ${skipped.length} 个维度：</strong> ` +
+      skipBanner.innerHTML = `<strong>跳过 ${skipped.length} 个维度：</strong> ` +
         skipped.map((s) => `<span class="mono">${escapeHTML(s.dimension || "?")}/${escapeHTML(s.tool || "?")}</span> (${escapeHTML(s.reason || "不可用")})`).join(" · ");
     } else {
       skipBanner.hidden = true;
@@ -784,7 +961,7 @@
 
     const baseline = data.baseline || {};
     const statePill = $("baseline-state");
-    $("baseline-updated").textContent = baseline.updated_at ? `更新时间：${formatDate(baseline.updated_at)}` : "更新时间：—";
+    $("baseline-updated").textContent = baseline.updated_at ? formatShortTime(baseline.updated_at) : "";
     if (!baseline.available) {
       statePill.textContent = "未配置";
       statePill.className = "pill";
@@ -804,8 +981,13 @@
     const metricList = $("baseline-list");
     metricList.innerHTML = "";
     const metrics = Array.isArray(baseline.metrics) ? baseline.metrics : [];
-    if (!metrics.length) {
-      metricList.innerHTML = `<p class="empty-state">${baseline.available ? "基线中暂无逃生舱指标。" : "未找到 baseline.json，请先运行 <code>slopguard init</code>。"}</p>`;
+    if (!state.project) {
+      const box = document.createElement("div");
+      box.className = "quick-project-bar";
+      renderQuickProjectAction(box, "暂无项目");
+      metricList.appendChild(box);
+    } else if (!metrics.length) {
+      metricList.innerHTML = `<p class="empty-state">${baseline.available ? "暂无逃生舱指标" : "未找到 baseline.json"}</p>`;
     } else {
       const head = document.createElement("div");
       head.className = "metric-row metric-head";
@@ -912,10 +1094,19 @@
     if (!state.project) {
       emptyProj.hidden = false;
       content.hidden = true;
+      renderQuickProjectAction(emptyProj, "尚未添加项目");
       return;
     }
     emptyProj.hidden = true;
     content.hidden = false;
+
+    const nameEl = $("project-meta-name");
+    const pathEl = $("project-meta-path");
+    if (nameEl) nameEl.textContent = shortProject(state.project);
+    if (pathEl) {
+      pathEl.textContent = shortPathDisplay(state.project);
+      pathEl.title = state.project;
+    }
 
     const adapters = Array.isArray(meta?.adapters) ? meta.adapters : [];
     $("adapters-count").textContent = `${adapters.length} 个适配器`;
@@ -1023,13 +1214,13 @@
     const btn = $("btn-submit-add-project");
     if (!path) {
       feedback.hidden = false;
-      feedback.textContent = "请先选择或输入项目目录路径。";
+      feedback.textContent = "请先选择项目目录";
       return;
     }
     btn.disabled = true;
-    btn.textContent = "正在初始化与体检…";
+    btn.textContent = "处理中…";
     feedback.hidden = false;
-    feedback.textContent = "正在初始化项目配置并运行首次全量体检，请稍候…";
+    feedback.textContent = "正在初始化并执行首次体检…";
     try {
       const res = await api("/api/projects/add", {
         method: "POST",
@@ -1040,14 +1231,13 @@
       localStorage.setItem("slopguard.project", state.project);
       closeAddProjectModal();
       await loadProjects();
-      updateTopbarProject();
       await refresh();
     } catch (error) {
       feedback.hidden = false;
       feedback.textContent = error.message;
     } finally {
       btn.disabled = false;
-      btn.textContent = "初始化并首次体检";
+      btn.textContent = "添加并体检";
     }
   }
 
@@ -1182,6 +1372,7 @@
       });
       closeDiffModal();
       await loadMCPClients();
+      renderOnboardingCard();
     } catch (error) {
       feedback.hidden = false;
       feedback.textContent = `操作失败：${error.message}`;
@@ -1202,11 +1393,12 @@
       row.className = "mcp-client-row";
       const statusPill = item.configured
         ? '<span class="pill pass">已接入</span>'
-        : (item.detected ? '<span class="pill warn">未接入</span>' : '<span class="pill">未检测到</span>');
+        : (item.detected ? '<span class="pill warn">未接入</span>' : '<span class="pill">未检测</span>');
       const recPill = item.recommended ? '<span class="pill accent">推荐</span>' : "";
-      const backupPill = item.has_backup ? '<span class="pill" title="已自动备份至 ~/.slopguard/backups/">已备份</span>' : "";
-      const applyLabel = item.configured ? "预览更新" : "预览并接入";
-      const restoreLabel = item.has_backup ? "一键还原" : "撤销接入";
+      const backupPill = item.has_backup ? '<span class="pill">已备份</span>' : "";
+      const applyLabel = item.configured ? "更新" : (kind === "skill" ? "部署" : "接入");
+      const applyBtnCls = (item.recommended && !item.configured) ? "btn-primary" : "btn-secondary";
+      const restoreLabel = item.has_backup ? "还原" : "移除";
       const restoreBtnHTML = (item.configured || item.has_backup)
         ? `<button class="btn btn-sm btn-ghost" data-op="restore" type="button">${restoreLabel}</button>`
         : "";
@@ -1219,11 +1411,11 @@
             ${statusPill}
             ${backupPill}
           </div>
-          <div class="mcp-client-path mono" title="${escapeHTML(item.config_path)}">${escapeHTML(item.config_path)}</div>
+          <div class="mcp-client-path mono" title="${escapeHTML(item.config_path)}">${escapeHTML(shortPathDisplay(item.config_path))}</div>
         </div>
         <div class="mcp-client-actions">
           ${restoreBtnHTML}
-          <button class="btn btn-sm ${item.configured ? "btn-secondary" : "btn-primary"}" data-op="install" type="button">${applyLabel}</button>
+          <button class="btn btn-sm ${applyBtnCls}" data-op="install" type="button">${applyLabel}</button>
         </div>`;
 
       row.querySelector('button[data-op="install"]').addEventListener("click", async (e) => {
@@ -1259,17 +1451,48 @@
   async function loadMCPClients() {
     const mcpContainer = $("mcp-clients-list");
     const skillContainer = $("skill-targets-list");
+    const hintEl = $("mcp-project-hint");
     if (!mcpContainer) return;
     try {
       const data = await api(`/api/mcp-clients?${projectQuery()}`);
+      state.mcpData = data;
       const clients = Array.isArray(data.clients) ? data.clients : [];
       const skillTargets = Array.isArray(data.skills) ? data.skills : [];
-      renderTargetList(mcpContainer, clients, "mcp", "未探测到支持的 AI 客户端配置路径。");
-      renderTargetList(skillContainer, skillTargets, "skill", "选择一个具体项目后可一键部署项目级 SKILL.md / Cursor Rule。");
+      if (hintEl) {
+        if (!state.project) {
+          hintEl.hidden = false;
+          renderQuickProjectAction(hintEl, "先添加项目即可接入项目级 .mcp.json");
+        } else {
+          hintEl.hidden = true;
+          hintEl.innerHTML = "";
+        }
+      }
+      renderTargetList(mcpContainer, clients, "mcp", "未探测到支持的 AI 客户端");
+      renderTargetList(skillContainer, skillTargets, "skill", "选择项目后可部署项目级规则文件");
     } catch (error) {
-      mcpContainer.innerHTML = `<p class="empty-state">加载 Agent 客户端列表失败：${escapeHTML(error.message)}</p>`;
+      mcpContainer.innerHTML = `<p class="empty-state">加载失败：${escapeHTML(error.message)}</p>`;
       if (skillContainer) skillContainer.innerHTML = "";
     }
+  }
+
+  function openGenericMCPModal() {
+    const bin = state.mcpData?.binary_path || "slopguard";
+    const args = state.project ? ["mcp", "--root", state.project] : ["mcp"];
+    const snippet = JSON.stringify({
+      mcpServers: {
+        slopguard: {
+          command: bin,
+          args,
+        },
+      },
+    }, null, 2);
+    $("generic-mcp-code").textContent = snippet;
+    $("btn-copy-generic-mcp").textContent = "复制配置";
+    $("generic-mcp-modal").hidden = false;
+  }
+
+  function closeGenericMCPModal() {
+    $("generic-mcp-modal").hidden = true;
   }
 
   // 后台无感自动守护
@@ -1293,13 +1516,16 @@
     const st = data?.status || null;
 
     if (!state.project || !st) {
-      if (badge) badge.textContent = "全部项目";
-      if (emptyEl) emptyEl.hidden = false;
+      if (badge) badge.textContent = "未选项目";
+      if (emptyEl) {
+        emptyEl.hidden = false;
+        renderQuickProjectAction(emptyEl, "尚未添加项目");
+      }
       if (controlsEl) controlsEl.hidden = true;
       if (topbarPill) {
         if (guardedCount > 0) {
           topbarPill.hidden = false;
-          topbarPill.textContent = `已守护 ${guardedCount} 个项目`;
+          topbarPill.textContent = `已守护 ${guardedCount}`;
           topbarPill.className = "pill pass";
         } else {
           topbarPill.hidden = true;
@@ -1315,7 +1541,7 @@
     const active = Boolean(st.enabled || st.hook_installed);
     if (topbarPill) {
       topbarPill.hidden = !active;
-      topbarPill.textContent = st.running ? "自动体检中…" : "自动守护中";
+      topbarPill.textContent = st.running ? "体检中…" : "守护中";
       topbarPill.className = `pill ${st.running ? "accent" : "pass"}`;
     }
 
@@ -1333,14 +1559,17 @@
       watchPill.className = "pill";
     }
     if (st.last_error) {
-      watchDetail.textContent = `最近异常：${st.last_error}`;
+      watchDetail.hidden = false;
+      watchDetail.textContent = `异常：${st.last_error}`;
     } else if (st.last_scan_at) {
-      const outcomeText = st.last_passed === false ? `发现 ${st.last_findings || 0} 项问题（已记入错题栏）` : "通过";
-      watchDetail.textContent = `最近自动守护体检 (${formatShortTime(st.last_scan_at)})：${outcomeText}`;
+      watchDetail.hidden = false;
+      const outcomeText = st.last_passed === false ? `发现 ${st.last_findings || 0} 项` : "通过";
+      watchDetail.textContent = `最近 (${formatShortTime(st.last_scan_at)})：${outcomeText}`;
     } else {
-      watchDetail.textContent = `检测到项目文件变更并稳定 ${st.debounce_sec || 5} 秒后自动后台局部体检`;
+      watchDetail.hidden = true;
+      watchDetail.textContent = "";
     }
-    watchBtn.textContent = st.enabled ? "关闭守护" : "开启守护";
+    watchBtn.textContent = st.enabled ? "关闭" : "开启";
     watchBtn.className = `btn btn-sm ${st.enabled ? "btn-ghost" : "btn-primary"}`;
 
     const hookPill = $("guard-hook-pill");
@@ -1349,7 +1578,8 @@
     if (!st.is_git_repo) {
       hookPill.textContent = "非 Git 仓库";
       hookPill.className = "pill";
-      hookDetail.textContent = "当前目录未检测到 .git，无法安装 Git post-commit 钩子";
+      hookDetail.hidden = true;
+      hookDetail.textContent = "";
       hookBtn.disabled = true;
       hookBtn.textContent = "不可用";
     } else {
@@ -1357,14 +1587,17 @@
       if (st.hook_installed) {
         hookPill.textContent = "已安装";
         hookPill.className = "pill pass";
-        hookDetail.textContent = `已安装非阻塞钩子 (${st.hook_path || ".git/hooks/post-commit"})，提交后后台静默留痕`;
-        hookBtn.textContent = "移除钩子";
+        hookDetail.hidden = false;
+        hookDetail.textContent = shortPathDisplay(st.hook_path || ".git/hooks/post-commit");
+        hookDetail.title = st.hook_path || "";
+        hookBtn.textContent = "移除";
         hookBtn.className = "btn btn-sm btn-ghost";
       } else {
         hookPill.textContent = "未安装";
         hookPill.className = "pill warn";
-        hookDetail.textContent = "提交后后台静默记录错题，绝不阻塞 git commit（写入前自动备份原钩子）";
-        hookBtn.textContent = "安装钩子";
+        hookDetail.hidden = true;
+        hookDetail.textContent = "";
+        hookBtn.textContent = "安装";
         hookBtn.className = "btn btn-sm btn-secondary";
       }
     }
@@ -1386,6 +1619,7 @@
         body: JSON.stringify({ project: state.project, ...patch }),
       });
       await Promise.all([loadGuardStatus(), loadProjects()]);
+      renderOnboardingCard();
     } catch (error) {
       alert(`守护设置失败：${error.message}`);
     } finally {
@@ -1418,9 +1652,9 @@
       const sc = res.scanned || {};
       if (banner) {
         banner.hidden = false;
-        banner.innerHTML = `<strong>只读嗅探完成（近 ${res.days || 14} 天，零文件修改）：</strong>` +
-          `已扫描 Git 提交 ${sc.git_commits || 0} 条、Claude 日志 ${sc.claude_files || 0} 份、Codex 日志 ${sc.codex_files || 0} 份、Antigravity 日志 ${sc.antigravity_files || 0} 份；` +
-          `提取高信号错误 <strong>${res.found || 0}</strong> 条，写入错题栏 <strong>${res.imported || 0}</strong> 条。`;
+        banner.innerHTML = `<strong>嗅探完成（近 ${res.days || 14} 天）：</strong>` +
+          `Git ${sc.git_commits || 0} 提交 · Claude ${sc.claude_files || 0} · Codex ${sc.codex_files || 0} · Antigravity ${sc.antigravity_files || 0}；` +
+          `提取 <strong>${res.found || 0}</strong> 条，入库 <strong>${res.imported || 0}</strong> 条。`;
       }
       await refresh();
       if ((res.imported || 0) > 0 && state.reviewStatus === "pending_user") {
@@ -1436,7 +1670,7 @@
       }
     } finally {
       btn.disabled = false;
-      btn.textContent = "嗅探会话与返工";
+      btn.textContent = "嗅探会话";
     }
   }
 
@@ -1445,15 +1679,15 @@
     if (state.verifying) return;
     if (!state.project) {
       switchTab("verify");
-      $("verify-status-pill").textContent = "请先选择一个项目";
+      $("verify-status-pill").textContent = "请先选择项目";
       $("verify-status-pill").className = "pill warn";
       return;
     }
 
     state.verifying = true;
-    const buttons = [$("btn-run-verify"), $("btn-run-verify-ui"), $("verify-tab-run"), $("verify-tab-run-ui")];
+    const buttons = [$("btn-run-verify"), $("btn-run-verify-ui")].filter(Boolean);
     buttons.forEach((b) => { b.disabled = true; });
-    $("verify-status-pill").textContent = withUI ? "正在执行体检 + UI..." : "正在执行体检...";
+    $("verify-status-pill").textContent = withUI ? "体检 + UI 中…" : "体检中…";
     $("verify-status-pill").className = "pill accent";
     switchTab("verify");
 
@@ -1476,7 +1710,7 @@
       $("verify-status-pill").className = "pill fail";
     } finally {
       state.verifying = false;
-      buttons.forEach((b) => { b.disabled = false; });
+      updateTopbarProject();
     }
   }
 
@@ -1553,14 +1787,17 @@
   }
 
   function renderScreenshots(screenshots) {
+    const card = $("screenshots-card");
     const grid = $("screenshot-grid");
     const empty = $("screenshot-empty");
-    $("screenshots-count").textContent = `${screenshots.length} 张截图`;
+    $("screenshots-count").textContent = `${screenshots.length} 张`;
     grid.innerHTML = "";
     if (!screenshots.length) {
+      if (card) card.hidden = true;
       empty.hidden = false;
       return;
     }
+    if (card) card.hidden = false;
     empty.hidden = true;
     for (const shot of screenshots) {
       const card = document.createElement("div");
@@ -1618,6 +1855,7 @@
 
       if (projectsData && Array.isArray(projectsData.projects)) {
         state.projects = projectsData.projects;
+        updateAddProjectButtonStyle();
         renderProjectsTable(state.projects);
         updateTopbarProject();
       }
@@ -1628,6 +1866,7 @@
       renderRadar(radar);
       renderProjectMeta(meta || null);
       await Promise.all([loadMCPClients(), loadGuardStatus()]);
+      renderOnboardingCard();
 
       $("last-updated").textContent = `更新于 ${new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
     } catch (error) {
@@ -1641,6 +1880,7 @@
   window.slopguardSwitchTab = (tab) => switchTab(tab);
 
   async function start() {
+    initFloatingTooltips();
     applyTheme(state.theme);
     const hashMatch = (window.location.hash || "").match(/tab=([a-z]+)/i);
     if (hashMatch) {
@@ -1701,14 +1941,31 @@
       $(id).addEventListener("change", applyRuleFilters);
     });
 
-    // 体检操作
+    // 体检操作（统一由顶栏触发）
     $("btn-run-verify").addEventListener("click", () => runVerify(false));
     $("btn-run-verify-ui").addEventListener("click", () => runVerify(true));
-    $("verify-tab-run").addEventListener("click", () => runVerify(false));
-    $("verify-tab-run-ui").addEventListener("click", () => runVerify(true));
 
-    // 零命令行交互：添加项目、服务开关、基线操作、自动守护、安全 MCP/Skill 预览与还原
+    // 零命令行交互：添加项目、新手引导、服务开关、基线操作、自动守护、安全 MCP/Skill 预览与还原
     $("btn-open-add-project").addEventListener("click", openAddProjectModal);
+    $("btn-verify-add-project")?.addEventListener("click", openAddProjectModal);
+    document.querySelectorAll(".js-open-add-project").forEach((btn) => {
+      btn.addEventListener("click", openAddProjectModal);
+    });
+    $("btn-onboard-add-project")?.addEventListener("click", openAddProjectModal);
+    $("btn-onboard-guard")?.addEventListener("click", () => {
+      switchTab("verify");
+      $("auto-guard-card")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    $("btn-onboard-agent")?.addEventListener("click", () => {
+      switchTab("verify");
+      $("agent-connect-card")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    $("btn-dismiss-onboarding")?.addEventListener("click", () => {
+      state.onboardingDismissed = true;
+      localStorage.setItem("slopguard.onboardingDismissed", "1");
+      $("onboarding-card").hidden = true;
+    });
+
     $("add-project-close").addEventListener("click", closeAddProjectModal);
     $("add-project-cancel").addEventListener("click", closeAddProjectModal);
     $("add-project-backdrop").addEventListener("click", closeAddProjectModal);
@@ -1718,6 +1975,20 @@
     $("btn-baseline-tighten").addEventListener("click", () => runBaselineAction("tighten"));
     $("btn-baseline-reset").addEventListener("click", () => runBaselineAction("reset"));
     $("btn-refresh-mcp").addEventListener("click", loadMCPClients);
+    $("btn-generic-mcp")?.addEventListener("click", openGenericMCPModal);
+    $("generic-mcp-close")?.addEventListener("click", closeGenericMCPModal);
+    $("generic-mcp-cancel")?.addEventListener("click", closeGenericMCPModal);
+    $("generic-mcp-backdrop")?.addEventListener("click", closeGenericMCPModal);
+    $("btn-copy-generic-mcp")?.addEventListener("click", async () => {
+      const btn = $("btn-copy-generic-mcp");
+      try {
+        await navigator.clipboard.writeText($("generic-mcp-code").textContent || "");
+        btn.textContent = "已复制";
+        setTimeout(() => { btn.textContent = "复制配置"; }, 1800);
+      } catch {
+        btn.textContent = "复制失败";
+      }
+    });
     $("btn-toggle-guard-watch").addEventListener("click", () => {
       const enabled = Boolean(state.guardStatus?.status?.enabled);
       toggleGuard({ enabled: !enabled });
@@ -1738,6 +2009,8 @@
       if (e.key !== "Escape") return;
       if (!$("diff-preview-modal").hidden) {
         closeDiffModal();
+      } else if (!$("generic-mcp-modal").hidden) {
+        closeGenericMCPModal();
       } else if (!$("add-project-modal").hidden) {
         closeAddProjectModal();
       } else if (!$("lightbox").hidden) {
@@ -1746,16 +2019,7 @@
     });
 
     // 项目切换与刷新
-    $("project-select").addEventListener("change", async (e) => {
-      state.project = e.target.value;
-      if (state.project) {
-        localStorage.setItem("slopguard.project", state.project);
-      } else {
-        localStorage.removeItem("slopguard.project");
-      }
-      updateTopbarProject();
-      await refresh();
-    });
+    $("project-select").addEventListener("change", (e) => selectProject(e.target.value));
     $("refresh-button").addEventListener("click", refresh);
 
     await Promise.all([loadProjects(), loadServiceStatus()]);

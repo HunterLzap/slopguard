@@ -366,7 +366,7 @@ func discoverSkillTargets(home, project string) []skillTargetStatus {
 	if project != "" {
 		add(
 			"project_claude_skill",
-			"当前项目 Agent Skill (.claude/skills/slopguard)",
+			"当前项目 Skill (.claude/skills)",
 			filepath.Join(project, ".claude", "skills", "slopguard", "SKILL.md"),
 			"project",
 			true,
@@ -374,7 +374,7 @@ func discoverSkillTargets(home, project string) []skillTargetStatus {
 		)
 		add(
 			"project_cursor_rule",
-			"当前项目 Cursor Rule (.cursor/rules/slopguard.mdc)",
+			"当前项目 Cursor Rule (.cursor/rules)",
 			filepath.Join(project, ".cursor", "rules", "slopguard.mdc"),
 			"project",
 			true,

@@ -362,6 +362,190 @@ func buildLocalMistakeHint(m store.MistakeRecord) string {
 	}
 }
 
+func isThirdPartyNoisePath(m store.MistakeRecord) bool {
+	hay := strings.ToLower(m.Summary + "\n" + m.BadSnippet)
+	noiseMarkers := []string{
+		"/.cache/", "\\.cache\\", ".cache/uv/",
+		"/node_modules/", "\\node_modules\\",
+		"/.venv/", "\\.venv\\", "/site-packages/",
+		"/__pycache__/", "/.pytest_cache/", "/.ruff_cache/", "/.mypy_cache/",
+	}
+	for _, marker := range noiseMarkers {
+		if strings.Contains(hay, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractRuleTokenAfterColon(summary, prefix string) string {
+	lower := strings.ToLower(summary)
+	idx := strings.Index(lower, prefix)
+	if idx < 0 {
+		return ""
+	}
+	rest := summary[idx+len(prefix):]
+	end := strings.IndexAny(rest, "] \t\r\n:")
+	if end > 0 {
+		return strings.TrimSpace(rest[:end])
+	}
+	return ""
+}
+
+func deriveRuleFromMistake(m store.MistakeRecord) (engineName, ruleID, payload string) {
+	summary := strings.TrimSpace(m.Summary)
+	lower := strings.ToLower(summary)
+	shortFP := m.Fingerprint
+	if len(shortFP) > 8 {
+		shortFP = shortFP[:8]
+	}
+
+	switch {
+	case strings.Contains(lower, "[pyright"):
+		engineName = "pyright"
+		ruleID = extractRuleTokenAfterColon(summary, "[pyright:")
+		if ruleID == "" {
+			ruleID = "pyright-" + shortFP
+		}
+		payload = fmt.Sprintf("{\n  %q: \"error\"\n}", ruleID)
+	case strings.Contains(lower, "[ruff"):
+		engineName = "ruff"
+		ruleID = extractRuleTokenAfterColon(summary, "[ruff:")
+		if ruleID == "" {
+			for _, code := range []string{"F401", "F841", "F821", "E711", "E712", "B006", "UP"} {
+				if strings.Contains(summary, code) {
+					ruleID = code
+					break
+				}
+			}
+		}
+		if ruleID == "" && strings.Contains(lower, "noqa") {
+			ruleID = "RUF100"
+		}
+		if ruleID == "" {
+			ruleID = "ruff-" + shortFP
+		}
+		payload = fmt.Sprintf("[tool.ruff.lint]\nextend-select = [%q]", ruleID)
+	case strings.Contains(lower, "[eslint") || strings.Contains(lower, "no-explicit-any") || strings.Contains(lower, "no-unused-vars") || strings.Contains(lower, "no-console"):
+		engineName = "eslint"
+		ruleID = extractRuleTokenAfterColon(summary, "[eslint:")
+		if ruleID == "" {
+			for _, code := range []string{"@typescript-eslint/no-explicit-any", "no-unused-vars", "no-console"} {
+				if strings.Contains(lower, code) {
+					ruleID = code
+					break
+				}
+			}
+		}
+		if ruleID == "" {
+			ruleID = "eslint-" + shortFP
+		}
+		payload = fmt.Sprintf("{\n  \"rules\": {\n    %q: \"error\"\n  }\n}", ruleID)
+	case strings.Contains(lower, "ts2322") || strings.Contains(lower, "ts2345") || strings.Contains(lower, "[tsc"):
+		engineName = "tsc"
+		ruleID = extractRuleTokenAfterColon(summary, "[tsc:")
+		if ruleID == "" {
+			if strings.Contains(lower, "ts2322") {
+				ruleID = "TS2322"
+			} else if strings.Contains(lower, "ts2345") {
+				ruleID = "TS2345"
+			} else {
+				ruleID = "strict-types-" + shortFP
+			}
+		}
+		payload = fmt.Sprintf("// TypeScript guard for %s", ruleID)
+	case strings.Contains(lower, "ratchet:") || strings.EqualFold(m.Category, "escape"):
+		engineName = "slopguard"
+		ruleID = "no-new-escapes-" + shortFP
+		payload = "ratchet: disallow new ignore/noqa comments"
+	default:
+		engineName = "slopguard"
+		ruleID = "mistake-" + shortFP
+		if summary != "" {
+			payload = summary
+		} else {
+			payload = m.BadSnippet
+		}
+	}
+	return engineName, ruleID, payload
+}
+
+// analyzeMistakeDeterministic runs a zero-LLM deterministic assessment on a captured mistake,
+// classifying third-party noise vs repeatable issues and producing a concise Chinese rationale.
+func analyzeMistakeDeterministic(m store.MistakeRecord) (decision, reason, ruleDraft string) {
+	if isThirdPartyNoisePath(m) {
+		return "skip", "命中第三方缓存或虚拟环境目录（如 .cache / node_modules），属于环境噪音误报，建议忽略。", ""
+	}
+
+	_, _, draft := deriveRuleFromMistake(m)
+	hay := strings.ToLower(m.Summary + "\n" + m.BadSnippet)
+	cat := strings.ToLower(strings.TrimSpace(m.Category))
+
+	shouldRecommend := m.Count >= 2 ||
+		cat == "type" ||
+		cat == "escape" ||
+		strings.Contains(hay, "ratchet:") ||
+		strings.Contains(hay, "reportoptional") ||
+		strings.Contains(hay, "no-explicit-any") ||
+		strings.Contains(hay, "ts2322") ||
+		strings.Contains(hay, "ts2345") ||
+		strings.Contains(hay, "importerror") ||
+		strings.Contains(hay, "modulenotfounderror") ||
+		strings.Contains(hay, "f401") ||
+		strings.Contains(hay, "f841") ||
+		strings.Contains(hay, "no-unused-vars")
+
+	hint := buildLocalMistakeHint(m)
+	if shouldRecommend {
+		prefix := ""
+		if m.Count >= 2 {
+			prefix = fmt.Sprintf("该问题已累计触发 %d 次，", m.Count)
+		}
+		return "recommend", prefix + hint + " 建议转为项目防线规则长期拦截。", draft
+	}
+	return "skip", hint + " 当前仅偶发 1 次，建议先观察是否复发后再决定是否入库。", ""
+}
+
+func ensureRuleForApprovedMistake(ctx context.Context, db *store.Store, m store.MistakeRecord) error {
+	engineName, ruleID, defaultPayload := deriveRuleFromMistake(m)
+	payload := strings.TrimSpace(m.AIRuleDraft)
+	if payload == "" {
+		payload = defaultPayload
+	}
+	rationale := strings.TrimSpace(m.AIReason)
+	if rationale == "" {
+		rationale = buildLocalMistakeHint(m)
+	}
+	source := "manual"
+	if strings.TrimSpace(m.AIReason) != "" {
+		source = "agent"
+	}
+
+	existing, err := db.ListRuleLedger(ctx, store.RuleLedgerQuery{
+		ProjectPath: m.ProjectPath,
+		Engine:      engineName,
+	})
+	if err == nil {
+		for _, r := range existing {
+			if strings.EqualFold(r.RuleID, ruleID) && r.ProjectPath == m.ProjectPath {
+				return nil
+			}
+		}
+	}
+
+	return db.InsertRule(ctx, store.Rule{
+		Scope:       "project",
+		ProjectPath: m.ProjectPath,
+		Engine:      engineName,
+		RuleID:      ruleID,
+		Payload:     payload,
+		Rationale:   rationale,
+		Source:      source,
+		Status:      "active",
+		AppliedAt:   time.Now().UTC(),
+	})
+}
+
 func (s *Server) handleMistakes(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w, http.MethodGet)
@@ -426,6 +610,16 @@ func (s *Server) handleMistakeAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if action == "approve" {
+		var matchedMistake *store.MistakeRecord
+		if list, qErr := s.db.QueryMistakes(r.Context(), store.MistakeQuery{}); qErr == nil {
+			for i := range list {
+				if list[i].Fingerprint == fingerprint {
+					cp := list[i]
+					matchedMistake = &cp
+					break
+				}
+			}
+		}
 		if err := s.db.ApproveMistake(r.Context(), fingerprint); err != nil {
 			if errors.Is(err, store.ErrMistakeNotFound) {
 				writeError(w, http.StatusNotFound, "mistake not found")
@@ -434,11 +628,18 @@ func (s *Server) handleMistakeAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		ruleCreated := false
+		if matchedMistake != nil {
+			if rErr := ensureRuleForApprovedMistake(r.Context(), s.db, *matchedMistake); rErr == nil {
+				ruleCreated = true
+			}
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":            true,
 			"fingerprint":   fingerprint,
 			"status":        "promoted",
 			"review_status": "approved",
+			"rule_created":  ruleCreated,
 		})
 		return
 	}

@@ -2164,6 +2164,116 @@ code, pre, .mono {
   padding: 6px 10px;
   border-radius: 0 6px 6px 0;
   line-height: 1.45;
+  margin: 0;
+}
+
+/* Linear/Magpie Inbox Bar */
+.inbox-card {
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+
+.inbox-head-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 14px;
+  flex-wrap: wrap;
+}
+
+.inbox-sub-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-2);
+  flex-wrap: wrap;
+}
+
+.seg-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 9px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.seg-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg-dim);
+  background: transparent;
+  cursor: pointer;
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+
+.seg-tab:hover {
+  color: var(--fg);
+}
+
+.seg-tab.active {
+  background: var(--surface);
+  color: var(--fg);
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+.seg-tab .pill-count {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--fg-dim);
+}
+
+.seg-tab.active .pill-count {
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+.inbox-filter-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 240px;
+  flex-wrap: wrap;
+}
+
+.inbox-search-input {
+  flex: 1;
+  min-width: 170px;
+  max-width: 300px;
+}
+
+.compact-select {
+  height: 29px;
+  padding: 0 8px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 12px;
+  outline: none;
+}
+
+.compact-select:focus {
+  border-color: var(--accent);
 }
 
 @media (max-width: 860px) {

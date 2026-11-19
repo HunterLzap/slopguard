@@ -34,6 +34,7 @@ func (s *Server) registerActionRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/guard/status", s.handleGuardStatus)
 	mux.HandleFunc("/api/guard/toggle", s.handleGuardToggle)
 	mux.HandleFunc("/api/sessions/scan", s.handleScanSessions)
+	mux.HandleFunc("/api/mistakes/analyze-all", s.handleAnalyzeAllMistakes)
 }
 
 func resolveSelfBinary() (string, error) {
@@ -983,5 +984,51 @@ func (s *Server) handleToggleAgent(w http.ResponseWriter, r *http.Request) {
 		"ok":      true,
 		"agent":   updated,
 		"results": results,
+	})
+}
+
+func (s *Server) handleAnalyzeAllMistakes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	if s.db == nil {
+		writeError(w, http.StatusInternalServerError, "store is not available")
+		return
+	}
+	var req struct {
+		Project string `json:"project"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	project := strings.TrimSpace(req.Project)
+
+	pending, err := s.db.ListInboxMistakes(r.Context(), project, "pending_ai")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	analyzed, recommended, skipped := 0, 0, 0
+	for _, m := range pending {
+		decision, reason, ruleDraft := analyzeMistakeDeterministic(m)
+		if err := s.db.SubmitMistakeAnalysis(r.Context(), m.Fingerprint, decision, reason, ruleDraft); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("写入分析结果失败: %v", err))
+			return
+		}
+		analyzed++
+		if decision == "recommend" {
+			recommended++
+		} else {
+			skipped++
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":          true,
+		"analyzed":    analyzed,
+		"recommended": recommended,
+		"skipped":     skipped,
 	})
 }

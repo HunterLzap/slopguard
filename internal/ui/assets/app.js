@@ -599,10 +599,10 @@
     }
   }
 
-  // 错题栏（含 Agent 分析建议 + 人工校验）
-  function populateSelectOptions(selectEl, values, currentVal, labelFn) {
+  // 错题栏（含确定性一键分析 + Agent 建议 + 转为规则）
+  function populateSelectOptions(selectEl, values, currentVal, labelFn, allLabel = "全部") {
     const existing = Array.from(new Set(values.filter(Boolean))).sort();
-    selectEl.innerHTML = '<option value="">全部</option>';
+    selectEl.innerHTML = `<option value="">${escapeHTML(allLabel)}</option>`;
     for (const val of existing) {
       const opt = document.createElement("option");
       opt.value = val;
@@ -704,22 +704,30 @@
       }
     }
 
-    $("count-pending-user").textContent = String(counts.pending_user);
-    $("count-pending-ai").textContent = String(counts.pending_ai);
-    $("count-all-mistakes").textContent = String(mistakes.length);
-    $("count-ignored").textContent = String(counts.ignored);
+    const pendingTotal = counts.pending_user + counts.pending_ai;
+    const pendEl = $("count-pending");
+    if (pendEl) pendEl.textContent = String(pendingTotal);
+    const allEl = $("count-all-mistakes");
+    if (allEl) allEl.textContent = String(mistakes.length);
+    const ignEl = $("count-ignored");
+    if (ignEl) ignEl.textContent = String(counts.ignored);
 
-    const actionNeeded = counts.pending_user + counts.pending_ai;
-    $("stat-candidates").textContent = actionNeeded.toLocaleString();
-    $("stat-candidates").className = "stat-value " + (actionNeeded > 0 ? "warn" : "");
-    $("stat-candidates-sub").textContent = `待校验 ${counts.pending_user} · 待深入 ${counts.pending_ai}`;
+    const analyzeBtn = $("btn-analyze-all");
+    if (analyzeBtn) {
+      analyzeBtn.hidden = counts.pending_ai === 0;
+      analyzeBtn.textContent = `一键分析 (${counts.pending_ai})`;
+    }
+
+    $("stat-candidates").textContent = pendingTotal.toLocaleString();
+    $("stat-candidates").className = "stat-value " + (pendingTotal > 0 ? "warn" : "");
+    $("stat-candidates-sub").textContent = `已分析 ${counts.pending_user} · 待分析 ${counts.pending_ai}`;
 
     const badge = $("badge-mistakes");
-    badge.textContent = String(counts.pending_user || actionNeeded);
-    badge.hidden = actionNeeded === 0;
+    badge.textContent = String(pendingTotal);
+    badge.hidden = pendingTotal === 0;
 
-    populateSelectOptions($("mistakes-filter-category"), mistakes.map((m) => m.category), $("mistakes-filter-category").value, formatCategoryLabel);
-    populateSelectOptions($("mistakes-filter-source"), mistakes.map((m) => m.source), $("mistakes-filter-source").value, formatSourceLabel);
+    populateSelectOptions($("mistakes-filter-category"), mistakes.map((m) => m.category), $("mistakes-filter-category").value, formatCategoryLabel, "全部分类");
+    populateSelectOptions($("mistakes-filter-source"), mistakes.map((m) => m.source), $("mistakes-filter-source").value, formatSourceLabel, "全部来源");
 
     applyMistakeFilters();
   }
@@ -732,7 +740,11 @@
 
     const filtered = state.mistakes.filter((m) => {
       const rs = normalizeReviewStatus(m);
-      if (reviewF && rs !== reviewF) return false;
+      if (reviewF === "pending") {
+        if (rs !== "pending_ai" && rs !== "pending_user") return false;
+      } else if (reviewF && reviewF !== "rules_view" && rs !== reviewF) {
+        return false;
+      }
       if (catF && m.category !== catF) return false;
       if (srcF && m.source !== srcF) return false;
       if (q) {
@@ -742,7 +754,7 @@
       return true;
     });
 
-    $("mistakes-summary").textContent = `显示 ${filtered.length} / 共 ${state.mistakes.length} 条`;
+    $("mistakes-summary").textContent = `共 ${filtered.length} 条`;
     const list = $("mistakes-list");
     const empty = $("mistakes-empty");
     list.innerHTML = "";
@@ -752,18 +764,21 @@
     }
     empty.hidden = true;
 
-    const statusBadgeMap = {
-      pending_user: { cls: "pending", text: "待我校验" },
-      pending_ai: { cls: "", text: "待 Agent 分析" },
-      approved: { cls: "pass", text: "已确认入库" },
-      ignored: { cls: "ignored", text: "已忽略" },
-    };
-
     for (const m of filtered) {
       const count = Number(m.count || 0);
       const isCandidate = Boolean(m.is_candidate) || count >= 2;
       const rs = normalizeReviewStatus(m);
-      const badgeInfo = statusBadgeMap[rs] || { cls: "", text: rs };
+      const decision = String(m.ai_decision || "").toLowerCase();
+      const isApproveRec = decision === "recommend" || decision === "approve" || decision === "promote" || decision === "recommend_approve";
+
+      let statusPillHTML = "";
+      if (rs === "approved") {
+        statusPillHTML = '<span class="pill pass">已入库规则</span>';
+      } else if (rs === "ignored") {
+        statusPillHTML = '<span class="pill ignored">已忽略</span>';
+      } else if (rs === "pending_user" && decision) {
+        statusPillHTML = `<span class="pill ${isApproveRec ? "warn" : "ignored"}">${isApproveRec ? "建议入库" : "建议忽略"}</span>`;
+      }
 
       const card = document.createElement("article");
       card.className = "mistake-card" + (rs === "pending_user" || (isCandidate && rs === "pending_ai") ? " candidate" : "");
@@ -776,46 +791,29 @@
         snippets.push(`<div class="snippet-box"><span class="snippet-label">修复参考</span><pre class="snippet good">${escapeHTML(m.good_snippet)}</pre></div>`);
       }
 
-      // Agent 分析建议区
+      // 分析建议或初步解读（不重复堆叠标题与徽标）
       let aiAdviceHTML = "";
-      if (rs === "pending_user" || m.ai_decision || m.ai_reason) {
-        const decision = String(m.ai_decision || "").toLowerCase();
-        const isApproveRec = decision === "recommend" || decision === "approve" || decision === "promote" || decision === "recommend_approve";
-        const decisionBadge = decision
-          ? `<span class="pill ${isApproveRec ? "warn" : "ignored"}">${isApproveRec ? "建议入库" : "建议忽略"}</span>`
-          : "";
-        const ruleDraftHTML = m.ai_rule_draft
-          ? `<pre class="code-block">${escapeHTML(m.ai_rule_draft)}</pre>`
+      if (m.ai_reason) {
+        const draftHTML = m.ai_rule_draft
+          ? `<details class="inline-details" style="margin-top:6px;"><summary>查看生成规则草稿</summary><pre class="code-block" style="margin-top:6px;">${escapeHTML(m.ai_rule_draft)}</pre></details>`
           : "";
         aiAdviceHTML = `
           <div class="ai-advice">
             <div class="ai-advice-head">
-              <span class="ai-advice-title">Agent 分析建议 ${decisionBadge}</span>
+              <span class="ai-advice-title">分析建议</span>
               ${m.ai_analyzed_at ? `<span class="muted mono">${escapeHTML(formatShortTime(m.ai_analyzed_at))}</span>` : ""}
             </div>
-            <p class="ai-advice-reason">${escapeHTML(m.ai_reason || "Agent 已完成分析，请结合代码上下文确认是否入库为规则。")}</p>
-            ${ruleDraftHTML}
+            <p class="ai-advice-reason">${escapeHTML(m.ai_reason)}</p>
+            ${draftHTML}
           </div>`;
-      } else if (rs === "pending_ai") {
-        const hintHTML = m.local_hint
-          ? `<p class="local-hint-line"><strong>初步解读：</strong>${escapeHTML(m.local_hint)}</p>`
-          : "";
-        aiAdviceHTML = `
-          <div class="ai-advice pending-ai">
-            <div class="ai-advice-head">
-              <div class="title-with-tip">
-                <span class="ai-advice-title">待 Agent 深入分析</span>
-                <button type="button" class="help-tip" data-tip="已接入 MCP 的 AI 助手下次在本项目运行代码体检（sg_verify）时会自动分析并补充规则建议；你也可先看下方初步解读直接决定" aria-label="分析说明">?</button>
-              </div>
-            </div>
-            ${hintHTML}
-          </div>`;
+      } else if (rs === "pending_ai" && m.local_hint) {
+        aiAdviceHTML = `<p class="local-hint-line"><strong>初步解读：</strong>${escapeHTML(m.local_hint)}</p>`;
       }
 
-      // 人工校验操作按钮
       const actionBtns = [];
       if (rs !== "approved") {
-        actionBtns.push(`<button class="btn btn-primary btn-sm" data-action="approve" data-fp="${escapeHTML(m.fingerprint)}" type="button">确认入库</button>`);
+        const approveCls = rs === "pending_user" && !isApproveRec ? "btn-secondary" : "btn-primary";
+        actionBtns.push(`<button class="btn ${approveCls} btn-sm" data-action="approve" data-fp="${escapeHTML(m.fingerprint)}" type="button">转为规则</button>`);
       }
       if (rs !== "ignored") {
         actionBtns.push(`<button class="btn btn-ghost btn-sm" data-action="ignore" data-fp="${escapeHTML(m.fingerprint)}" type="button">忽略</button>`);
@@ -828,8 +826,8 @@
         <div class="mistake-main">
           <div class="mistake-title-row">
             <h3 class="mistake-title">${escapeHTML(m.summary || "未命名错题")}</h3>
-            <span class="pill ${badgeInfo.cls}">${escapeHTML(badgeInfo.text)}</span>
-            ${isCandidate ? `<span class="pill warn" data-tip="该错题已重复出现至少 2 次，强烈建议「确认入库」防止反复踩坑">高频候选 &ge;2</span>` : ""}
+            ${statusPillHTML}
+            ${isCandidate ? `<span class="pill warn" data-tip="该错题已重复出现至少 2 次，建议「转为规则」长期拦截">高频 &ge;2</span>` : ""}
           </div>
           <div class="mistake-meta">
             <span class="pill">${escapeHTML(formatCategoryLabel(m.category))}</span>
@@ -925,8 +923,8 @@
     const countEl = $("count-rules");
     if (countEl) countEl.textContent = String(rules.length);
 
-    populateSelectOptions($("rules-filter-engine"), rules.map((r) => r.engine), $("rules-filter-engine").value);
-    populateSelectOptions($("rules-filter-status"), rules.map((r) => r.status), $("rules-filter-status").value, formatRuleStatusLabel);
+    populateSelectOptions($("rules-filter-engine"), rules.map((r) => r.engine), $("rules-filter-engine").value, null, "全部工具");
+    populateSelectOptions($("rules-filter-status"), rules.map((r) => r.status), $("rules-filter-status").value, formatRuleStatusLabel, "全部状态");
 
     applyRuleFilters();
   }
@@ -1817,7 +1815,7 @@
     }
     state.reviewStatus = reviewStatus ?? "";
     const isRulesView = state.reviewStatus === "rules_view";
-    document.querySelectorAll("#mistakes-review-tabs .review-pill").forEach((b) => {
+    document.querySelectorAll("#mistakes-review-tabs .seg-tab").forEach((b) => {
       b.classList.toggle("active", (b.dataset.reviewStatus ?? "") === state.reviewStatus);
     });
     const mFilters = $("mistakes-sub-filters");
@@ -1833,6 +1831,33 @@
       applyRuleFilters();
     } else {
       applyMistakeFilters();
+    }
+  }
+
+  async function analyzeAllMistakes() {
+    const btn = $("btn-analyze-all");
+    const banner = $("session-scan-banner");
+    if (!btn) return;
+    btn.disabled = true;
+    btn.textContent = "分析中…";
+    try {
+      const res = await api("/api/mistakes/analyze-all", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project: state.project || "" }),
+      });
+      if (banner) {
+        banner.hidden = false;
+        banner.innerHTML = `<strong>一键分析完成：</strong>共评估 <strong>${res.analyzed || 0}</strong> 条（建议入库 <strong>${res.recommended || 0}</strong> 条 · 建议忽略 <strong>${res.skipped || 0}</strong> 条）。`;
+      }
+      await refresh();
+    } catch (error) {
+      if (banner) {
+        banner.hidden = false;
+        banner.textContent = `分析失败：${error.message}`;
+      }
+    } finally {
+      btn.disabled = false;
     }
   }
 
@@ -2016,10 +2041,11 @@
       await refreshRadar().catch(console.error);
     });
 
-    // 错题栏审核状态筛选胶囊与会话嗅探
-    document.querySelectorAll("#mistakes-review-tabs .review-pill").forEach((btn) => {
+    // 错题与规则视图切换、一键分析与会话嗅探
+    document.querySelectorAll("#mistakes-review-tabs .seg-tab").forEach((btn) => {
       btn.addEventListener("click", () => selectReviewTab(btn.dataset.reviewStatus ?? "", true));
     });
+    $("btn-analyze-all")?.addEventListener("click", analyzeAllMistakes);
     $("btn-scan-sessions").addEventListener("click", scanLocalSessions);
 
     // 总览 KPI 卡片跳转

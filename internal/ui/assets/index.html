@@ -497,76 +497,59 @@
 
         <!-- TAB: 错题与规则 -->
         <section id="tab-mistakes" class="tab-panel" hidden>
-          <div class="card filter-bar">
-            <div class="review-pills" id="mistakes-review-tabs" role="tablist" aria-label="错题与规则视图">
-              <button class="review-pill active" data-review-status="" type="button">
-                <span>全部</span>
-                <span class="pill-count" id="count-all-mistakes">0</span>
-              </button>
-              <button class="review-pill" data-review-status="pending_user" type="button" data-tip="Agent 已给出分析建议，确认无误后点击「确认入库」即可转为正式防线规则">
-                <span>待我校验</span>
-                <span class="pill-count" id="count-pending-user">0</span>
-              </button>
-              <button class="review-pill" data-review-status="pending_ai" type="button" data-tip="自动守护或体检捕获的错误，已提供「初步解读」；下次接入的 Agent 体检时会自动补充深入建议">
-                <span>待深入分析</span>
-                <span class="pill-count" id="count-pending-ai">0</span>
-              </button>
-              <button class="review-pill" data-review-status="rules_view" type="button" data-tip="查看在错题中点击「确认入库」后正式生效的检查规则及拦截次数">
-                <span>已生效规则</span>
-                <span class="pill-count" id="count-rules">0</span>
-              </button>
-              <button class="review-pill" data-review-status="ignored" type="button">
-                <span>已忽略</span>
-                <span class="pill-count" id="count-ignored">0</span>
-              </button>
-            </div>
-
-            <div id="mistakes-sub-filters" class="filter-group">
-              <label class="filter-field">
-                <span>分类</span>
-                <select id="mistakes-filter-category">
-                  <option value="">全部</option>
-                </select>
-              </label>
-              <label class="filter-field">
-                <span>来源</span>
-                <select id="mistakes-filter-source">
-                  <option value="">全部</option>
-                </select>
-              </label>
-              <label class="filter-field search-field">
-                <span>搜索</span>
-                <input id="mistakes-filter-q" type="search" placeholder="搜索报错描述或代码片段">
-              </label>
-              <div class="title-with-tip">
-                <button id="btn-scan-sessions" class="btn btn-secondary btn-sm" type="button">嗅探会话</button>
-                <button type="button" class="help-tip" data-tip="纯只读扫描近 14 天本地 Claude / Codex / Antigravity 会话日志与 Git fix 提交，零配置修改" aria-label="嗅探说明">?</button>
+          <div class="card inbox-card">
+            <div class="inbox-head-row">
+              <div class="seg-tabs" id="mistakes-review-tabs" role="tablist" aria-label="错题与规则视图">
+                <button class="seg-tab active" data-review-status="" type="button">
+                  <span>全部</span>
+                  <span class="pill-count" id="count-all-mistakes">0</span>
+                </button>
+                <button class="seg-tab" data-review-status="pending" type="button" data-tip="尚未转为规则或忽略的错题；可点右侧「一键分析」快速分类筛选">
+                  <span>待处理</span>
+                  <span class="pill-count" id="count-pending">0</span>
+                </button>
+                <button class="seg-tab" data-review-status="rules_view" type="button" data-tip="在错题中点击「转为规则」后会永久记录于此，后续守护与体检自动拦截">
+                  <span>已入库规则</span>
+                  <span class="pill-count" id="count-rules">0</span>
+                </button>
+                <button class="seg-tab" data-review-status="ignored" type="button">
+                  <span>已忽略</span>
+                  <span class="pill-count" id="count-ignored">0</span>
+                </button>
               </div>
-              <span id="mistakes-summary" class="muted">0 条</span>
+              <div class="card-header-actions">
+                <button id="btn-analyze-all" class="btn btn-primary btn-sm" type="button" hidden data-tip="按本地确定性规则一键批量分析待处理错题，自动给出「建议入库 / 建议忽略」和规则草案">一键分析</button>
+                <button id="btn-scan-sessions" class="btn btn-secondary btn-sm" type="button">嗅探会话</button>
+                <button type="button" class="help-tip" data-tip="纯只读扫描近 14 天本地 Agent 会话与 Git fix 提交，补充潜在错题" aria-label="嗅探说明">?</button>
+              </div>
             </div>
 
-            <div id="rules-sub-filters" class="filter-group" hidden>
-              <label class="filter-field">
-                <span>检查工具</span>
-                <select id="rules-filter-engine">
-                  <option value="">全部</option>
+            <div class="inbox-sub-row">
+              <div id="mistakes-sub-filters" class="inbox-filter-controls">
+                <input id="mistakes-filter-q" class="text-input compact-select inbox-search-input" type="search" placeholder="搜索报错描述或代码片段…">
+                <select id="mistakes-filter-category" class="compact-select" aria-label="按分类筛选">
+                  <option value="">全部分类</option>
                 </select>
-              </label>
-              <label class="filter-field">
-                <span>生效范围</span>
-                <select id="rules-filter-scope">
-                  <option value="">全部</option>
+                <select id="mistakes-filter-source" class="compact-select" aria-label="按来源筛选">
+                  <option value="">全部来源</option>
+                </select>
+                <span id="mistakes-summary" class="muted" style="margin-left:auto; font-size:12px;">0 条</span>
+              </div>
+
+              <div id="rules-sub-filters" class="inbox-filter-controls" hidden>
+                <select id="rules-filter-engine" class="compact-select" aria-label="按检查工具筛选">
+                  <option value="">全部工具</option>
+                </select>
+                <select id="rules-filter-scope" class="compact-select" aria-label="按生效范围筛选">
+                  <option value="">全部范围</option>
                   <option value="project">项目级</option>
                   <option value="global">全局</option>
                 </select>
-              </label>
-              <label class="filter-field">
-                <span>状态</span>
-                <select id="rules-filter-status">
-                  <option value="">全部</option>
+                <select id="rules-filter-status" class="compact-select" aria-label="按状态筛选">
+                  <option value="">全部状态</option>
                 </select>
-              </label>
-              <span id="rules-summary" class="muted">0 条</span>
+                <span id="rules-summary" class="muted" style="margin-left:auto; font-size:12px;">0 条</span>
+              </div>
             </div>
           </div>
 

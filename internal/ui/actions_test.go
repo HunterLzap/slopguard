@@ -697,3 +697,77 @@ func TestMistakeLocalHintCacheExclusionAndSetProjectConfig(t *testing.T) {
 		t.Fatalf("expected Chinese local_hint explaining None access, got %q", hint)
 	}
 }
+
+func TestAnalyzeAllAndApproveCreatesRule(t *testing.T) {
+	home := t.TempDir()
+	db := openDashboardStore(t)
+	project := filepath.Join(t.TempDir(), "py-rules")
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.RecordMistake(context.Background(), contract.Mistake{
+		ProjectPath: project,
+		Fingerprint: "fp-cache-noise",
+		Category:    "lint",
+		Summary:     `[ruff] warning: Invalid '# noqa' directive on .cache/uv/archive/pkg.py:1`,
+		BadSnippet:  ".cache/uv/archive/pkg.py:1 - Invalid `# noqa`",
+		Source:      "auto_verify",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecordMistake(context.Background(), contract.Mistake{
+		ProjectPath: project,
+		Fingerprint: "fp-pyright-none",
+		Category:    "type",
+		Summary:     `[pyright:reportOptionalMemberAccess] "auth" is not a known attribute of "None"`,
+		Source:      "auto_verify",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewServer(db, nil)
+	s.homeDir = home
+	handler := s.Handler()
+
+	// 1. Batch deterministic analysis classifies cache noise as skip and optional member access as recommend.
+	aCode, aBody := postDashboardJSON(t, handler, "/api/mistakes/analyze-all", map[string]any{
+		"project": project,
+	})
+	if aCode != http.StatusOK {
+		t.Fatalf("POST /api/mistakes/analyze-all = %d: %s", aCode, aBody)
+	}
+	aJSON := decodeDashboardJSON(t, aBody)
+	if aJSON["analyzed"] != float64(2) || aJSON["recommended"] != float64(1) || aJSON["skipped"] != float64(1) {
+		t.Fatalf("analyze-all = %v, want analyzed=2 recommended=1 skipped=1", aJSON)
+	}
+
+	// Verify both moved to pending_user with expected decisions.
+	pendingUser, err := db.ListInboxMistakes(context.Background(), project, "pending_user")
+	if err != nil || len(pendingUser) != 2 {
+		t.Fatalf("pending_user = %+v (err=%v)", pendingUser, err)
+	}
+	byFP := map[string]store.MistakeRecord{}
+	for _, m := range pendingUser {
+		byFP[m.Fingerprint] = m
+	}
+	if byFP["fp-cache-noise"].AIDecision != "skip" || byFP["fp-pyright-none"].AIDecision != "recommend" {
+		t.Fatalf("unexpected decisions: %+v", byFP)
+	}
+
+	// 2. Approving mistake creates a rule entry in rules ledger without duplicating on repeat approve.
+	for i := 0; i < 2; i++ {
+		apCode, apBody := postDashboardJSON(t, handler, "/api/mistakes/fp-pyright-none/approve", map[string]any{})
+		if apCode != http.StatusOK {
+			t.Fatalf("approve = %d: %s", apCode, apBody)
+		}
+	}
+
+	rules, err := db.ListRuleLedger(context.Background(), store.RuleLedgerQuery{ProjectPath: project})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rules) != 1 || rules[0].Engine != "pyright" || rules[0].RuleID != "reportOptionalMemberAccess" {
+		t.Fatalf("rules ledger = %+v, want 1 pyright reportOptionalMemberAccess rule", rules)
+	}
+}

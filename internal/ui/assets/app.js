@@ -20,6 +20,7 @@
     guardStatus: null,
     mcpData: null,
     diffPreview: null,
+    userPickedReviewTab: false,
     onboardingDismissed: localStorage.getItem("slopguard.onboardingDismissed") === "1",
   };
 
@@ -428,11 +429,9 @@
     escEl.className = "stat-value " + (currentEscapes > 0 ? "warn" : "pass");
 
     if (t.candidate_mistakes !== undefined || t.pending_mistakes !== undefined) {
-      const candCount = Number(t.candidate_mistakes || 0);
       const pendCount = Number(t.pending_mistakes || 0);
       $("stat-candidates").textContent = pendCount.toLocaleString();
       $("stat-candidates").className = "stat-value " + (pendCount > 0 ? "warn" : "");
-      $("stat-candidates-sub").textContent = `高频候选 ${candCount} · 共待审 ${pendCount}`;
     }
 
     $("stat-rules").textContent = Number(t.rule_count || 0).toLocaleString();
@@ -490,7 +489,7 @@
       const failH = totalH - passH;
       const yPass = top + plotH - passH;
       const yFail = yPass - failH;
-      const title = `${escapeHTML(p.bucket)} · 通过: ${passed}, 未通过: ${failed}, 逃生舱: ${p.escapes || 0}, 平均耗时: ${Number(p.avg_duration_ms || 0).toFixed(1)}ms`;
+      const title = `${escapeHTML(p.bucket)} · 通过: ${passed}, 未通过: ${failed}, 跳过注释: ${p.escapes || 0}, 平均耗时: ${Number(p.avg_duration_ms || 0).toFixed(1)}ms`;
       let rects = "";
       if (passH > 0) {
         rects += `<rect x="${x.toFixed(1)}" y="${yPass.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(1, passH).toFixed(1)}" rx="2" fill="var(--success)" opacity="0.78"><title>${title}</title></rect>`;
@@ -648,9 +647,9 @@
     $("count-ignored").textContent = String(counts.ignored);
 
     const actionNeeded = counts.pending_user + counts.pending_ai;
-    $("stat-candidates").textContent = counts.pending_user.toLocaleString();
-    $("stat-candidates").className = "stat-value " + (counts.pending_user > 0 ? "warn" : "");
-    $("stat-candidates-sub").textContent = `待我校验 ${counts.pending_user} · 高频候选 ${candidateCount}`;
+    $("stat-candidates").textContent = actionNeeded.toLocaleString();
+    $("stat-candidates").className = "stat-value " + (actionNeeded > 0 ? "warn" : "");
+    $("stat-candidates-sub").textContent = `待校验 ${counts.pending_user} · 待分析 ${counts.pending_ai}`;
 
     const badge = $("badge-mistakes");
     badge.textContent = String(counts.pending_user || actionNeeded);
@@ -658,6 +657,11 @@
 
     populateSelectOptions($("mistakes-filter-category"), mistakes.map((m) => m.category), $("mistakes-filter-category").value);
     populateSelectOptions($("mistakes-filter-source"), mistakes.map((m) => m.source), $("mistakes-filter-source").value);
+
+    if (!state.userPickedReviewTab && state.reviewStatus === "pending_user" && counts.pending_user === 0 && counts.pending_ai > 0) {
+      selectReviewTab("pending_ai", false);
+      return;
+    }
 
     applyMistakeFilters();
   }
@@ -1067,7 +1071,11 @@
       kEl.textContent = k;
       const vEl = document.createElement("span");
       vEl.className = "kv-val";
-      vEl.textContent = Array.isArray(v) ? v.join(", ") : String(v);
+      const rawVal = Array.isArray(v) ? v.join(", ") : String(v);
+      vEl.textContent = rawVal.replace(/\/(?:Users|home)\/[^/\s]+/g, "~");
+      if (vEl.textContent !== rawVal) {
+        vEl.title = rawVal;
+      }
       const mEl = document.createElement("span");
       mEl.className = "kv-meta";
       container.append(kEl, vEl, mEl);
@@ -1125,30 +1133,38 @@
 
         const checksHTML = checks.length
           ? `<div class="sub-block-title">检查项 (${checks.length})</div>
-             <table class="mini-table">
-               <thead><tr><th>ID</th><th>命令</th><th>可选</th><th>超时</th></tr></thead>
-               <tbody>${checks.map((c) => `
-                 <tr>
-                   <td class="mono">${escapeHTML(c.id)}</td>
-                   <td class="mono">${escapeHTML(Array.isArray(c.cmd) ? c.cmd.join(" ") : (c.cmd || ""))}</td>
-                   <td>${c.optional ? "是" : "否"}</td>
-                   <td class="mono">${c.timeout_sec ? `${c.timeout_sec}s` : "—"}</td>
-                 </tr>`).join("")}
-               </tbody>
-             </table>`
+             <div class="table-wrap">
+               <table class="mini-table">
+                 <thead><tr><th>ID</th><th>命令</th><th>可选</th><th>超时</th></tr></thead>
+                 <tbody>${checks.map((c) => {
+                   const cmdRaw = Array.isArray(c.cmd) ? c.cmd.join(" ") : (c.cmd || "");
+                   const cmdDisplay = String(cmdRaw).replace(/\/(?:Users|home)\/[^/\s]+/g, "~");
+                   return `
+                   <tr>
+                     <td class="mono">${escapeHTML(c.id)}</td>
+                     <td class="mono" title="${escapeHTML(cmdRaw)}">${escapeHTML(cmdDisplay)}</td>
+                     <td>${c.optional ? "是" : "否"}</td>
+                     <td class="mono">${c.timeout_sec ? `${c.timeout_sec}s` : "—"}</td>
+                   </tr>`;
+                 }).join("")}
+                 </tbody>
+               </table>
+             </div>`
           : "";
 
         const patternsHTML = patterns.length
-          ? `<div class="sub-block-title">逃生舱正则 (${patterns.length})</div>
-             <table class="mini-table">
-               <thead><tr><th>名称</th><th>正则</th></tr></thead>
-               <tbody>${patterns.map((p) => `
-                 <tr>
-                   <td>${escapeHTML(p.name)}</td>
-                   <td class="mono">${escapeHTML(p.regex)}</td>
-                 </tr>`).join("")}
-               </tbody>
-             </table>`
+          ? `<div class="sub-block-title">跳过注释正则 (${patterns.length})</div>
+             <div class="table-wrap">
+               <table class="mini-table">
+                 <thead><tr><th>名称</th><th>正则</th></tr></thead>
+                 <tbody>${patterns.map((p) => `
+                   <tr>
+                     <td>${escapeHTML(p.name)}</td>
+                     <td class="mono">${escapeHTML(p.regex)}</td>
+                   </tr>`).join("")}
+                 </tbody>
+               </table>
+             </div>`
           : "";
 
         card.innerHTML = `
@@ -1629,7 +1645,10 @@
   }
 
   // 只读本地 Agent 会话与 Git 返工嗅探
-  function selectReviewTab(reviewStatus) {
+  function selectReviewTab(reviewStatus, userInitiated = true) {
+    if (userInitiated) {
+      state.userPickedReviewTab = true;
+    }
     state.reviewStatus = reviewStatus ?? "";
     document.querySelectorAll("#mistakes-review-tabs .review-pill").forEach((b) => {
       b.classList.toggle("active", (b.dataset.reviewStatus ?? "") === state.reviewStatus);
@@ -1660,7 +1679,7 @@
       if ((res.imported || 0) > 0 && state.reviewStatus === "pending_user") {
         const hasPendingUser = state.mistakes.some((m) => normalizeReviewStatus(m) === "pending_user");
         if (!hasPendingUser) {
-          selectReviewTab("pending_ai");
+          selectReviewTab("pending_ai", false);
         }
       }
     } catch (error) {
@@ -1754,6 +1773,9 @@
     const empty = $("verify-findings-empty");
     body.innerHTML = "";
     if (!findings.length) {
+      empty.textContent = $("verify-opt-all").checked
+        ? "全量扫描未发现问题"
+        : "本次 Git 改动未发现问题（默认仅查改动文件；扫全库请勾选「全量扫描」）";
       empty.hidden = false;
     } else {
       empty.hidden = true;
@@ -1922,9 +1944,28 @@
 
     // 错题栏审核状态筛选胶囊与会话嗅探
     document.querySelectorAll("#mistakes-review-tabs .review-pill").forEach((btn) => {
-      btn.addEventListener("click", () => selectReviewTab(btn.dataset.reviewStatus ?? ""));
+      btn.addEventListener("click", () => selectReviewTab(btn.dataset.reviewStatus ?? "", true));
     });
     $("btn-scan-sessions").addEventListener("click", scanLocalSessions);
+
+    // 总览 KPI 卡片跳转
+    $("stat-card-escapes")?.addEventListener("click", (e) => {
+      if (e.target.closest?.(".help-tip")) return;
+      switchTab("radar");
+    });
+    $("stat-card-mistakes")?.addEventListener("click", (e) => {
+      if (e.target.closest?.(".help-tip")) return;
+      switchTab("mistakes");
+      const pendUser = state.mistakes.filter((m) => normalizeReviewStatus(m) === "pending_user").length;
+      const pendAI = state.mistakes.filter((m) => normalizeReviewStatus(m) === "pending_ai").length;
+      if (pendUser === 0 && pendAI > 0) {
+        selectReviewTab("pending_ai", false);
+      }
+    });
+    $("stat-card-rules")?.addEventListener("click", (e) => {
+      if (e.target.closest?.(".help-tip")) return;
+      switchTab("rules");
+    });
 
     // 错题栏下拉与搜索筛选
     ["mistakes-filter-category", "mistakes-filter-source"].forEach((id) => {

@@ -134,32 +134,50 @@
 
           <div class="stats">
             <article class="stat-card">
-              <span class="stat-label">扫描次数</span>
+              <div class="stat-label-row">
+                <span class="stat-label">体检次数</span>
+                <button type="button" class="help-tip" data-tip="每次添加项目、点「立即体检」、后台守护或 Agent 调用 sg_verify 都会记录 1 次" aria-label="体检次数说明">?</button>
+              </div>
               <strong id="stat-runs" class="stat-value">—</strong>
               <span id="stat-runs-sub" class="stat-sub">暂无记录</span>
             </article>
             <article class="stat-card">
-              <span class="stat-label">通过率</span>
+              <div class="stat-label-row">
+                <span class="stat-label">通过率</span>
+                <button type="button" class="help-tip" data-tip="体检无报错且未新增跳过注释的占比；添加项目默认扫全库旧代码，日常体检默认仅查本次 Git 改动" aria-label="通过率说明">?</button>
+              </div>
               <strong id="stat-pass-rate" class="stat-value">—</strong>
               <span id="stat-pass-sub" class="stat-sub">—</span>
             </article>
             <article class="stat-card">
-              <span class="stat-label">平均耗时</span>
+              <div class="stat-label-row">
+                <span class="stat-label">平均耗时</span>
+                <button type="button" class="help-tip" data-tip="单次体检平均耗时；全量扫旧代码较慢，日常仅查 Git 改动通常在 1 秒内" aria-label="平均耗时说明">?</button>
+              </div>
               <strong id="stat-duration" class="stat-value">—</strong>
               <span class="stat-sub">ms</span>
             </article>
-            <article class="stat-card">
-              <span class="stat-label">逃生舱</span>
+            <article id="stat-card-escapes" class="stat-card clickable">
+              <div class="stat-label-row">
+                <span class="stat-label">跳过注释</span>
+                <button type="button" class="help-tip" data-tip="代码中屏蔽检查的注释总数，如 # type: ignore、# noqa、@ts-ignore。历史存量已记入基线，只要求后续不再增加；点击查看雷达明细" aria-label="跳过注释说明">?</button>
+              </div>
               <strong id="stat-escapes" class="stat-value">—</strong>
-              <span id="stat-escapes-sub" class="stat-sub">最近一次</span>
+              <span id="stat-escapes-sub" class="stat-sub">存量基线</span>
             </article>
-            <article class="stat-card">
-              <span class="stat-label">待校验错题</span>
+            <article id="stat-card-mistakes" class="stat-card clickable">
+              <div class="stat-label-row">
+                <span class="stat-label">待处理错题</span>
+                <button type="button" class="help-tip" data-tip="体检失败自动捕获的错题数：先由 Agent 分析写中文理由（待分析），再由你确认是否转为规则（待校验）；点击直接处理" aria-label="待处理错题说明">?</button>
+              </div>
               <strong id="stat-candidates" class="stat-value">—</strong>
               <span id="stat-candidates-sub" class="stat-sub">—</span>
             </article>
-            <article class="stat-card">
-              <span class="stat-label">生效规则</span>
+            <article id="stat-card-rules" class="stat-card clickable">
+              <div class="stat-label-row">
+                <span class="stat-label">生效规则</span>
+                <button type="button" class="help-tip" data-tip="你确认入库后已启用的自动检查规则数，后续 Agent 再犯同类错会自动拦截；点击查看规则台账" aria-label="生效规则说明">?</button>
+              </div>
               <strong id="stat-rules" class="stat-value">—</strong>
               <span class="stat-sub">已启用</span>
             </article>
@@ -168,11 +186,14 @@
           <div class="card">
             <div class="card-header">
               <div class="card-title-group">
-                <h2>趋势</h2>
+                <div class="title-with-tip">
+                  <h2>趋势</h2>
+                  <button type="button" class="help-tip" data-tip="按天/按周统计通过与未通过次数、跳过注释总数变化（黄线）及平均耗时（蓝虚线）" aria-label="趋势说明">?</button>
+                </div>
                 <div class="legend">
                   <span class="legend-item"><i class="swatch swatch-pass"></i>通过</span>
                   <span class="legend-item"><i class="swatch swatch-fail"></i>未通过</span>
-                  <span class="legend-item"><i class="swatch swatch-escape"></i>逃生舱</span>
+                  <span class="legend-item"><i class="swatch swatch-escape"></i>跳过注释</span>
                   <span class="legend-item"><i class="swatch swatch-dur"></i>耗时</span>
                 </div>
               </div>
@@ -182,7 +203,7 @@
               </div>
             </div>
             <div class="card-body">
-              <svg id="trend-chart" class="trend-chart" role="img" aria-label="扫描与逃生舱趋势图"></svg>
+              <svg id="trend-chart" class="trend-chart" role="img" aria-label="扫描与跳过注释趋势图"></svg>
               <div id="trend-empty" class="empty-action-row" hidden>
                 <span class="muted">暂无扫描记录</span>
               </div>
@@ -192,7 +213,10 @@
           <div class="split-grid">
             <div class="card">
               <div class="card-header">
-                <h2>最近扫描</h2>
+                <div class="title-with-tip">
+                  <h2>最近扫描</h2>
+                  <button type="button" class="help-tip" data-tip="添加项目、点击「立即体检」、后台自动守护或 Agent 调用 sg_verify 时自动追加；点右上角「刷新」同步最新记录" aria-label="最近扫描说明">?</button>
+                </div>
                 <span id="recent-runs-count" class="muted">0 次</span>
               </div>
               <div class="table-wrap">
@@ -202,7 +226,7 @@
                       <th>时间</th>
                       <th>项目</th>
                       <th>状态</th>
-                      <th class="num">逃生舱</th>
+                      <th class="num">跳过注释</th>
                       <th class="num">耗时</th>
                     </tr>
                   </thead>
@@ -214,7 +238,10 @@
 
             <div class="card">
               <div class="card-header">
-                <h2>项目列表</h2>
+                <div class="title-with-tip">
+                  <h2>项目列表</h2>
+                  <button type="button" class="help-tip" data-tip="点击任意项目行可切换当前工作区" aria-label="项目列表说明">?</button>
+                </div>
                 <span id="projects-count" class="muted">0 个</span>
               </div>
               <div class="table-wrap">
@@ -225,7 +252,7 @@
                       <th>最近扫描</th>
                       <th class="num">次数</th>
                       <th class="num">通过率</th>
-                      <th class="num">逃生舱</th>
+                      <th class="num">跳过注释</th>
                       <th class="num">待审</th>
                       <th>守护</th>
                     </tr>
@@ -270,7 +297,7 @@
                   <summary>查看适配器与配置文件</summary>
                   <div class="adapters-layout" style="margin-top: 10px;">
                     <div id="adapters-list" class="stack-list"></div>
-                    <div class="stack-list">
+                    <div class="config-cards-row">
                       <div class="sub-card">
                         <div class="section-subhead">.slopguard/config.yaml</div>
                         <div id="config-kv" class="kv" style="margin-top: 6px;"></div>
@@ -377,11 +404,17 @@
                 <strong id="verify-res-passed" class="stat-value">—</strong>
               </article>
               <article class="stat-card">
-                <span class="stat-label">发现问题</span>
+                <div class="stat-label-row">
+                  <span class="stat-label">发现问题</span>
+                  <button type="button" class="help-tip" data-tip="本次检查命中的 Lint、类型报错或新增跳过注释数" aria-label="发现问题说明">?</button>
+                </div>
                 <strong id="verify-res-findings" class="stat-value">0</strong>
               </article>
               <article class="stat-card">
-                <span class="stat-label">逃生舱</span>
+                <div class="stat-label-row">
+                  <span class="stat-label">跳过注释</span>
+                  <button type="button" class="help-tip" data-tip="项目内 # noqa、# type: ignore、@ts-ignore 存量总数；未超过基线即算通过" aria-label="跳过注释说明">?</button>
+                </div>
                 <strong id="verify-res-escapes" class="stat-value">0</strong>
               </article>
               <article class="stat-card">
@@ -611,7 +644,7 @@
               <div class="card-header">
                 <div class="title-with-tip">
                   <h2>基线棘轮</h2>
-                  <button type="button" class="help-tip" data-tip="限制逃生舱指标只减不增；债务下降后可点「收紧」锁定更严上限" aria-label="基线说明">?</button>
+                  <button type="button" class="help-tip" data-tip="限制跳过注释（如 # type: ignore / # noqa / @ts-ignore）只减不增；清理后可点「收紧」锁定更严上限" aria-label="基线说明">?</button>
                   <span id="baseline-updated" class="muted mono"></span>
                 </div>
                 <div class="card-header-actions">
@@ -636,7 +669,7 @@
               <div class="card-header">
                 <div class="title-with-tip">
                   <h2>热点文件</h2>
-                  <button type="button" class="help-tip" data-tip="综合被引用、复杂度、逃生舱、返工、死代码、重复度 6 维计算传染风险分" aria-label="热点说明">?</button>
+                  <button type="button" class="help-tip" data-tip="综合被引用、复杂度、跳过注释、返工、死代码、重复度 6 维计算传染风险分" aria-label="热点说明">?</button>
                 </div>
                 <span id="hotspots-count" class="muted">0 个</span>
               </div>
@@ -648,7 +681,7 @@
                       <th class="num">风险分</th>
                       <th class="num">引用</th>
                       <th class="num">复杂度</th>
-                      <th class="num">逃生舱</th>
+                      <th class="num">跳过注释</th>
                       <th class="num">返工</th>
                       <th class="num">死代码</th>
                       <th class="num">重复</th>

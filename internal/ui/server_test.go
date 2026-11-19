@@ -304,7 +304,7 @@ func TestDashboardEmbeddedAssets(t *testing.T) {
 	if !strings.Contains(header.Get("Content-Type"), "text/html") || !strings.Contains(string(body), "SlopGuard") {
 		t.Fatalf("index content-type=%q body=%q", header.Get("Content-Type"), body)
 	}
-	for _, section := range []string{"总览", "接入与守护", "错题栏", "Agent 活动", "规则台账", "坏样本雷达"} {
+	for _, section := range []string{"总览", "错题与规则", "接入与守护", "热点文件与跳过注释基线", "MCP 调用日志"} {
 		if !strings.Contains(string(body), section) {
 			t.Fatalf("index missing dashboard section %q", section)
 		}

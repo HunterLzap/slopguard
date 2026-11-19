@@ -8,7 +8,7 @@
     theme: localStorage.getItem("slopguard.theme") || "system",
     granularity: "day",
     radarTop: "10",
-    reviewStatus: "pending_user",
+    reviewStatus: "",
     overview: null,
     mistakes: [],
     events: [],
@@ -214,10 +214,20 @@
     });
   }
 
-  // 导航与侧边栏
-  function switchTab(tab) {
-    const validTabs = ["overview", "mistakes", "events", "rules", "radar", "verify"];
-    const target = validTabs.includes(tab) ? tab : "overview";
+  // 导航与侧边栏（极简 3 页：总览 / 错题与规则 / 接入与守护）
+  function switchTab(tab, opts = {}) {
+    let target = tab;
+    if (target === "events") {
+      target = "verify";
+    } else if (target === "rules") {
+      target = "mistakes";
+      opts.rulesView = true;
+    } else if (target === "radar") {
+      target = "overview";
+      opts.openRadar = true;
+    }
+    const validTabs = ["overview", "mistakes", "verify"];
+    target = validTabs.includes(target) ? target : "overview";
     state.tab = target;
     localStorage.setItem("slopguard.tab", target);
     document.querySelectorAll(".nav-item").forEach((btn) => {
@@ -226,6 +236,13 @@
     document.querySelectorAll(".tab-panel").forEach((panel) => {
       panel.hidden = panel.id !== `tab-${target}`;
     });
+    if (opts.rulesView) {
+      selectReviewTab("rules_view", true);
+    }
+    if (opts.openRadar) {
+      const details = $("overview-radar-details");
+      if (details) details.open = true;
+    }
     closeSidebar();
   }
 
@@ -245,51 +262,50 @@
   async function loadServiceStatus() {
     const dot = $("service-status-dot");
     const text = $("service-status-text");
-    const btn = $("btn-toggle-service");
+    const sw = $("service-switch");
     try {
       const data = await api("/api/service-status");
       serviceInstalled = Boolean(data && data.installed);
+      if (sw) {
+        sw.disabled = false;
+        sw.checked = serviceInstalled;
+      }
       if (serviceInstalled) {
         dot.className = "health-dot pass";
         text.textContent = "后台常驻";
         text.title = `已安装开机后台常驻 (${data.platform || "local"}${data.port ? ` · :${data.port}` : ""})`;
-        if (btn) btn.textContent = "关闭常驻";
       } else {
         dot.className = "health-dot neutral";
         text.textContent = "按需运行";
         text.title = "未安装后台常驻服务，当前仅在打开应用时运行";
-        if (btn) btn.textContent = "开启常驻";
       }
     } catch {
       dot.className = "health-dot neutral";
       text.textContent = "按需运行";
+      if (sw) {
+        sw.disabled = false;
+        sw.checked = false;
+      }
     }
   }
 
-  async function toggleService() {
-    const btn = $("btn-toggle-service");
-    if (!btn) return;
-    btn.disabled = true;
+  async function toggleService(enableOpt) {
+    const sw = $("service-switch");
+    const nextEnable = typeof enableOpt === "boolean" ? enableOpt : !serviceInstalled;
+    if (sw) sw.disabled = true;
     try {
       await api("/api/service/toggle", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enable: !serviceInstalled }),
+        body: JSON.stringify({ enable: nextEnable }),
       });
       await loadServiceStatus();
     } catch (error) {
       alert(`操作失败：${error.message}`);
+      await loadServiceStatus();
     } finally {
-      btn.disabled = false;
+      if (sw) sw.disabled = false;
     }
-  }
-
-  // 项目列表
-  function updateAddProjectButtonStyle() {
-    const addBtn = $("btn-open-add-project");
-    if (!addBtn) return;
-    const isEmpty = state.projects.length === 0;
-    addBtn.className = `btn ${isEmpty ? "btn-primary" : "btn-secondary"} btn-add-project`;
   }
 
   async function loadProjects() {
@@ -297,26 +313,32 @@
       const data = await api("/api/projects");
       state.projects = Array.isArray(data.projects) ? data.projects : [];
       const select = $("project-select");
-      select.innerHTML = "";
-      const all = document.createElement("option");
-      all.value = "";
-      all.textContent = "全部项目";
-      select.appendChild(all);
+      if (select) {
+        select.innerHTML = "";
+        const all = document.createElement("option");
+        all.value = "";
+        all.textContent = "全部项目";
+        select.appendChild(all);
 
-      for (const project of state.projects) {
-        const option = document.createElement("option");
-        option.value = project.project_path;
-        const count = project.scan_count ?? project.total_runs ?? 0;
-        option.textContent = `${shortProject(project.project_path)} (${count})`;
-        option.title = project.project_path;
-        select.appendChild(option);
-      }
+        for (const project of state.projects) {
+          const option = document.createElement("option");
+          option.value = project.project_path;
+          const count = project.scan_count ?? project.total_runs ?? 0;
+          option.textContent = `${shortProject(project.project_path)} (${count})`;
+          option.title = project.project_path;
+          select.appendChild(option);
+        }
 
-      if (state.project && !state.projects.some((p) => p.project_path === state.project)) {
-        state.project = "";
+        const addOpt = document.createElement("option");
+        addOpt.value = "__add__";
+        addOpt.textContent = "+ 添加项目…";
+        select.appendChild(addOpt);
+
+        if (state.project && !state.projects.some((p) => p.project_path === state.project)) {
+          state.project = "";
+        }
+        select.value = state.project;
       }
-      select.value = state.project;
-      updateAddProjectButtonStyle();
       updateTopbarProject();
       renderProjectsTable(state.projects);
     } catch (error) {
@@ -325,24 +347,24 @@
   }
 
   function updateTopbarProject() {
-    const pathEl = $("current-project-path");
+    const select = $("project-select");
     const dot = $("project-health-dot");
     const verifyBtn = $("btn-run-verify");
 
+    if (select && select.value !== state.project) {
+      select.value = state.project || "";
+    }
+
     if (!state.project) {
-      pathEl.textContent = "全部项目";
-      pathEl.title = "全部项目";
-      dot.className = "health-dot neutral";
+      if (dot) dot.className = "health-dot neutral";
       if (verifyBtn) {
         verifyBtn.disabled = true;
-        verifyBtn.dataset.tip = "请先选择或添加项目";
-        verifyBtn.title = "请先选择或添加项目";
+        verifyBtn.dataset.tip = "请先在顶部下拉框选择或添加项目";
+        verifyBtn.title = "请先在顶部下拉框选择或添加项目";
       }
       return;
     }
 
-    pathEl.textContent = shortPathDisplay(state.project);
-    pathEl.title = state.project;
     if (verifyBtn) {
       verifyBtn.disabled = state.verifying;
       delete verifyBtn.dataset.tip;
@@ -685,39 +707,21 @@
     $("count-pending-user").textContent = String(counts.pending_user);
     $("count-pending-ai").textContent = String(counts.pending_ai);
     $("count-all-mistakes").textContent = String(mistakes.length);
-    $("count-approved").textContent = String(counts.approved);
     $("count-ignored").textContent = String(counts.ignored);
 
     const actionNeeded = counts.pending_user + counts.pending_ai;
     $("stat-candidates").textContent = actionNeeded.toLocaleString();
     $("stat-candidates").className = "stat-value " + (actionNeeded > 0 ? "warn" : "");
-    $("stat-candidates-sub").textContent = `待校验 ${counts.pending_user} · 待分析 ${counts.pending_ai}`;
+    $("stat-candidates-sub").textContent = `待校验 ${counts.pending_user} · 待深入 ${counts.pending_ai}`;
 
     const badge = $("badge-mistakes");
     badge.textContent = String(counts.pending_user || actionNeeded);
     badge.hidden = actionNeeded === 0;
 
-    const batchBtn = $("btn-copy-batch-analyze");
-    if (batchBtn) {
-      batchBtn.hidden = counts.pending_ai === 0;
-      batchBtn.textContent = `批量复制分析指令 (${counts.pending_ai})`;
-    }
-
     populateSelectOptions($("mistakes-filter-category"), mistakes.map((m) => m.category), $("mistakes-filter-category").value, formatCategoryLabel);
     populateSelectOptions($("mistakes-filter-source"), mistakes.map((m) => m.source), $("mistakes-filter-source").value, formatSourceLabel);
 
-    if (!state.userPickedReviewTab && state.reviewStatus === "pending_user" && counts.pending_user === 0 && counts.pending_ai > 0) {
-      selectReviewTab("pending_ai", false);
-      return;
-    }
-
     applyMistakeFilters();
-  }
-
-  function buildAnalyzePrompt(m) {
-    const fp = m.fingerprint || "";
-    const summary = m.summary || "未命名错题";
-    return `请调用 SlopGuard MCP 工具 sg_list_inbox 查看错题详情（fingerprint: ${fp}，摘要：${summary}），分析其是否值得沉淀为防线规则，并用通俗中文说明原因后调用 sg_submit_analysis 提交分析建议。`;
   }
 
   function applyMistakeFilters() {
@@ -801,9 +805,8 @@
             <div class="ai-advice-head">
               <div class="title-with-tip">
                 <span class="ai-advice-title">待 Agent 深入分析</span>
-                <button type="button" class="help-tip" data-tip="若已接入 MCP 并配合 Agent 调用 sg_verify，Agent 会自动分析；也可复制指令主动让 Agent 评估是否沉淀为规则" aria-label="分析说明">?</button>
+                <button type="button" class="help-tip" data-tip="已接入 MCP 的 AI 助手下次在本项目运行代码体检（sg_verify）时会自动分析并补充规则建议；你也可先看下方初步解读直接决定" aria-label="分析说明">?</button>
               </div>
-              <button class="btn btn-secondary btn-sm copy-prompt-btn" type="button">复制指令</button>
             </div>
             ${hintHTML}
           </div>`;
@@ -842,20 +845,6 @@
       card.querySelectorAll("button[data-action]").forEach((btn) => {
         btn.addEventListener("click", () => handleMistakeAction(btn.dataset.fp, btn.dataset.action, btn));
       });
-
-      const copyBtn = card.querySelector(".copy-prompt-btn");
-      if (copyBtn) {
-        copyBtn.addEventListener("click", async () => {
-          const prompt = buildAnalyzePrompt(m);
-          try {
-            await navigator.clipboard.writeText(prompt);
-            copyBtn.textContent = "已复制";
-            setTimeout(() => { copyBtn.textContent = "复制指令"; }, 1800);
-          } catch {
-            copyBtn.textContent = "复制失败";
-          }
-        });
-      }
 
       list.appendChild(card);
     }
@@ -930,12 +919,11 @@
     }
   }
 
-  // 规则台账
+  // 规则台账（集成于「错题与规则」的「已生效规则」视图）
   function renderRules(rules) {
     state.rules = rules;
-    const badge = $("badge-rules");
-    badge.textContent = String(rules.length);
-    badge.hidden = rules.length === 0;
+    const countEl = $("count-rules");
+    if (countEl) countEl.textContent = String(rules.length);
 
     populateSelectOptions($("rules-filter-engine"), rules.map((r) => r.engine), $("rules-filter-engine").value);
     populateSelectOptions($("rules-filter-status"), rules.map((r) => r.status), $("rules-filter-status").value, formatRuleStatusLabel);
@@ -1022,14 +1010,6 @@
     } else {
       statePill.textContent = baseline.passed ? "通过" : "未通过";
       statePill.className = `pill ${baseline.passed ? "pass" : "fail"}`;
-    }
-
-    const badgeRadar = $("badge-radar");
-    if (baseline.available) {
-      badgeRadar.textContent = baseline.passed ? "正常" : "超标";
-      badgeRadar.hidden = false;
-    } else {
-      badgeRadar.hidden = true;
     }
 
     const metricList = $("baseline-list");
@@ -1836,10 +1816,24 @@
       state.userPickedReviewTab = true;
     }
     state.reviewStatus = reviewStatus ?? "";
+    const isRulesView = state.reviewStatus === "rules_view";
     document.querySelectorAll("#mistakes-review-tabs .review-pill").forEach((b) => {
       b.classList.toggle("active", (b.dataset.reviewStatus ?? "") === state.reviewStatus);
     });
-    applyMistakeFilters();
+    const mFilters = $("mistakes-sub-filters");
+    const rFilters = $("rules-sub-filters");
+    const mView = $("mistakes-view-wrap");
+    const rView = $("rules-view-wrap");
+    if (mFilters) mFilters.hidden = isRulesView;
+    if (rFilters) rFilters.hidden = !isRulesView;
+    if (mView) mView.hidden = isRulesView;
+    if (rView) rView.hidden = !isRulesView;
+
+    if (isRulesView) {
+      applyRuleFilters();
+    } else {
+      applyMistakeFilters();
+    }
   }
 
   async function scanLocalSessions() {
@@ -1862,12 +1856,6 @@
           `提取 <strong>${res.found || 0}</strong> 条，入库 <strong>${res.imported || 0}</strong> 条。`;
       }
       await refresh();
-      if ((res.imported || 0) > 0 && state.reviewStatus === "pending_user") {
-        const hasPendingUser = state.mistakes.some((m) => normalizeReviewStatus(m) === "pending_user");
-        if (!hasPendingUser) {
-          selectReviewTab("pending_ai", false);
-        }
-      }
     } catch (error) {
       if (banner) {
         banner.hidden = false;
@@ -1879,26 +1867,7 @@
     }
   }
 
-  async function copyBatchAnalyzePrompt() {
-    const pending = state.mistakes.filter((m) => normalizeReviewStatus(m) === "pending_ai");
-    if (!pending.length) return;
-    const sample = pending.slice(0, 15).map((m, idx) => `${idx + 1}. [${m.fingerprint || ""}] ${m.summary || "未命名错题"}`).join("\n");
-    const prompt = `请调用 SlopGuard MCP 工具 sg_list_inbox 获取待分析错题，逐条评估是否值得沉淀为防线规则，并用通俗中文说明原因后调用 sg_submit_analysis 提交分析建议（当前待分析 ${pending.length} 条）：\n${sample}`;
-    const btn = $("btn-copy-batch-analyze");
-    try {
-      await navigator.clipboard.writeText(prompt);
-      if (btn) {
-        btn.textContent = `已复制 ${pending.length} 条指令`;
-        setTimeout(() => {
-          btn.textContent = `批量复制分析指令 (${pending.length})`;
-        }, 2000);
-      }
-    } catch {
-      if (btn) btn.textContent = "复制失败";
-    }
-  }
-
-  // 立即体检（结果同步写入总览与错题栏）
+  // 立即体检（结果同步写入总览与错题）
   async function runVerify() {
     if (state.verifying) return;
     const pill = $("topbar-verify-pill");
@@ -1986,7 +1955,6 @@
 
       if (projectsData && Array.isArray(projectsData.projects)) {
         state.projects = projectsData.projects;
-        updateAddProjectButtonStyle();
         renderProjectsTable(state.projects);
         updateTopbarProject();
       }
@@ -1998,11 +1966,8 @@
       renderProjectMeta(meta || null);
       await Promise.all([loadAgents(), loadGuardStatus()]);
       renderOnboardingCard();
-
-      $("last-updated").textContent = `更新于 ${new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
     } catch (error) {
       console.error(error);
-      $("last-updated").textContent = `错误：${error.message}`;
     } finally {
       $("refresh-button").disabled = false;
     }
@@ -2060,20 +2025,19 @@
     // 总览 KPI 卡片跳转
     $("stat-card-escapes")?.addEventListener("click", (e) => {
       if (e.target.closest?.(".help-tip")) return;
-      switchTab("radar");
+      const details = $("overview-radar-details");
+      if (details) details.open = true;
+      $("overview-radar-card")?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
     $("stat-card-mistakes")?.addEventListener("click", (e) => {
       if (e.target.closest?.(".help-tip")) return;
       switchTab("mistakes");
-      const pendUser = state.mistakes.filter((m) => normalizeReviewStatus(m) === "pending_user").length;
-      const pendAI = state.mistakes.filter((m) => normalizeReviewStatus(m) === "pending_ai").length;
-      if (pendUser === 0 && pendAI > 0) {
-        selectReviewTab("pending_ai", false);
-      }
+      selectReviewTab("", true);
     });
     $("stat-card-rules")?.addEventListener("click", (e) => {
       if (e.target.closest?.(".help-tip")) return;
-      switchTab("rules");
+      switchTab("mistakes");
+      selectReviewTab("rules_view", true);
     });
 
     // 错题栏下拉与搜索筛选
@@ -2093,11 +2057,8 @@
 
     // 体检操作（统一由顶栏触发）
     $("btn-run-verify").addEventListener("click", runVerify);
-    $("btn-copy-batch-analyze")?.addEventListener("click", copyBatchAnalyzePrompt);
 
     // 零命令行交互：添加项目、新手引导、服务开关、基线操作、自动守护、安全 MCP/Skill 预览与还原
-    $("btn-open-add-project").addEventListener("click", openAddProjectModal);
-    $("btn-verify-add-project")?.addEventListener("click", openAddProjectModal);
     document.querySelectorAll(".js-open-add-project").forEach((btn) => {
       btn.addEventListener("click", openAddProjectModal);
     });
@@ -2121,7 +2082,7 @@
     $("add-project-backdrop").addEventListener("click", closeAddProjectModal);
     $("btn-pick-folder").addEventListener("click", pickFolder);
     $("btn-submit-add-project").addEventListener("click", submitAddProject);
-    $("btn-toggle-service").addEventListener("click", toggleService);
+    $("service-switch")?.addEventListener("change", (e) => toggleService(e.currentTarget.checked));
     $("btn-baseline-tighten").addEventListener("click", () => runBaselineAction("tighten"));
     $("btn-baseline-reset").addEventListener("click", () => runBaselineAction("reset"));
     $("btn-refresh-mcp").addEventListener("click", loadAgents);
@@ -2131,8 +2092,7 @@
     $("shared-skill-backdrop")?.addEventListener("click", closeSharedSkillModal);
     $("btn-save-shared-skill")?.addEventListener("click", () => saveSharedSkill(false));
     $("btn-reset-shared-skill")?.addEventListener("click", () => saveSharedSkill(true));
-    $("btn-events-goto-connect")?.addEventListener("click", () => switchTab("verify"));
-    $("btn-rules-goto-mistakes")?.addEventListener("click", () => switchTab("mistakes"));
+    $("btn-rules-goto-mistakes")?.addEventListener("click", () => selectReviewTab("", true));
     $("btn-generic-mcp")?.addEventListener("click", openGenericMCPModal);
     $("generic-mcp-close")?.addEventListener("click", closeGenericMCPModal);
     $("generic-mcp-cancel")?.addEventListener("click", closeGenericMCPModal);
@@ -2179,8 +2139,15 @@
       }
     });
 
-    // 项目切换与刷新
-    $("project-select").addEventListener("change", (e) => selectProject(e.target.value));
+    // 项目切换（含「+ 添加项目…」选项）与刷新
+    $("project-select").addEventListener("change", (e) => {
+      if (e.target.value === "__add__") {
+        e.target.value = state.project || "";
+        openAddProjectModal();
+        return;
+      }
+      selectProject(e.target.value);
+    });
     $("refresh-button").addEventListener("click", refresh);
 
     await Promise.all([loadProjects(), loadServiceStatus()]);

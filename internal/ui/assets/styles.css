@@ -192,7 +192,9 @@ code, pre, .mono {
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 0 8px;
+  padding: 0 9px;
+  min-width: 190px;
+  max-width: 320px;
 }
 
 .project-switcher select {
@@ -200,9 +202,10 @@ code, pre, .mono {
   min-width: 0;
   border: 0;
   background: transparent;
-  padding: 6px 0;
+  padding: 5px 0;
   font-size: 12px;
   font-weight: 500;
+  color: var(--fg);
   outline: none;
   cursor: pointer;
 }
@@ -1695,6 +1698,30 @@ code, pre, .mono {
   align-items: center;
   gap: 6px;
   min-width: 0;
+}
+
+.radar-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 10px;
+}
+
+.radar-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.compact-filter-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
 }
 
 .help-tip {

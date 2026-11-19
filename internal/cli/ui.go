@@ -5,10 +5,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/HunterLzap/slopguard/internal/contract"
 )
@@ -43,13 +45,13 @@ func runUI(args []string, stdout, stderr io.Writer) int {
 	}
 
 	if checkDashboardRunning != nil && checkDashboardRunning(*port) {
-		url := fmt.Sprintf("http://127.0.0.1:%d", *port)
+		displayURL := fmt.Sprintf("http://127.0.0.1:%d", *port)
 		if !*noOpen && openDashboardWindow != nil {
-			if err := openDashboardWindow(url); err != nil {
+			if err := openDashboardWindow(appendLocalUIToken(displayURL)); err != nil {
 				fmt.Fprintf(stderr, "slopguard: warning: open dashboard window: %v\n", err)
 			}
 		}
-		fmt.Fprintf(stdout, "SlopGuard dashboard already running at %s\n", url)
+		fmt.Fprintf(stdout, "SlopGuard dashboard already running at %s\n", displayURL)
 		return ExitOK
 	}
 
@@ -66,6 +68,29 @@ func runUI(args []string, stdout, stderr io.Writer) int {
 		return commandError(stderr, "dashboard: %v", err)
 	}
 	return ExitOK
+}
+
+func appendLocalUIToken(rawURL string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return rawURL
+	}
+	raw, err := os.ReadFile(filepath.Join(home, ".slopguard", "ui-token"))
+	if err != nil {
+		return rawURL
+	}
+	tok := strings.TrimSpace(string(raw))
+	if tok == "" {
+		return rawURL
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	q := u.Query()
+	q.Set("token", tok)
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 func defaultOpenDashboardWindow(targetURL string) error {

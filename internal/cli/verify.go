@@ -21,6 +21,7 @@ type verifyOptions struct {
 	root          string
 	all           bool
 	lastCommit    bool
+	commitSHA     string
 	json          bool
 	jobs          int
 	record        bool
@@ -35,6 +36,7 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	all := fs.Bool("all", false, "scan all project files instead of only git-changed files")
 	lastCommit := fs.Bool("last-commit", false, "scan files touched by HEAD commit (used by post-commit hook)")
+	commitSHA := fs.String("commit", "", "scan files touched by a specific commit SHA (used by post-commit hook)")
 	jsonOut := fs.Bool("json", false, "emit a structured contract.VerifyResult as JSON")
 	jobs := fs.Int("jobs", 0, "maximum concurrent checks (default: config value or 2)")
 	record := fs.Bool("record", false, "record a scan_runs row after verify (pass or fail)")
@@ -67,6 +69,7 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 		root:          root,
 		all:           *all,
 		lastCommit:    *lastCommit,
+		commitSHA:     strings.TrimSpace(*commitSHA),
 		json:          *jsonOut,
 		jobs:          *jobs,
 		record:        *record,
@@ -153,6 +156,17 @@ func runVerifyWith(opts verifyOptions, stdout, stderr io.Writer) int {
 		files = filterFilesByExtensions(resolveScopePaths(opts.root, opts.paths), extensions)
 	case opts.all:
 		files, err = deps.engine.ListFiles(opts.root, extensions)
+	case strings.TrimSpace(opts.commitSHA) != "":
+		if cfp, ok := deps.engine.(commitFilesProvider); ok {
+			files, err = cfp.CommitFiles(ctx, opts.root, opts.commitSHA)
+		} else if lcp, ok := deps.engine.(lastCommitProvider); ok {
+			files, err = lcp.LastCommitFiles(ctx, opts.root)
+		} else {
+			files, err = deps.engine.ChangedFiles(ctx, opts.root)
+		}
+		if err == nil {
+			files = filterFilesByExtensions(files, extensions)
+		}
 	case opts.lastCommit:
 		if lcp, ok := deps.engine.(lastCommitProvider); ok {
 			files, err = lcp.LastCommitFiles(ctx, opts.root)

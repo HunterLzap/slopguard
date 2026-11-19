@@ -25,6 +25,7 @@ func postDashboardJSON(t *testing.T, handler http.Handler, path string, payload 
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(raw))
+	req.Host = "127.0.0.1"
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -111,7 +112,7 @@ func TestMCPClientsPriorityPreviewInstallRestore(t *testing.T) {
 
 	s := NewServer(nil, nil)
 	s.homeDir = home
-	handler := s.Handler()
+	handler := authedTestHandler(s)
 
 	// 1. Project .mcp.json should appear first and be marked recommended.
 	status, body, _ := dashboardRequest(t, handler, http.MethodGet, "/api/mcp-clients?project="+url.QueryEscape(project))
@@ -201,7 +202,7 @@ func TestSkillTargetsPreviewInstallRestore(t *testing.T) {
 
 	s := NewServer(nil, nil)
 	s.homeDir = home
-	handler := s.Handler()
+	handler := authedTestHandler(s)
 
 	skillPath := filepath.Join(project, ".claude", "skills", "slopguard", "SKILL.md")
 
@@ -279,7 +280,7 @@ func TestGuardToggleGitHookAndDebounceWatcher(t *testing.T) {
 	s := NewServer(db, runner)
 	s.homeDir = home
 	s.guard.pollInterval = 25 * time.Millisecond
-	handler := s.Handler()
+	handler := authedTestHandler(s)
 
 	// 1. Enable guard + hook and verify existing post-commit content is preserved.
 	code, body := postDashboardJSON(t, handler, "/api/guard/toggle", map[string]any{
@@ -383,7 +384,7 @@ func TestSessionScannerReadOnlyAndGitFix(t *testing.T) {
 
 	s := NewServer(db, runner)
 	s.homeDir = home
-	handler := s.Handler()
+	handler := authedTestHandler(s)
 
 	code, body := postDashboardJSON(t, handler, "/api/sessions/scan", map[string]any{
 		"project": project,
@@ -447,7 +448,7 @@ func TestSummaryAndVerifyAutoCapture(t *testing.T) {
 
 	s := NewServer(db, runner)
 	s.homeDir = home
-	handler := s.Handler()
+	handler := authedTestHandler(s)
 
 	// POST /api/verify with record=true should auto-capture findings into pending_ai.
 	code, vBody := postDashboardJSON(t, handler, "/api/verify", map[string]any{
@@ -510,7 +511,7 @@ func TestSharedSkillAndUnifiedAgentsWorkflow(t *testing.T) {
 
 	s := NewServer(db, nil)
 	s.homeDir = home
-	handler := s.Handler()
+	handler := authedTestHandler(s)
 
 	// 1. Default shared skill state.
 	stCode, stBody, _ := dashboardRequest(t, handler, http.MethodGet, "/api/shared-skill")
@@ -669,7 +670,7 @@ func TestMistakeLocalHintCacheExclusionAndSetProjectConfig(t *testing.T) {
 
 	s := NewServer(db, nil)
 	s.homeDir = home
-	handler := s.Handler()
+	handler := authedTestHandler(s)
 
 	// SetProjectConfig enables watch + git hook cleanly.
 	enTrue := true
@@ -748,7 +749,7 @@ func TestAnalyzeAllAndApproveCreatesRule(t *testing.T) {
 		}
 		return out, nil
 	}
-	handler := s.Handler()
+	handler := authedTestHandler(s)
 
 	// Verify AI config toggle persists cleanly.
 	aiOn := false
@@ -859,7 +860,7 @@ func TestParseAgentAnalysisOutputAndCodexTOMLVerify(t *testing.T) {
 
 	s := NewServer(db, nil)
 	s.homeDir = home
-	handler := s.Handler()
+	handler := authedTestHandler(s)
 
 	// Enable Codex (MCP TOML + Skill).
 	cCode, cBody := postDashboardJSON(t, handler, "/api/agents/toggle", map[string]any{
@@ -907,5 +908,308 @@ func TestParseAgentAnalysisOutputAndCodexTOMLVerify(t *testing.T) {
 	restoredTOML, _ := os.ReadFile(codexTOMLPath)
 	if string(restoredTOML) != origTOML {
 		t.Fatalf("expected restored TOML:\n%q\ngot:\n%q", origTOML, string(restoredTOML))
+	}
+}
+
+func TestP0AgentTrustEnvWhitelistAndAISafety(t *testing.T) {
+	home := t.TempDir()
+	db := openDashboardStore(t)
+
+	// P0-04: Parent secrets must NEVER be inherited into agent CLI env.
+	t.Setenv("OPENAI_API_KEY", "sk-secret-parent-key")
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-secret-key")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "aws-secret")
+	envList := augmentedCLIEnv(home)
+	joinedEnv := strings.Join(envList, "\n")
+	for _, secret := range []string{"sk-secret-parent-key", "sk-ant-secret-key", "aws-secret"} {
+		if strings.Contains(joinedEnv, secret) {
+			t.Fatalf("augmentedCLIEnv leaked parent secret %q", secret)
+		}
+	}
+	if !strings.Contains(joinedEnv, "HOME="+home) {
+		t.Fatalf("augmentedCLIEnv missing HOME=%s", home)
+	}
+
+	// P0-02: Untrusted MCP command or invalid args must fail verification without executing.
+	markerPath := filepath.Join(home, "pwned.marker")
+	writeDashboardFile(t, filepath.Join(home, ".cursor", "mcp.json"),
+		`{"mcpServers":{"slopguard":{"command":"/bin/sh","args":["-c","touch `+markerPath+`"]}}}`)
+	writeDashboardFile(t, filepath.Join(home, ".codex", "config.toml"),
+		"[mcp_servers.slopguard]\ncommand = \"/bin/echo\"\nargs = [\"mcp\"]\n")
+
+	s := NewServer(db, nil)
+	s.homeDir = home
+	handler := authedTestHandler(s)
+
+	for _, agentID := range []string{"cursor", "codex"} {
+		vCode, vBody := postDashboardJSON(t, handler, "/api/agents/verify", map[string]any{"agent_id": agentID})
+		if vCode != http.StatusOK {
+			t.Fatalf("verify %s = %d: %s", agentID, vCode, vBody)
+		}
+		vJSON := decodeDashboardJSON(t, vBody)
+		reports, _ := vJSON["reports"].([]any)
+		rep, _ := reports[0].(map[string]any)
+		if rep["health_status"] != "broken" || rep["config_matched"] != false {
+			t.Fatalf("expected untrusted binary for %s to fail config_matched, got %v", agentID, rep)
+		}
+	}
+	if _, err := os.Stat(markerPath); !os.IsNotExist(err) {
+		t.Fatalf("untrusted MCP command was executed!")
+	}
+
+	// P0-03: AutoAnalyze defaults to false even on corrupt config, requires explicit confirmation,
+	// rejects unavailable explicit runner instead of falling back silently, and rejects invalid decisions.
+	writeDashboardFile(t, filepath.Join(home, ".slopguard", "ai-config.json"), `{corrupt-json`)
+	st := s.ai.Status()
+	if st.AutoAnalyze {
+		t.Fatalf("AutoAnalyze must default false on corrupt config")
+	}
+	unconfCode, _ := postDashboardJSON(t, handler, "/api/ai/config", map[string]any{
+		"auto_analyze": true,
+	})
+	if unconfCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 when auto_analyze=true without confirmed=true, got %d", unconfCode)
+	}
+	if _, err := s.ai.SetConfig(nil, strPtr("codex")); err != nil {
+		t.Fatalf("set runner codex: %v", err)
+	}
+	if _, err := db.RecordMistake(context.Background(), contract.Mistake{
+		ProjectPath: home,
+		Fingerprint: "fp-invalid-decision",
+		Category:    "type",
+		Summary:     "[pyright] none access",
+		Source:      "auto_verify",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Fake empty PATH so codex is unavailable; production analyzer must refuse without silent failover.
+	t.Setenv("PATH", t.TempDir())
+	if _, _, _, err := s.ai.AnalyzePending(context.Background(), home); err == nil {
+		t.Fatalf("expected explicit error when preferred runner codex is unavailable")
+	}
+
+	// Invalid AI decision must stay pending_ai rather than coercing to recommend.
+	s.ai.analyzeFn = func(_ context.Context, _ AgentCLIRunner, _ string, _ []store.MistakeRecord) ([]AIAnalysisItem, error) {
+		return []AIAnalysisItem{{
+			Fingerprint: "fp-invalid-decision",
+			Decision:    "auto_fix_everything",
+			Reason:      "bogus decision",
+		}}, nil
+	}
+	if _, _, _, err := s.ai.AnalyzePending(context.Background(), home); err == nil {
+		t.Fatalf("expected error on illegal decision value")
+	}
+	stillPending, _ := db.ListInboxMistakes(context.Background(), home, "pending_ai")
+	if len(stillPending) != 1 || stillPending[0].Fingerprint != "fp-invalid-decision" {
+		t.Fatalf("illegal decision must remain pending_ai, got %+v", stillPending)
+	}
+
+	// P1 Codex JSONL event parsing.
+	jsonl := `{"type":"thread.started","thread_id":"t1"}` + "\n" +
+		`{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"{\"items\":[{\"fingerprint\":\"fp1\",\"decision\":\"skip\",\"reason\":\"缓存噪音\"}]}"}}` + "\n"
+	parsedCodex, err := parseCodexJSONLOutput([]byte(jsonl))
+	if err != nil || len(parsedCodex) != 1 || parsedCodex[0].Decision != "skip" {
+		t.Fatalf("parseCodexJSONLOutput failed: items=%+v err=%v", parsedCodex, err)
+	}
+}
+
+func strPtr(s string) *string { return &s }
+
+func TestP0SafeUninstallBackupPermissionsConflictAndTOML(t *testing.T) {
+	home := t.TempDir()
+	db := openDashboardStore(t)
+
+	claudePath := filepath.Join(home, ".claude.json")
+	if err := os.WriteFile(claudePath, []byte(`{"mcpServers":{"other":{"command":"echo"}}}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewServer(db, nil)
+	s.homeDir = home
+	handler := authedTestHandler(s)
+
+	// 1. Preview gives base_hashes; modifying target before apply yields 409 Conflict.
+	pCode, pBody := postDashboardJSON(t, handler, "/api/agents/preview", map[string]any{
+		"agent_id": "claude_code",
+		"action":   "install",
+	})
+	if pCode != http.StatusOK {
+		t.Fatalf("preview claude_code = %d: %s", pCode, pBody)
+	}
+	pJSON := decodeDashboardJSON(t, pBody)
+	baseHashes, _ := pJSON["base_hashes"].(map[string]any)
+	if len(baseHashes) == 0 {
+		t.Fatalf("expected non-empty base_hashes in preview: %v", pJSON)
+	}
+	if err := os.WriteFile(claudePath, []byte(`{"mcpServers":{"other":{"command":"echo"},"racing":{}}}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	conflictCode, _ := postDashboardJSON(t, handler, "/api/agents/toggle", map[string]any{
+		"agent_id":        "claude_code",
+		"enable":          true,
+		"confirmed":       true,
+		"expected_hashes": baseHashes,
+	})
+	if conflictCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict when file changed after preview, got %d", conflictCode)
+	}
+
+	// 2. Re-preview and apply cleanly; check 0700 backup dir, 0600 backup file, 0600 target file.
+	_, pBody2 := postDashboardJSON(t, handler, "/api/agents/preview", map[string]any{
+		"agent_id": "claude_code",
+		"action":   "install",
+	})
+	pJSON2 := decodeDashboardJSON(t, pBody2)
+	okCode, okBody := postDashboardJSON(t, handler, "/api/agents/toggle", map[string]any{
+		"agent_id":        "claude_code",
+		"enable":          true,
+		"confirmed":       true,
+		"expected_hashes": pJSON2["base_hashes"],
+	})
+	if okCode != http.StatusOK {
+		t.Fatalf("apply claude_code = %d: %s", okCode, okBody)
+	}
+	if dirInfo, err := os.Stat(s.backupsDir()); err != nil || dirInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("backupsDir perm = %v (err=%v), want 0700", dirInfo.Mode().Perm(), err)
+	}
+	bPath := backupRecordPath(s.backupsDir(), "mcp", "claude_code", claudePath)
+	if bInfo, err := os.Stat(bPath); err != nil || bInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("backup file perm = %v (err=%v), want 0600", bInfo.Mode().Perm(), err)
+	}
+	if tgtInfo, err := os.Stat(claudePath); err != nil || tgtInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("target ~/.claude.json perm = %v (err=%v), want preserved 0600", tgtInfo.Mode().Perm(), err)
+	}
+
+	// 3. Another tool adds "postgres" AFTER SlopGuard install; disabling SlopGuard must NOT wipe "postgres"!
+	rawClaude, _ := os.ReadFile(claudePath)
+	var claudeObj map[string]any
+	if err := json.Unmarshal(rawClaude, &claudeObj); err != nil {
+		t.Fatal(err)
+	}
+	serversObj := claudeObj["mcpServers"].(map[string]any)
+	serversObj["postgres"] = map[string]any{"command": "pg-mcp"}
+	editedClaude, _ := json.MarshalIndent(claudeObj, "", "  ")
+	if err := os.WriteFile(claudePath, append(editedClaude, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	offCode, offBody := postDashboardJSON(t, handler, "/api/agents/toggle", map[string]any{
+		"agent_id":  "claude_code",
+		"enable":    false,
+		"confirmed": true,
+	})
+	if offCode != http.StatusOK {
+		t.Fatalf("disable claude_code = %d: %s", offCode, offBody)
+	}
+	afterDisable, _ := os.ReadFile(claudePath)
+	if !strings.Contains(string(afterDisable), `"postgres"`) || !strings.Contains(string(afterDisable), `"other"`) {
+		t.Fatalf("disabling SlopGuard wiped later additions:\n%s", string(afterDisable))
+	}
+	if strings.Contains(string(afterDisable), `"slopguard"`) {
+		t.Fatalf("expected slopguard removed cleanly:\n%s", string(afterDisable))
+	}
+
+	// 4. Corrupt backup must fail loudly instead of silently degrading.
+	corruptPath := filepath.Join(home, ".cursor", "mcp.json")
+	if err := writeFileAtomic(corruptPath, []byte(`{"mcpServers":{"slopguard":{"command":"echo"}}}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	corruptBak := backupRecordPath(s.backupsDir(), "mcp", "cursor", corruptPath)
+	if err := writeFileAtomic(corruptBak, []byte(`{not valid json`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cOffCode, _ := postDashboardJSON(t, handler, "/api/agents/toggle", map[string]any{
+		"agent_id":  "cursor",
+		"enable":    false,
+		"confirmed": true,
+	})
+	if cOffCode == http.StatusOK {
+		t.Fatalf("expected error on corrupt backup record, got 200")
+	}
+
+	// 5. Invalid non-object mcpServers JSON type must be rejected rather than overwritten.
+	if err := writeFileAtomic(corruptPath, []byte(`{"mcpServers":["bad"]}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := renderMCPUpsert(corruptPath, "/bin/echo", []string{"mcp"}); err == nil {
+		t.Fatalf("expected renderMCPUpsert to reject array mcpServers")
+	}
+
+	// 6. Codex TOML validation + multiline string & later section preservation.
+	codexTOML := filepath.Join(home, ".codex", "config.toml")
+	mlTOML := "developer_instructions = \"\"\"\n[mcp_servers.slopguard]\nnot a real header\n\"\"\"\n\n[mcp_servers.existing]\ncommand = \"echo\"\n"
+	if err := writeFileAtomic(codexTOML, []byte(mlTOML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, updatedTOML, _, err := renderMCPUpsert(codexTOML, "/usr/local/bin/slopguard", []string{"mcp"})
+	if err != nil {
+		t.Fatalf("renderMCPUpsert multiline TOML: %v", err)
+	}
+	if !strings.Contains(updatedTOML, "not a real header") || !strings.Contains(updatedTOML, "[mcp_servers.slopguard]") {
+		t.Fatalf("multiline TOML broken:\n%s", updatedTOML)
+	}
+	if err := validateTOMLBasic("[broken\n"); err == nil {
+		t.Fatalf("expected validateTOMLBasic to catch unclosed header")
+	}
+}
+
+func TestP1GitHookPathAndSessionScanGuards(t *testing.T) {
+	home := t.TempDir()
+	proj := t.TempDir()
+
+	// Real git repo with custom core.hooksPath.
+	customHooksDir := filepath.Join(proj, ".custom-hooks")
+	if err := os.MkdirAll(customHooksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"init", "-q"},
+		{"config", "core.hooksPath", ".custom-hooks"},
+	} {
+		res := engine.RunProcess(context.Background(), engine.ProcessSpec{
+			Command: "git",
+			Args:    args,
+			Dir:     proj,
+			Timeout: 5 * time.Second,
+		})
+		if res.Err != nil || res.ExitCode != 0 {
+			t.Skipf("git unavailable or failed in test env: err=%v code=%d", res.Err, res.ExitCode)
+		}
+	}
+
+	hookPath, ok := resolveGitHookPath(proj)
+	wantHook := filepath.Join(proj, ".custom-hooks", "post-commit")
+	wantReal, _ := filepath.EvalSymlinks(filepath.Dir(wantHook))
+	gotReal, _ := filepath.EvalSymlinks(filepath.Dir(hookPath))
+	if !ok || (hookPath != wantHook && gotReal != wantReal) {
+		t.Fatalf("resolveGitHookPath with core.hooksPath = %q (ok=%v), want %q", hookPath, ok, wantHook)
+	}
+
+	block := buildGitHookBlock("/usr/local/bin/slopguard")
+	if !strings.Contains(block, `--commit "$_sg_rev"`) {
+		t.Fatalf("git hook block must pin commit SHA via --commit, got:\n%s", block)
+	}
+
+	// Session scan skips symlinks & honors cancelled context.
+	sessDir := filepath.Join(home, ".claude", "projects", "demo")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	secretTarget := filepath.Join(home, "secret-outside.jsonl")
+	_ = writeFileAtomic(secretTarget, []byte(`{"type":"tool_result","is_error":true,"content":"secret"}`+"\n"), 0o600)
+	_ = os.Symlink(secretTarget, filepath.Join(sessDir, "symlink.jsonl"))
+	_ = writeFileAtomic(filepath.Join(sessDir, "regular.jsonl"), []byte(`{}`+"\n"), 0o644)
+
+	files := collectRecentFiles(context.Background(), filepath.Join(home, ".claude", "projects"), ".jsonl", time.Now().Add(-time.Hour), 10)
+	for _, f := range files {
+		if strings.HasSuffix(f, "symlink.jsonl") {
+			t.Fatalf("collectRecentFiles must skip symlinks, got %v", files)
+		}
+	}
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	canceledFiles := collectRecentFiles(canceledCtx, filepath.Join(home, ".claude", "projects"), ".jsonl", time.Now().Add(-time.Hour), 10)
+	if len(canceledFiles) != 0 {
+		t.Fatalf("expected 0 files on canceled context, got %v", canceledFiles)
 	}
 }

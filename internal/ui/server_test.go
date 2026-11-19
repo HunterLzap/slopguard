@@ -40,9 +40,20 @@ func writeDashboardFile(t *testing.T, path, content string) {
 	}
 }
 
+func authedTestHandler(s *Server) http.Handler {
+	base := s.Handler()
+	tok := s.AuthToken()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Host = "127.0.0.1"
+		r.Header.Set(uiTokenHeaderName, tok)
+		base.ServeHTTP(w, r)
+	})
+}
+
 func dashboardRequest(t *testing.T, handler http.Handler, method, path string) (int, []byte, http.Header) {
 	t.Helper()
 	req := httptest.NewRequest(method, path, nil)
+	req.Host = "127.0.0.1"
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
 	return recorder.Code, recorder.Body.Bytes(), recorder.Header()
@@ -93,7 +104,7 @@ func TestDashboardOverviewMistakesAndRulesAPI(t *testing.T) {
 	}
 
 	server := NewServer(db, nil)
-	handler := server.Handler()
+	handler := authedTestHandler(server)
 
 	status, body, header := dashboardRequest(t, handler, http.MethodGet, "/api/overview?project="+url.QueryEscape(project))
 	if status != http.StatusOK {
@@ -171,7 +182,7 @@ func TestDashboardMistakeIgnoreStatusFlow(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	handler := NewServer(db, nil).Handler()
+	handler := authedTestHandler(NewServer(db, nil))
 
 	status, body, _ := dashboardRequest(t, handler, http.MethodGet, "/api/mistakes?status=pending")
 	if status != http.StatusOK {
@@ -224,7 +235,7 @@ func TestDashboardRadarAndScreenshotAPI(t *testing.T) {
 	screenshotDir := filepath.Join(project, ".slopguard", "ui-screenshots")
 	writeDashboardFile(t, filepath.Join(screenshotDir, "home.png"), "fake-png")
 
-	handler := NewServer(db, nil).Handler()
+	handler := authedTestHandler(NewServer(db, nil))
 	status, body, _ := dashboardRequest(t, handler, http.MethodGet, "/api/radar?project="+url.QueryEscape(project)+"&top=3")
 	if status != http.StatusOK {
 		t.Fatalf("radar status = %d, body = %s", status, body)
@@ -264,7 +275,7 @@ func TestDashboardRadarAndScreenshotAPI(t *testing.T) {
 }
 
 func TestDashboardRadarMissingProjectIsGraceful(t *testing.T) {
-	handler := NewServer(nil, nil).Handler()
+	handler := authedTestHandler(NewServer(nil, nil))
 	missing := filepath.Join(t.TempDir(), "missing-project")
 	status, body, _ := dashboardRequest(t, handler, http.MethodGet, "/api/radar?project="+url.QueryEscape(missing))
 	if status != http.StatusOK {
@@ -296,7 +307,7 @@ func TestDashboardEmbeddedAssets(t *testing.T) {
 	if _, err := assets.ReadFile("assets/styles.css"); err != nil {
 		t.Fatalf("embedded styles.css missing: %v", err)
 	}
-	handler := NewServer(nil, nil).Handler()
+	handler := authedTestHandler(NewServer(nil, nil))
 	status, body, header := dashboardRequest(t, handler, http.MethodGet, "/")
 	if status != http.StatusOK {
 		t.Fatalf("index status = %d", status)
@@ -324,6 +335,8 @@ func TestDashboardEmbeddedAssets(t *testing.T) {
 }
 
 func TestDashboardRunLoopbackAndGracefulShutdown(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
 	db := openDashboardStore(t)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -344,7 +357,7 @@ func TestDashboardRunLoopbackAndGracefulShutdown(t *testing.T) {
 	var response *http.Response
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		response, err = client.Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
+		response, err = client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/identity", port))
 		if err == nil {
 			break
 		}
@@ -358,10 +371,52 @@ func TestDashboardRunLoopbackAndGracefulShutdown(t *testing.T) {
 	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		cancel()
-		t.Fatalf("dashboard status = %d", response.StatusCode)
+		t.Fatalf("identity status = %d", response.StatusCode)
 	}
+
+	// Unauthenticated root / API must fail with 401.
+	unauthResp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, unauthResp.Body)
+	_ = unauthResp.Body.Close()
+	if unauthResp.StatusCode != http.StatusUnauthorized {
+		cancel()
+		t.Fatalf("unauthenticated root status = %d, want 401", unauthResp.StatusCode)
+	}
+
+	// Read 0600 ~/.slopguard/ui-token and authenticate cleanly.
+	tokRaw, err := os.ReadFile(filepath.Join(home, ".slopguard", "ui-token"))
+	if err != nil {
+		cancel()
+		t.Fatalf("read ui-token: %v", err)
+	}
+	tok := strings.TrimSpace(string(tokRaw))
+	if len(tok) < 32 {
+		cancel()
+		t.Fatalf("unexpected short token %q", tok)
+	}
+	authReq, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/", port), nil)
+	authReq.Header.Set(uiTokenHeaderName, tok)
+	authResp, err := client.Do(authReq)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, authResp.Body)
+	_ = authResp.Body.Close()
+	if authResp.StatusCode != http.StatusOK {
+		cancel()
+		t.Fatalf("authenticated root status = %d, want 200", authResp.StatusCode)
+	}
+
 	if !strings.Contains(output.String(), fmt.Sprintf("http://127.0.0.1:%d/", port)) {
 		t.Fatalf("startup output = %q", output.String())
+	}
+	if strings.Contains(output.String(), tok) {
+		t.Fatalf("startup output must never log session token")
 	}
 
 	cancel()
@@ -475,7 +530,7 @@ func TestDashboardMistakeRestoreFiltersProjectMetaAndVerify(t *testing.T) {
 	}
 
 	server := NewServer(db, runner)
-	handler := server.Handler()
+	handler := authedTestHandler(server)
 
 	// Ignore then restore
 	status, body, _ := dashboardRequest(t, handler, http.MethodPost, "/api/mistakes/fp-restore/ignore")
@@ -596,7 +651,7 @@ func TestDashboardEventsApproveAndServiceStatusAPI(t *testing.T) {
 	}
 
 	server := NewServer(db, nil)
-	handler := server.Handler()
+	handler := authedTestHandler(server)
 
 	// 1. GET /api/events
 	status, body, _ := dashboardRequest(t, handler, http.MethodGet, "/api/events?project="+url.QueryEscape(projectA)+"&tool=sg_verify&limit=10")
@@ -694,5 +749,144 @@ func TestDashboardEventsApproveAndServiceStatusAPI(t *testing.T) {
 	notInstalled := detectServiceStatus("darwin", "/Users/tester", 8899, func(string) bool { return false })
 	if notInstalled.Installed || notInstalled.Port != 8899 {
 		t.Fatalf("detectServiceStatus(not installed) = %+v", notInstalled)
+	}
+}
+
+func TestDashboardSecurityMiddlewareAndTrustBoundary(t *testing.T) {
+	db := openDashboardStore(t)
+	s := NewServer(db, nil)
+	s.homeDir = t.TempDir()
+	s.port = 7788
+	handler := s.Handler()
+
+	// 1. Public discovery endpoint (/api/identity) works on loopback host without token.
+	idReq := httptest.NewRequest(http.MethodGet, "/api/identity", nil)
+	idReq.Host = "127.0.0.1:7788"
+	idRec := httptest.NewRecorder()
+	handler.ServeHTTP(idRec, idReq)
+	if idRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/identity = %d: %s", idRec.Code, idRec.Body.String())
+	}
+	idJSON := decodeDashboardJSON(t, idRec.Body.Bytes())
+	if idJSON["service"] != "slopguard" || idJSON["auth_required"] != true {
+		t.Fatalf("unexpected identity payload: %v", idJSON)
+	}
+
+	// 2. Protected /api/* rejects missing or invalid session token with 401.
+	for _, tc := range []struct {
+		name  string
+		token string
+	}{
+		{"missing", ""},
+		{"wrong", "0000000000000000"},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/api/overview", nil)
+		req.Host = "127.0.0.1:7788"
+		if tc.token != "" {
+			req.Header.Set(uiTokenHeaderName, tc.token)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s token: GET /api/overview = %d, want 401", tc.name, rec.Code)
+		}
+	}
+
+	// 3. Rejects DNS rebinding / non-loopback Host and cross-site Origin / Sec-Fetch-Site.
+	badHostReq := httptest.NewRequest(http.MethodGet, "/api/overview", nil)
+	badHostReq.Host = "evil.example.com:7788"
+	badHostReq.Header.Set(uiTokenHeaderName, s.AuthToken())
+	badHostRec := httptest.NewRecorder()
+	handler.ServeHTTP(badHostRec, badHostReq)
+	if badHostRec.Code != http.StatusForbidden {
+		t.Fatalf("bad host = %d, want 403", badHostRec.Code)
+	}
+
+	badOriginReq := httptest.NewRequest(http.MethodPost, "/api/ai/config", strings.NewReader(`{}`))
+	badOriginReq.Host = "127.0.0.1:7788"
+	badOriginReq.Header.Set("Origin", "https://evil.com")
+	badOriginReq.Header.Set("Content-Type", "application/json")
+	badOriginReq.Header.Set(uiTokenHeaderName, s.AuthToken())
+	badOriginRec := httptest.NewRecorder()
+	handler.ServeHTTP(badOriginRec, badOriginReq)
+	if badOriginRec.Code != http.StatusForbidden {
+		t.Fatalf("bad origin = %d, want 403", badOriginRec.Code)
+	}
+
+	crossSiteReq := httptest.NewRequest(http.MethodGet, "/api/overview", nil)
+	crossSiteReq.Host = "127.0.0.1:7788"
+	crossSiteReq.Header.Set("Sec-Fetch-Site", "cross-site")
+	crossSiteReq.Header.Set(uiTokenHeaderName, s.AuthToken())
+	crossSiteRec := httptest.NewRecorder()
+	handler.ServeHTTP(crossSiteRec, crossSiteReq)
+	if crossSiteRec.Code != http.StatusForbidden {
+		t.Fatalf("cross-site = %d, want 403", crossSiteRec.Code)
+	}
+
+	// 4. Browser bootstrap via /?token=... issues HttpOnly SameSite=Strict cookie & enforces X-Requested-With + Content-Type.
+	bootReq := httptest.NewRequest(http.MethodGet, "/?token="+url.QueryEscape(s.AuthToken()), nil)
+	bootReq.Host = "127.0.0.1:7788"
+	bootRec := httptest.NewRecorder()
+	handler.ServeHTTP(bootRec, bootReq)
+	if bootRec.Code != http.StatusFound {
+		t.Fatalf("GET /?token=... = %d, want 302", bootRec.Code)
+	}
+	cookies := bootRec.Result().Cookies()
+	var sessCookie *http.Cookie
+	for _, c := range cookies {
+		if c.Name == uiSessionCookieName {
+			sessCookie = c
+			break
+		}
+	}
+	if sessCookie == nil || !sessCookie.HttpOnly || sessCookie.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("expected HttpOnly SameSite=Strict cookie, got %+v", sessCookie)
+	}
+
+	// Cookie POST without X-Requested-With must be rejected with 403.
+	noCSRFReq := httptest.NewRequest(http.MethodPost, "/api/ai/config", strings.NewReader(`{"auto_analyze":false}`))
+	noCSRFReq.Host = "127.0.0.1:7788"
+	noCSRFReq.AddCookie(sessCookie)
+	noCSRFReq.Header.Set("Content-Type", "application/json")
+	noCSRFRec := httptest.NewRecorder()
+	handler.ServeHTTP(noCSRFRec, noCSRFReq)
+	if noCSRFRec.Code != http.StatusForbidden {
+		t.Fatalf("cookie POST without X-Requested-With = %d, want 403", noCSRFRec.Code)
+	}
+
+	// Cookie POST with X-Requested-With but non-JSON Content-Type rejected with 415.
+	badCTReq := httptest.NewRequest(http.MethodPost, "/api/ai/config", strings.NewReader(`auto_analyze=false`))
+	badCTReq.Host = "127.0.0.1:7788"
+	badCTReq.AddCookie(sessCookie)
+	badCTReq.Header.Set("X-Requested-With", "SlopGuard")
+	badCTReq.Header.Set("Content-Type", "text/plain")
+	badCTRec := httptest.NewRecorder()
+	handler.ServeHTTP(badCTRec, badCTReq)
+	if badCTRec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("bad content-type = %d, want 415", badCTRec.Code)
+	}
+
+	// Valid cookie POST with X-Requested-With + application/json succeeds.
+	okCookieReq := httptest.NewRequest(http.MethodPost, "/api/ai/config", strings.NewReader(`{"auto_analyze":false}`))
+	okCookieReq.Host = "127.0.0.1:7788"
+	okCookieReq.AddCookie(sessCookie)
+	okCookieReq.Header.Set("X-Requested-With", "SlopGuard")
+	okCookieReq.Header.Set("Content-Type", "application/json")
+	okCookieRec := httptest.NewRecorder()
+	handler.ServeHTTP(okCookieRec, okCookieReq)
+	if okCookieRec.Code != http.StatusOK {
+		t.Fatalf("valid cookie POST = %d: %s", okCookieRec.Code, okCookieRec.Body.String())
+	}
+
+	// 5. Oversized request body (> 2 MiB) returns 413 Request Entity Too Large.
+	bigBody := `{"project":"` + strings.Repeat("a", (2<<20)+1024) + `"}`
+	bigReq := httptest.NewRequest(http.MethodPost, "/api/mistakes/analyze-all", strings.NewReader(bigBody))
+	bigReq.Host = "127.0.0.1:7788"
+	bigReq.Header.Set(uiTokenHeaderName, s.AuthToken())
+	bigReq.Header.Set("Content-Type", "application/json")
+	bigRec := httptest.NewRecorder()
+	handler.ServeHTTP(bigRec, bigReq)
+	if bigRec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized body = %d, want 413: %s", bigRec.Code, bigRec.Body.String())
 	}
 }

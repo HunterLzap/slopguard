@@ -66,6 +66,14 @@ func (p productionEngine) LastCommitFiles(ctx context.Context, root string) ([]s
 	return git.LastCommitFiles(ctx)
 }
 
+func (p productionEngine) CommitFiles(ctx context.Context, root, rev string) ([]string, error) {
+	git := engine.NewGit(p.runner, root)
+	if !git.IsRepository(ctx) {
+		return nil, fmt.Errorf("not a git repository; use --all to scan every file")
+	}
+	return git.CommitFiles(ctx, rev)
+}
+
 func (p productionEngine) ListFiles(root string, extensions []string) ([]string, error) {
 	return engine.ListFiles(root, extensions)
 }

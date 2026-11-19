@@ -19,6 +19,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/HunterLzap/slopguard/internal/adapter"
@@ -42,23 +43,30 @@ type Options struct {
 
 // Server exposes the dashboard API, local action handlers, background guard, and embedded single-page app.
 type Server struct {
-	db      *store.Store
-	runner  contract.Runner
-	mux     *http.ServeMux
-	port    int
-	homeDir string
-	guard   *GuardManager
-	ai      *AIManager
+	db        *store.Store
+	runner    contract.Runner
+	mux       *http.ServeMux
+	port      int
+	homeDir   string
+	guard     *GuardManager
+	ai        *AIManager
+	authMu    sync.RWMutex
+	authToken string
 }
 
 // NewServer creates a dashboard server backed by the given store and runner.
 func NewServer(db *store.Store, runner contract.Runner) *Server {
-	s := &Server{db: db, runner: runner}
+	s := &Server{
+		db:        db,
+		runner:    runner,
+		authToken: generateRandomToken(),
+	}
 	s.guard = newGuardManager(s)
 	s.ai = newAIManager(s)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(mustSubFS(assets, "assets")))))
+	mux.HandleFunc("/api/identity", s.handleIdentity)
 	mux.HandleFunc("/api/overview", s.handleOverview)
 	mux.HandleFunc("/api/summary", s.handleSummary)
 	mux.HandleFunc("/api/projects", s.handleProjects)
@@ -92,9 +100,9 @@ func (s *Server) backupsDir() string {
 	return filepath.Join(home, ".slopguard", "backups")
 }
 
-// Handler returns the dashboard HTTP handler.
+// Handler returns the dashboard HTTP handler wrapped with localhost security middleware.
 func (s *Server) Handler() http.Handler {
-	return s.mux
+	return s.withSecurity(s.mux)
 }
 
 // Run starts the local dashboard on 127.0.0.1 and blocks until ctx is cancelled
@@ -114,6 +122,12 @@ func Run(ctx context.Context, db *store.Store, runner contract.Runner, opts Opti
 	}
 	server := NewServer(db, runner)
 	server.port = opts.Port
+	token, err := ensurePersistentAuthToken(server.resolveHomeDir())
+	if err != nil {
+		return fmt.Errorf("ui: initialize session token: %w", err)
+	}
+	server.SetAuthToken(token)
+
 	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", opts.Port))
 	if err != nil {
 		return fmt.Errorf("ui: listen 127.0.0.1:%d: %w", opts.Port, err)
@@ -126,15 +140,27 @@ func Run(ctx context.Context, db *store.Store, runner contract.Runner, opts Opti
 		fmt.Fprintf(stdout, "SlopGuard dashboard: %s\n", url)
 	}
 	if !opts.NoOpen {
-		if err := openBrowser(url); err != nil && stdout != nil {
+		authURL := url + "?token=" + neturl.QueryEscape(token)
+		if err := openBrowser(authURL); err != nil && stdout != nil {
 			fmt.Fprintf(stdout, "slopguard: warning: cannot open browser: %v\n", err)
 		}
 	}
 
-	httpServer := &http.Server{Handler: server.Handler(), ReadHeaderTimeout: 5 * time.Second}
+	httpServer := &http.Server{
+		Handler:           server.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      180 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
 	if server.guard != nil {
 		server.guard.Start(ctx)
 		defer server.guard.Stop()
+	}
+	if server.ai != nil {
+		server.ai.Start(ctx)
+		defer server.ai.Wait()
 	}
 	errCh := make(chan error, 1)
 	go func() {
@@ -456,7 +482,7 @@ func deriveRuleFromMistake(m store.MistakeRecord) (engineName, ruleID, payload s
 	return engineName, ruleID, payload
 }
 
-func ensureRuleForApprovedMistake(ctx context.Context, db *store.Store, m store.MistakeRecord) error {
+func ruleFromApprovedMistake(m store.MistakeRecord) (store.Rule, error) {
 	engineName, ruleID, defaultPayload := deriveRuleFromMistake(m)
 	payload := strings.TrimSpace(m.AIRuleDraft)
 	if payload == "" {
@@ -470,20 +496,7 @@ func ensureRuleForApprovedMistake(ctx context.Context, db *store.Store, m store.
 	if strings.TrimSpace(m.AIReason) != "" {
 		source = "agent"
 	}
-
-	existing, err := db.ListRuleLedger(ctx, store.RuleLedgerQuery{
-		ProjectPath: m.ProjectPath,
-		Engine:      engineName,
-	})
-	if err == nil {
-		for _, r := range existing {
-			if strings.EqualFold(r.RuleID, ruleID) && r.ProjectPath == m.ProjectPath {
-				return nil
-			}
-		}
-	}
-
-	return db.InsertRule(ctx, store.Rule{
+	return store.Rule{
 		Scope:       "project",
 		ProjectPath: m.ProjectPath,
 		Engine:      engineName,
@@ -493,7 +506,7 @@ func ensureRuleForApprovedMistake(ctx context.Context, db *store.Store, m store.
 		Source:      source,
 		Status:      "active",
 		AppliedAt:   time.Now().UTC(),
-	})
+	}, nil
 }
 
 func (s *Server) handleMistakes(w http.ResponseWriter, r *http.Request) {
@@ -560,29 +573,14 @@ func (s *Server) handleMistakeAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if action == "approve" {
-		var matchedMistake *store.MistakeRecord
-		if list, qErr := s.db.QueryMistakes(r.Context(), store.MistakeQuery{}); qErr == nil {
-			for i := range list {
-				if list[i].Fingerprint == fingerprint {
-					cp := list[i]
-					matchedMistake = &cp
-					break
-				}
-			}
-		}
-		if err := s.db.ApproveMistake(r.Context(), fingerprint); err != nil {
+		ruleCreated, err := s.db.ApproveMistakeAndCreateRule(r.Context(), fingerprint, ruleFromApprovedMistake)
+		if err != nil {
 			if errors.Is(err, store.ErrMistakeNotFound) {
 				writeError(w, http.StatusNotFound, "mistake not found")
 				return
 			}
-			writeError(w, http.StatusBadRequest, err.Error())
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("原子入库失败（已回滚）: %v", err))
 			return
-		}
-		ruleCreated := false
-		if matchedMistake != nil {
-			if rErr := ensureRuleForApprovedMistake(r.Context(), s.db, *matchedMistake); rErr == nil {
-				ruleCreated = true
-			}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":            true,
@@ -951,8 +949,7 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req verifyRequest
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON request body")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 	project := strings.TrimSpace(req.Project)

@@ -31,7 +31,15 @@
   const $ = (id) => document.getElementById(id);
 
   async function api(path, options) {
-    const response = await fetch(path, options);
+    const opts = { ...(options || {}) };
+    const headers = new Headers(opts.headers || {});
+    headers.set("X-Requested-With", "SlopGuard");
+    const method = (opts.method || "GET").toUpperCase();
+    if (method !== "GET" && method !== "HEAD" && opts.body !== undefined && !headers.has("Content-Type")) {
+      headers.set("Content-Type", "application/json");
+    }
+    opts.headers = headers;
+    const response = await fetch(path, opts);
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
       throw new Error(data.error || response.statusText || "请求失败");
@@ -1435,15 +1443,17 @@
   }
 
   async function previewAgentChange(agent, action) {
+    const reqProject = state.project || "";
     const preview = await api("/api/agents/preview", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         agent_id: agent.id,
-        project: state.project || "",
+        project: reqProject,
         action,
       }),
     });
+    preview.project = reqProject;
     openDiffModal(preview);
   }
 
@@ -1478,6 +1488,7 @@
     confirmBtn.disabled = true;
     const isRestore = preview.action === "restore";
     confirmBtn.textContent = isRestore ? "正在还原…" : "正在备份并写入…";
+    const boundProject = typeof preview.project === "string" ? preview.project : (state.project || "");
 
     try {
       if (preview.kind === "agent") {
@@ -1486,9 +1497,10 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             agent_id: preview.agent_id,
-            project: state.project || "",
+            project: boundProject,
             enable: !isRestore,
             confirmed: true,
+            expected_hashes: preview.base_hashes || undefined,
           }),
         });
       } else {
@@ -1501,8 +1513,9 @@
           body: JSON.stringify({
             client_id: preview.client_id || preview.target_id,
             target_id: preview.target_id || preview.client_id,
-            project: state.project || "",
+            project: boundProject,
             confirmed: true,
+            expected_hashes: preview.base_hashes || undefined,
           }),
         });
       }
@@ -1604,14 +1617,31 @@
   }
 
   async function updateAIConfig(patch) {
+    const payload = { ...(patch || {}) };
+    if (payload.auto_analyze === true) {
+      const runnerName = state.aiStatus?.runner_id || state.aiStatus?.active_runner || "本机已登录 Agent CLI";
+      const ok = window.confirm(
+        `确认开启「自动调 AI」后台分析？\n\n` +
+        `• 执行方式：仅在只读沙箱/Plan 模式下调用本机 CLI（${runnerName}）\n` +
+        `• 提交数据：新捕获错题的报错摘要与局部代码片段\n` +
+        `• 额度消耗：后台嗅探/守护新增错题时将自动触发模型请求并消耗账号额度`
+      );
+      if (!ok) {
+        const autoSw = $("ai-auto-switch");
+        if (autoSw) autoSw.checked = false;
+        return;
+      }
+      payload.confirmed = true;
+    }
     try {
       const res = await api("/api/ai/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(patch),
+        body: JSON.stringify(payload),
       });
       renderAIStatus(res.status || null);
     } catch (error) {
+      renderAIStatus(state.aiStatus || null);
       alert(`AI 设置更新失败：${error.message}`);
     }
   }

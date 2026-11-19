@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -139,7 +140,7 @@ func buildMCPTools(root string) []mcp.Tool {
 				if err := decodeMCPArgs(args, &a); err != nil {
 					return nil, err
 				}
-				return listInboxForMCP(ctx, a.Project, a.ReviewStatus)
+				return listInboxForMCP(ctx, root, a.Project, a.ReviewStatus)
 			},
 		},
 		{
@@ -161,7 +162,7 @@ func buildMCPTools(root string) []mcp.Tool {
 				if err := decodeMCPArgs(args, &a); err != nil {
 					return nil, err
 				}
-				return submitAnalysisForMCP(ctx, a.Fingerprint, a.Decision, a.Reason, a.RuleDraft)
+				return submitAnalysisForMCP(ctx, root, a.Fingerprint, a.Decision, a.Reason, a.RuleDraft)
 			},
 		},
 	}
@@ -387,33 +388,78 @@ func listCandidatesForMCP(ctx context.Context, minCount int) ([]contract.Mistake
 	return candidates, nil
 }
 
-func listInboxForMCP(ctx context.Context, project, reviewStatus string) ([]store.MistakeRecord, error) {
+func normalizeMCPScopePath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	if resolved, err := filepath.EvalSymlinks(p); err == nil && resolved != "" {
+		p = resolved
+	}
+	return filepath.Clean(p)
+}
+
+func resolveMCPEnforcedRoot(root string) (string, error) {
+	scopeRoot := strings.TrimSpace(root)
+	if scopeRoot == "" {
+		abs, err := filepath.Abs(".")
+		if err != nil || strings.TrimSpace(abs) == "" {
+			return "", errors.New("mcp workspace root is required for inbox operations")
+		}
+		scopeRoot = abs
+	}
+	return scopeRoot, nil
+}
+
+func listInboxForMCP(ctx context.Context, root, requestedProject, reviewStatus string) ([]store.MistakeRecord, error) {
+	scopeRoot, err := resolveMCPEnforcedRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(requestedProject) != "" {
+		if normalizeMCPScopePath(requestedProject) != normalizeMCPScopePath(scopeRoot) {
+			return nil, fmt.Errorf("cross-project query blocked: sg_list_inbox is scoped to %s", scopeRoot)
+		}
+	}
 	db, err := openMCPStore()
 	if err != nil {
 		return nil, fmt.Errorf("open mistake store: %w", err)
 	}
 	defer db.Close()
-	items, err := db.ListInboxMistakes(ctx, project, reviewStatus)
+	items, err := db.ListInboxMistakes(ctx, scopeRoot, reviewStatus)
 	if err != nil {
 		return nil, fmt.Errorf("list inbox mistakes: %w", err)
 	}
-	if items == nil {
-		items = []store.MistakeRecord{}
+	// Double-check strict project scope across symlink aliases too.
+	scoped := make([]store.MistakeRecord, 0, len(items))
+	wantCanon := normalizeMCPScopePath(scopeRoot)
+	for _, rec := range items {
+		if normalizeMCPScopePath(rec.ProjectPath) == wantCanon {
+			scoped = append(scoped, rec)
+		}
 	}
-	return items, nil
+	return scoped, nil
 }
 
-func submitAnalysisForMCP(ctx context.Context, fingerprint, decision, reason, ruleDraft string) (any, error) {
+func submitAnalysisForMCP(ctx context.Context, root, fingerprint, decision, reason, ruleDraft string) (any, error) {
+	scopeRoot, err := resolveMCPEnforcedRoot(root)
+	if err != nil {
+		return nil, err
+	}
 	db, err := openMCPStore()
 	if err != nil {
 		return nil, fmt.Errorf("open mistake store: %w", err)
 	}
 	defer db.Close()
-	if err := db.SubmitMistakeAnalysis(ctx, fingerprint, decision, reason, ruleDraft); err != nil {
+	if err := db.SubmitMistakeAnalysisScoped(ctx, scopeRoot, fingerprint, decision, reason, ruleDraft); err != nil {
 		return nil, fmt.Errorf("submit analysis: %w", err)
 	}
 	return map[string]any{
 		"submitted":     true,
+		"project":       scopeRoot,
 		"fingerprint":   strings.TrimSpace(fingerprint),
 		"decision":      strings.ToLower(strings.TrimSpace(decision)),
 		"review_status": "pending_user",

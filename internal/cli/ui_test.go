@@ -50,6 +50,7 @@ func TestRunUIHelp(t *testing.T) {
 }
 
 func TestRunUISmartLaunchWhenAlreadyRunning(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	oldCheck := checkDashboardRunning
 	oldOpen := openDashboardWindow
 	oldRun := runDashboard

@@ -67,6 +67,11 @@ type lastCommitProvider interface {
 	LastCommitFiles(ctx context.Context, root string) ([]string, error)
 }
 
+// commitFilesProvider resolves files touched by an explicit commit SHA.
+type commitFilesProvider interface {
+	CommitFiles(ctx context.Context, root, rev string) ([]string, error)
+}
+
 // signalContextProvider is an optional engine capability for graceful
 // Ctrl+C/SIGTERM cancellation.
 type signalContextProvider interface {

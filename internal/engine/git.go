@@ -120,10 +120,22 @@ func (g *Git) ChangedFiles(ctx context.Context) ([]string, error) {
 // LastCommitFiles 返回最近一次提交（HEAD）中新增、复制、修改或重命名的文件列表，
 // 仅保留当前工作区仍存在的文件。仓库尚无 HEAD 提交时返回空切片。
 func (g *Git) LastCommitFiles(ctx context.Context) ([]string, error) {
+	return g.CommitFiles(ctx, "HEAD")
+}
+
+// CommitFiles 返回指定提交 rev 中新增、复制、修改或重命名的文件列表。
+func (g *Git) CommitFiles(ctx context.Context, rev string) ([]string, error) {
 	if g == nil || !g.hasHEAD(ctx) {
 		return []string{}, nil
 	}
-	out, err := g.output(ctx, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--root", "--diff-filter=ACMR", "HEAD")
+	rev = strings.TrimSpace(rev)
+	if rev == "" {
+		rev = "HEAD"
+	}
+	if strings.HasPrefix(rev, "-") {
+		return nil, fmt.Errorf("engine: invalid git revision %q", rev)
+	}
+	out, err := g.output(ctx, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--root", "--diff-filter=ACMR", rev)
 	if err != nil {
 		return nil, err
 	}

@@ -30,10 +30,12 @@ mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
   "$SRC_FILE" \
   -o "$OUT_BIN"
 
-if [[ -x "$ROOT_DIR/bin/slopguard" ]]; then
-  cp "$ROOT_DIR/bin/slopguard" "$RESOURCES_DIR/slopguard"
-  chmod +x "$RESOURCES_DIR/slopguard"
+if [[ ! -x "$ROOT_DIR/bin/slopguard" ]]; then
+  echo "error: missing executable $ROOT_DIR/bin/slopguard (run 'make build' first)" >&2
+  exit 1
 fi
+cp "$ROOT_DIR/bin/slopguard" "$RESOURCES_DIR/slopguard"
+chmod +x "$RESOURCES_DIR/slopguard"
 
 cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

@@ -2,16 +2,16 @@ package ui
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/HunterLzap/slopguard/internal/engine"
 )
 
 func (s *Server) registerActionRoutes(mux *http.ServeMux) {
@@ -56,20 +56,21 @@ func runSelfCLI(ctx context.Context, args ...string) (string, int, error) {
 	if err != nil {
 		return "", -1, err
 	}
-	runCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(runCtx, exe, args...)
-	out, err := cmd.CombinedOutput()
-	exitCode := 0
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			exitCode = exitErr.ExitCode()
+	res := engine.RunProcess(ctx, engine.ProcessSpec{
+		Command:        exe,
+		Args:           args,
+		Timeout:        120 * time.Second,
+		MaxOutputBytes: engine.MaxOutputBytes,
+	})
+	combined := strings.TrimSpace(res.Stdout)
+	if stderr := strings.TrimSpace(res.Stderr); stderr != "" {
+		if combined != "" {
+			combined += "\n" + stderr
 		} else {
-			return string(out), -1, err
+			combined = stderr
 		}
 	}
-	return strings.TrimSpace(string(out)), exitCode, nil
+	return combined, res.ExitCode, res.Err
 }
 
 func (s *Server) handlePickFolder(w http.ResponseWriter, r *http.Request) {
@@ -85,13 +86,21 @@ func (s *Server) handlePickFolder(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-	defer cancel()
 	script := `POSIX path of (choose folder with prompt "选择要接入 SlopGuard 的项目目录")`
-	cmd := exec.CommandContext(ctx, "osascript", "-e", script)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		msg := strings.TrimSpace(string(out))
+	res := engine.RunProcess(r.Context(), engine.ProcessSpec{
+		Command:        "osascript",
+		Args:           []string{"-e", script},
+		Timeout:        60 * time.Second,
+		MaxOutputBytes: 64 * 1024,
+	})
+	if res.Err != nil || res.ExitCode != 0 {
+		msg := strings.TrimSpace(res.Stderr)
+		if msg == "" {
+			msg = strings.TrimSpace(res.Stdout)
+		}
+		if msg == "" && res.Err != nil {
+			msg = res.Err.Error()
+		}
 		if strings.Contains(msg, "-128") || strings.Contains(strings.ToLower(msg), "cancel") {
 			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "supported": true, "cancelled": true})
 			return
@@ -99,7 +108,7 @@ func (s *Server) handlePickFolder(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "supported": true, "error": msg})
 		return
 	}
-	picked := strings.TrimRight(strings.TrimSpace(string(out)), "/")
+	picked := strings.TrimRight(strings.TrimSpace(res.Stdout), "/")
 	if picked == "" {
 		picked = "/"
 	}
@@ -118,8 +127,7 @@ func (s *Server) handleAddProject(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Path string `json:"path"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON payload")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 	rawPath := strings.TrimSpace(req.Path)
@@ -193,8 +201,7 @@ func (s *Server) handleServiceToggle(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Enable bool `json:"enable"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON payload")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 	sub := "uninstall"
@@ -244,8 +251,7 @@ func (s *Server) runBaselineAction(w http.ResponseWriter, r *http.Request, modeF
 	var req struct {
 		Project string `json:"project"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON payload")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 	project := strings.TrimSpace(req.Project)
@@ -269,11 +275,39 @@ func (s *Server) runBaselineAction(w http.ResponseWriter, r *http.Request, modeF
 }
 
 type targetMutationRequest struct {
-	ClientID  string `json:"client_id"`
-	TargetID  string `json:"target_id"`
-	Project   string `json:"project"`
-	Action    string `json:"action"`
-	Confirmed bool   `json:"confirmed"`
+	ClientID       string            `json:"client_id"`
+	TargetID       string            `json:"target_id"`
+	Project        string            `json:"project"`
+	Action         string            `json:"action"`
+	Confirmed      bool              `json:"confirmed"`
+	ExpectedHashes map[string]string `json:"expected_hashes,omitempty"`
+}
+
+func verifyExpectedHashes(expected map[string]string, paths ...string) error {
+	if len(expected) == 0 {
+		return nil
+	}
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		wantHash, has := expected[p]
+		if !has {
+			continue
+		}
+		currHash, existed, err := currentFileSHA256(p)
+		if err != nil {
+			return fmt.Errorf("检查目标文件版本失败 (%s): %w", p, err)
+		}
+		if !existed {
+			currHash = ""
+		}
+		if currHash != wantHash {
+			return fmt.Errorf("配置文件 %s 在预览后已被外部修改，请重新预览 Diff", p)
+		}
+	}
+	return nil
 }
 
 func (r targetMutationRequest) effectiveID() string {
@@ -339,6 +373,7 @@ type targetDiffSummary struct {
 	ConfigPath string `json:"config_path"`
 	Action     string `json:"action"`
 	Existed    bool   `json:"existed"`
+	BaseSHA256 string `json:"base_sha256,omitempty"`
 	HasChanges bool   `json:"has_changes"`
 	HasBackup  bool   `json:"has_backup"`
 	BackupAt   string `json:"backup_at,omitempty"`
@@ -359,14 +394,24 @@ func (s *Server) previewMCPTarget(target mcpClientStatus, project, action string
 	case "restore":
 		oldText, existed, err = readFileTextOrEmpty(target.ConfigPath)
 		if err == nil {
-			if _, rec, ok := lookupBackup(s.backupsDir(), "mcp", target.ID, target.ConfigPath); ok {
-				if rec.Existed {
-					newText = string(rec.OriginalBytes)
+			_, rec, ok, checkErr := lookupBackupChecked(s.backupsDir(), "mcp", target.ID, target.ConfigPath)
+			if checkErr != nil {
+				return targetDiffSummary{}, http.StatusInternalServerError, checkErr
+			}
+			extMod := false
+			if ok {
+				extMod, _, err = targetExternallyModifiedSinceInstall(rec, target.ConfigPath)
+			}
+			if err == nil {
+				if ok && !extMod {
+					if rec.Existed {
+						newText = string(rec.OriginalBytes)
+					} else {
+						newText = ""
+					}
 				} else {
-					newText = ""
+					_, newText, _, err = renderMCPRemove(target.ConfigPath)
 				}
-			} else {
-				_, newText, _, err = renderMCPRemove(target.ConfigPath)
 			}
 		}
 	default:
@@ -374,6 +419,10 @@ func (s *Server) previewMCPTarget(target mcpClientStatus, project, action string
 	}
 	if err != nil {
 		return targetDiffSummary{}, http.StatusBadRequest, err
+	}
+	baseHash := ""
+	if existed {
+		baseHash = fileSHA256Hex([]byte(oldText))
 	}
 	diff := buildUnifiedDiff(target.ConfigPath, oldText, newText, 3)
 	return targetDiffSummary{
@@ -384,6 +433,7 @@ func (s *Server) previewMCPTarget(target mcpClientStatus, project, action string
 		ConfigPath: target.ConfigPath,
 		Action:     action,
 		Existed:    existed,
+		BaseSHA256: baseHash,
 		HasChanges: diff != "",
 		HasBackup:  target.HasBackup,
 		BackupAt:   target.BackupAt,
@@ -401,13 +451,21 @@ func (s *Server) previewSkillTarget(home string, target skillTargetStatus, actio
 	case "install":
 		newText = renderSkillContent(home, target.ID)
 	case "restore":
-		if _, rec, ok := lookupBackup(s.backupsDir(), "skill", target.ID, target.ConfigPath); ok && rec.Existed {
+		_, rec, ok, checkErr := lookupBackupChecked(s.backupsDir(), "skill", target.ID, target.ConfigPath)
+		if checkErr != nil {
+			return targetDiffSummary{}, http.StatusInternalServerError, checkErr
+		}
+		if ok && rec.Existed {
 			newText = string(rec.OriginalBytes)
 		} else {
 			newText = ""
 		}
 	default:
 		return targetDiffSummary{}, http.StatusBadRequest, errors.New("不支持的预览操作类型")
+	}
+	baseHash := ""
+	if existed {
+		baseHash = fileSHA256Hex([]byte(oldText))
 	}
 	diff := buildUnifiedDiff(target.ConfigPath, oldText, newText, 3)
 	return targetDiffSummary{
@@ -418,6 +476,7 @@ func (s *Server) previewSkillTarget(home string, target skillTargetStatus, actio
 		ConfigPath: target.ConfigPath,
 		Action:     action,
 		Existed:    existed,
+		BaseSHA256: baseHash,
 		HasChanges: diff != "",
 		HasBackup:  target.HasBackup,
 		BackupAt:   target.BackupAt,
@@ -427,28 +486,14 @@ func (s *Server) previewSkillTarget(home string, target skillTargetStatus, actio
 
 func (s *Server) applyMCPTarget(target mcpClientStatus, project, action string) (map[string]any, int, error) {
 	if action == "restore" {
-		restoredFromBackup, removedFile, err := restoreFromBackup(s.backupsDir(), "mcp", target.ID, target.ConfigPath)
+		restoredFromBackup, removedFile, err := uninstallManagedTarget(s.backupsDir(), "mcp", target.ID, target.ConfigPath, target.Scope)
 		if err != nil {
-			return nil, http.StatusInternalServerError, err
-		}
-		if !restoredFromBackup {
-			_, newText, shouldRemove, remErr := renderMCPRemove(target.ConfigPath)
-			if remErr != nil {
-				return nil, http.StatusBadRequest, remErr
-			}
-			if shouldRemove {
-				if err := os.Remove(target.ConfigPath); err != nil && !os.IsNotExist(err) {
-					return nil, http.StatusInternalServerError, err
-				}
-				removedFile = true
-			} else if newText != "" {
-				if err := writeFileAtomic(target.ConfigPath, []byte(newText), 0o644); err != nil {
-					return nil, http.StatusInternalServerError, err
-				}
-			}
+			return nil, http.StatusConflict, err
 		}
 		if target.ID == "antigravity" && strings.TrimSpace(s.homeDir) == "" {
-			syncAgyMCPRegistry(s.resolveHomeDir(), "", false)
+			if syncErr := syncAgyMCPRegistry(s.resolveHomeDir(), "", false); syncErr != nil {
+				return nil, http.StatusInternalServerError, fmt.Errorf("已移除配置文件，但同步 Antigravity CLI 失败: %w", syncErr)
+			}
 		}
 		return map[string]any{
 			"ok":                   true,
@@ -472,11 +517,17 @@ func (s *Server) applyMCPTarget(target mcpClientStatus, project, action string) 
 	if err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("备份原配置失败: %v", err)
 	}
-	if err := writeFileAtomic(target.ConfigPath, []byte(newText), 0o644); err != nil {
+	mode := existingFileModeOrDefault(target.ConfigPath, defaultModeForTarget(target.Scope, "mcp"))
+	if err := writeFileAtomic(target.ConfigPath, []byte(newText), mode); err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("写入 MCP 配置失败: %v", err)
 	}
+	if err := recordBackupInstalledHash(s.backupsDir(), "mcp", target.ID, target.ConfigPath, []byte(newText)); err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("记录配置摘要失败: %v", err)
+	}
 	if target.ID == "antigravity" && strings.TrimSpace(s.homeDir) == "" {
-		syncAgyMCPRegistry(s.resolveHomeDir(), exe, true)
+		if syncErr := syncAgyMCPRegistry(s.resolveHomeDir(), exe, true); syncErr != nil {
+			return nil, http.StatusInternalServerError, fmt.Errorf("已写入配置文件，但同步 Antigravity CLI 失败: %w", syncErr)
+		}
 	}
 	return map[string]any{
 		"ok":          true,
@@ -490,16 +541,9 @@ func (s *Server) applyMCPTarget(target mcpClientStatus, project, action string) 
 
 func (s *Server) applySkillTarget(home string, target skillTargetStatus, action string) (map[string]any, int, error) {
 	if action == "restore" {
-		restoredFromBackup, removedFile, err := restoreFromBackup(s.backupsDir(), "skill", target.ID, target.ConfigPath)
+		restoredFromBackup, removedFile, err := uninstallManagedTarget(s.backupsDir(), "skill", target.ID, target.ConfigPath, target.Scope)
 		if err != nil {
-			return nil, http.StatusInternalServerError, err
-		}
-		if !restoredFromBackup && isSkillConfigured(target.ConfigPath) {
-			if err := os.Remove(target.ConfigPath); err != nil && !os.IsNotExist(err) {
-				return nil, http.StatusInternalServerError, err
-			}
-			removedFile = true
-			cleanupEmptySkillLeafDir("skill", target.ConfigPath)
+			return nil, http.StatusConflict, err
 		}
 		return map[string]any{
 			"ok":                   true,
@@ -520,8 +564,12 @@ func (s *Server) applySkillTarget(home string, target skillTargetStatus, action 
 	if err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("备份原 Skill 失败: %v", err)
 	}
-	if err := writeFileAtomic(target.ConfigPath, []byte(newText), 0o644); err != nil {
+	mode := existingFileModeOrDefault(target.ConfigPath, defaultModeForTarget(target.Scope, "skill"))
+	if err := writeFileAtomic(target.ConfigPath, []byte(newText), mode); err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("写入 Skill 失败: %v", err)
+	}
+	if err := recordBackupInstalledHash(s.backupsDir(), "skill", target.ID, target.ConfigPath, []byte(newText)); err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("记录 Skill 摘要失败: %v", err)
 	}
 	return map[string]any{
 		"ok":          true,
@@ -544,6 +592,8 @@ func writeTargetDiffJSON(w http.ResponseWriter, d targetDiffSummary) {
 		"config_path": d.ConfigPath,
 		"action":      d.Action,
 		"existed":     d.Existed,
+		"base_sha256": d.BaseSHA256,
+		"base_hashes": map[string]string{d.ConfigPath: d.BaseSHA256},
 		"has_changes": d.HasChanges,
 		"has_backup":  d.HasBackup,
 		"backup_at":   d.BackupAt,
@@ -557,8 +607,7 @@ func (s *Server) handlePreviewMCPClient(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var req targetMutationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON payload")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 	project := strings.TrimSpace(req.Project)
@@ -585,8 +634,7 @@ func (s *Server) handleInstallMCPClient(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var req targetMutationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON payload")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 	project := strings.TrimSpace(req.Project)
@@ -597,6 +645,10 @@ func (s *Server) handleInstallMCPClient(w http.ResponseWriter, r *http.Request) 
 	}
 	if target.Scope == "global" && !req.Confirmed {
 		writeError(w, http.StatusBadRequest, "修改全局配置前必须先预览 Diff 并确认")
+		return
+	}
+	if err := verifyExpectedHashes(req.ExpectedHashes, target.ConfigPath); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 	res, status, err := s.applyMCPTarget(*target, project, "install")
@@ -613,14 +665,17 @@ func (s *Server) handleRestoreMCPClient(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var req targetMutationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON payload")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 	project := strings.TrimSpace(req.Project)
 	target := findMCPClientTarget(s.resolveHomeDir(), project, req.effectiveID())
 	if target == nil {
 		writeError(w, http.StatusBadRequest, "未知的 Agent 客户端标识")
+		return
+	}
+	if err := verifyExpectedHashes(req.ExpectedHashes, target.ConfigPath); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 	res, status, err := s.applyMCPTarget(*target, project, "restore")
@@ -637,8 +692,7 @@ func (s *Server) handlePreviewSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req targetMutationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON payload")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 	home := s.resolveHomeDir()
@@ -666,8 +720,7 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req targetMutationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON payload")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 	home := s.resolveHomeDir()
@@ -679,6 +732,10 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 	}
 	if target.Scope == "global" && !req.Confirmed {
 		writeError(w, http.StatusBadRequest, "修改全局规则前必须先预览 Diff 并确认")
+		return
+	}
+	if err := verifyExpectedHashes(req.ExpectedHashes, target.ConfigPath); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 	res, status, err := s.applySkillTarget(home, *target, "install")
@@ -695,8 +752,7 @@ func (s *Server) handleRestoreSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req targetMutationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON payload")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 	home := s.resolveHomeDir()
@@ -704,6 +760,10 @@ func (s *Server) handleRestoreSkill(w http.ResponseWriter, r *http.Request) {
 	target := findSkillTarget(home, project, req.effectiveID())
 	if target == nil {
 		writeError(w, http.StatusBadRequest, "未知的 Skill 目标标识")
+		return
+	}
+	if err := verifyExpectedHashes(req.ExpectedHashes, target.ConfigPath); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 	res, status, err := s.applySkillTarget(home, *target, "restore")
@@ -745,8 +805,7 @@ func (s *Server) handleSharedSkill(w http.ResponseWriter, r *http.Request) {
 			SyncEnabled *bool  `json:"sync_enabled"`
 			Project     string `json:"project"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid JSON payload")
+		if !decodeJSONBody(w, r, &req, false) {
 			return
 		}
 		if path == "" {
@@ -867,8 +926,8 @@ func (s *Server) handleVerifyAgents(w http.ResponseWriter, r *http.Request) {
 		AgentID string `json:"agent_id"`
 		Project string `json:"project"`
 	}
-	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+	if !decodeJSONBody(w, r, &req, true) {
+		return
 	}
 	home := s.resolveHomeDir()
 	project := strings.TrimSpace(req.Project)
@@ -913,14 +972,18 @@ func (s *Server) handleAIConfig(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			AutoAnalyze *bool   `json:"auto_analyze"`
 			RunnerID    *string `json:"runner_id"`
+			Confirmed   bool    `json:"confirmed"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid JSON payload")
+		if !decodeJSONBody(w, r, &req, false) {
+			return
+		}
+		if req.AutoAnalyze != nil && *req.AutoAnalyze && !req.Confirmed {
+			writeError(w, http.StatusBadRequest, "开启自动调用本机 Agent AI 前，必须明确确认数据范围与额度消耗")
 			return
 		}
 		st, err := s.ai.SetConfig(req.AutoAnalyze, req.RunnerID)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -951,8 +1014,7 @@ func (s *Server) handlePreviewAgent(w http.ResponseWriter, r *http.Request) {
 		Project string `json:"project"`
 		Action  string `json:"action"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON payload")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 	home := s.resolveHomeDir()
@@ -971,6 +1033,7 @@ func (s *Server) handlePreviewAgent(w http.ResponseWriter, r *http.Request) {
 	var diffs []targetDiffSummary
 	var combined []string
 	var paths []string
+	baseHashes := make(map[string]string, 2)
 	var anyChanges, anyBackup bool
 	var backupAt string
 
@@ -982,6 +1045,7 @@ func (s *Server) handlePreviewAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		diffs = append(diffs, d)
 		paths = append(paths, d.ConfigPath)
+		baseHashes[d.ConfigPath] = d.BaseSHA256
 		if d.HasChanges {
 			anyChanges = true
 		}
@@ -1003,6 +1067,7 @@ func (s *Server) handlePreviewAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		diffs = append(diffs, d)
 		paths = append(paths, d.ConfigPath)
+		baseHashes[d.ConfigPath] = d.BaseSHA256
 		if d.HasChanges {
 			anyChanges = true
 		}
@@ -1027,6 +1092,7 @@ func (s *Server) handlePreviewAgent(w http.ResponseWriter, r *http.Request) {
 		"scope":       prof.Scope,
 		"action":      action,
 		"config_path": strings.Join(paths, " + "),
+		"base_hashes": baseHashes,
 		"has_changes": anyChanges,
 		"has_backup":  anyBackup,
 		"backup_at":   backupAt,
@@ -1041,13 +1107,13 @@ func (s *Server) handleToggleAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		AgentID   string `json:"agent_id"`
-		Project   string `json:"project"`
-		Enable    *bool  `json:"enable"`
-		Confirmed bool   `json:"confirmed"`
+		AgentID        string            `json:"agent_id"`
+		Project        string            `json:"project"`
+		Enable         *bool             `json:"enable"`
+		Confirmed      bool              `json:"confirmed"`
+		ExpectedHashes map[string]string `json:"expected_hashes,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON payload")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 	home := s.resolveHomeDir()
@@ -1070,23 +1136,39 @@ func (s *Server) handleToggleAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "修改全局 Agent 配置前必须先预览 Diff 并确认")
 		return
 	}
+	var expectedPaths []string
+	if prof.MCPTarget != nil {
+		expectedPaths = append(expectedPaths, prof.MCPTarget.ConfigPath)
+	}
+	if prof.SkillTarget != nil {
+		expectedPaths = append(expectedPaths, prof.SkillTarget.ConfigPath)
+	}
+	if err := verifyExpectedHashes(req.ExpectedHashes, expectedPaths...); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
 
 	action := "restore"
 	if enable {
 		action = "install"
 	}
 	results := make([]map[string]any, 0, 2)
+	wroteMCP := false
 	if prof.MCPTarget != nil {
 		res, status, err := s.applyMCPTarget(*prof.MCPTarget, project, action)
 		if err != nil {
 			writeError(w, status, err.Error())
 			return
 		}
+		wroteMCP = true
 		results = append(results, res)
 	}
 	if prof.SkillTarget != nil {
 		res, status, err := s.applySkillTarget(home, *prof.SkillTarget, action)
 		if err != nil {
+			if wroteMCP && action == "install" && prof.MCPTarget != nil {
+				_, _, _ = s.applyMCPTarget(*prof.MCPTarget, project, "restore")
+			}
 			writeError(w, status, err.Error())
 			return
 		}
@@ -1113,8 +1195,8 @@ func (s *Server) handleAnalyzeAllMistakes(w http.ResponseWriter, r *http.Request
 	var req struct {
 		Project string `json:"project"`
 	}
-	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+	if !decodeJSONBody(w, r, &req, true) {
+		return
 	}
 	project := strings.TrimSpace(req.Project)
 
@@ -1146,38 +1228,15 @@ func (s *Server) handleApplyAIRecommendations(w http.ResponseWriter, r *http.Req
 	var req struct {
 		Project string `json:"project"`
 	}
-	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+	if !decodeJSONBody(w, r, &req, true) {
+		return
 	}
 	project := strings.TrimSpace(req.Project)
 
-	pendingUser, err := s.db.ListInboxMistakes(r.Context(), project, "pending_user")
+	appliedRules, ignoredCount, err := s.db.ApplyAIRecommendationsBatch(r.Context(), project, ruleFromApprovedMistake)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("批量采纳事务失败（已整体回滚）: %v", err))
 		return
-	}
-
-	appliedRules, ignoredCount := 0, 0
-	for _, m := range pendingUser {
-		decision := strings.ToLower(strings.TrimSpace(m.AIDecision))
-		switch decision {
-		case "recommend", "approve", "promote", "recommend_approve":
-			if err := s.db.ApproveMistake(r.Context(), m.Fingerprint); err != nil {
-				writeError(w, http.StatusInternalServerError, fmt.Sprintf("确认入库失败: %v", err))
-				return
-			}
-			if err := ensureRuleForApprovedMistake(r.Context(), s.db, m); err != nil {
-				writeError(w, http.StatusInternalServerError, fmt.Sprintf("写入规则失败: %v", err))
-				return
-			}
-			appliedRules++
-		case "skip", "ignore":
-			if err := s.db.UpdateMistakeStatus(r.Context(), m.Fingerprint, "ignored"); err != nil {
-				writeError(w, http.StatusInternalServerError, fmt.Sprintf("忽略失败: %v", err))
-				return
-			}
-			ignoredCount++
-		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{

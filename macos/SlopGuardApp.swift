@@ -3,8 +3,12 @@ import WebKit
 
 private let defaultPort = 7788
 private let dashboardURLString = "http://127.0.0.1:\(defaultPort)"
-private let healthURLString = "\(dashboardURLString)/api/overview"
+private let identityURLString = "\(dashboardURLString)/api/identity"
 private let summaryURLString = "\(dashboardURLString)/api/summary"
+
+private struct IdentityResponse: Decodable, Sendable {
+    let service: String
+}
 
 private struct StatusSummary: Decodable, Sendable {
     let pending_user: Int
@@ -111,7 +115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
     @objc private func reloadPage() {
         if let currentURL = webView?.url, currentURL.host == "127.0.0.1" {
-            webView?.reload()
+            loadDashboard()
         } else {
             ensureServerAndLoad()
         }
@@ -124,7 +128,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         showWindow()
         if let currentURL = webView?.url, currentURL.host == "127.0.0.1" {
             webView?.evaluateJavaScript("window.slopguardSwitchTab && window.slopguardSwitchTab('mistakes')")
-        } else if let url = URL(string: "\(dashboardURLString)/#tab=mistakes") {
+        } else if let url = Self.authenticatedDashboardURL(fragment: "tab=mistakes") {
             webView?.load(URLRequest(url: url))
         }
     }
@@ -284,11 +288,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     private func loadDashboard() {
-        guard let url = URL(string: dashboardURLString) else { return }
+        guard let url = Self.authenticatedDashboardURL(fragment: nil) else { return }
         webView?.load(URLRequest(url: url))
         Task { @MainActor [weak self] in
             await self?.refreshStatusSummary()
         }
+    }
+
+    nonisolated private static func readUIToken() -> String? {
+        let tokenURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".slopguard", isDirectory: true)
+            .appendingPathComponent("ui-token", isDirectory: false)
+        guard let raw = try? String(contentsOf: tokenURL, encoding: .utf8) else {
+            return nil
+        }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    nonisolated private static func authenticatedDashboardURL(fragment: String?) -> URL? {
+        var components = URLComponents(string: "\(dashboardURLString)/")
+        if let tok = readUIToken() {
+            components?.queryItems = [URLQueryItem(name: "token", value: tok)]
+        }
+        if let fragment, !fragment.isEmpty {
+            components?.fragment = fragment
+        }
+        return components?.url
     }
 
     private func startSummaryPolling() {
@@ -361,6 +387,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         guard let url = URL(string: summaryURLString) else { return nil }
         var request = URLRequest(url: url)
         request.timeoutInterval = 1.5
+        if let tok = readUIToken() {
+            request.setValue(tok, forHTTPHeaderField: "X-SlopGuard-Token")
+        }
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
@@ -413,15 +442,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     nonisolated private static func isServerReachable() async -> Bool {
-        guard let url = URL(string: healthURLString) else { return false }
+        guard let url = URL(string: identityURLString) else { return false }
         var request = URLRequest(url: url)
         request.timeoutInterval = 1.0
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
-            if let http = response as? HTTPURLResponse {
-                return (200..<300).contains(http.statusCode)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                return false
             }
-            return false
+            let identity = try JSONDecoder().decode(IdentityResponse.self, from: data)
+            return identity.service == "slopguard"
         } catch {
             return false
         }
@@ -458,7 +488,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private func stopServerProcessIfOwned() {
         guard let proc = serverProcess, proc.isRunning else { return }
         proc.terminate()
-        proc.waitUntilExit()
+        let deadline = Date().addingTimeInterval(1.5)
+        while proc.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if proc.isRunning {
+            kill(proc.processIdentifier, SIGKILL)
+        }
         serverProcess = nil
     }
 

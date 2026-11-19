@@ -21,6 +21,7 @@ import (
 
 const (
 	maxSessionFilesPerSource = 15
+	maxSessionWalkEntries    = 4000
 	maxSessionReadBytes      = 2 << 20 // 2MB hard cap per log file
 	defaultSessionScanDays   = 14
 	maxSessionScanItems      = 10
@@ -67,11 +68,8 @@ func (s *Server) handleScanSessions(w http.ResponseWriter, r *http.Request) {
 		DryRun  bool     `json:"dry_run"`
 		Sources []string `json:"sources"`
 	}
-	if r.Body != nil {
-		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil && err != io.EOF {
-			writeError(w, http.StatusBadRequest, "invalid JSON payload")
-			return
-		}
+	if !decodeJSONBody(w, r, &req, true) {
+		return
 	}
 	project := strings.TrimSpace(req.Project)
 	if project != "" {
@@ -191,12 +189,12 @@ func (s *Server) scanLocalSessionsAndRework(ctx context.Context, project string,
 		}
 	}
 
-	if home != "" {
+	if home != "" && ctx.Err() == nil {
 		if allow["claude"] && len(candidates) < maxSessionScanItems {
-			files := collectRecentFiles(filepath.Join(home, ".claude", "projects"), ".jsonl", cutoff, maxSessionFilesPerSource)
+			files := collectRecentFiles(ctx, filepath.Join(home, ".claude", "projects"), ".jsonl", cutoff, maxSessionFilesPerSource)
 			counts.ClaudeFiles = len(files)
 			for _, f := range files {
-				if len(candidates) >= maxSessionScanItems {
+				if ctx.Err() != nil || len(candidates) >= maxSessionScanItems {
 					break
 				}
 				for _, item := range scanClaudeJSONL(f, project) {
@@ -204,11 +202,11 @@ func (s *Server) scanLocalSessionsAndRework(ctx context.Context, project string,
 				}
 			}
 		}
-		if allow["codex"] && len(candidates) < maxSessionScanItems {
-			files := collectRecentFiles(filepath.Join(home, ".codex", "sessions"), ".jsonl", cutoff, maxSessionFilesPerSource)
+		if allow["codex"] && len(candidates) < maxSessionScanItems && ctx.Err() == nil {
+			files := collectRecentFiles(ctx, filepath.Join(home, ".codex", "sessions"), ".jsonl", cutoff, maxSessionFilesPerSource)
 			counts.CodexFiles = len(files)
 			for _, f := range files {
-				if len(candidates) >= maxSessionScanItems {
+				if ctx.Err() != nil || len(candidates) >= maxSessionScanItems {
 					break
 				}
 				for _, item := range scanCodexJSONL(f, project) {
@@ -216,11 +214,11 @@ func (s *Server) scanLocalSessionsAndRework(ctx context.Context, project string,
 				}
 			}
 		}
-		if allow["antigravity"] && len(candidates) < maxSessionScanItems {
-			files := collectAntigravityTranscripts(filepath.Join(home, ".gemini", "antigravity", "brain"), cutoff, maxSessionFilesPerSource)
+		if allow["antigravity"] && len(candidates) < maxSessionScanItems && ctx.Err() == nil {
+			files := collectAntigravityTranscripts(ctx, filepath.Join(home, ".gemini", "antigravity", "brain"), cutoff, maxSessionFilesPerSource)
 			counts.AntigravityFiles = len(files)
 			for _, f := range files {
-				if len(candidates) >= maxSessionScanItems {
+				if ctx.Err() != nil || len(candidates) >= maxSessionScanItems {
 					break
 				}
 				for _, item := range scanAntigravityTranscript(f, project, knownProjects) {
@@ -379,14 +377,28 @@ type recentFile struct {
 	modTime time.Time
 }
 
-func collectRecentFiles(root, suffix string, cutoff time.Time, limit int) []string {
+func collectRecentFiles(ctx context.Context, root, suffix string, cutoff time.Time, limit int) []string {
 	info, err := os.Stat(root)
 	if err != nil || !info.IsDir() {
 		return nil
 	}
 	var found []recentFile
+	walked := 0
 	_ = filepath.WalkDir(root, func(path string, entry fs.DirEntry, wErr error) error {
+		if ctx != nil && ctx.Err() != nil {
+			return fs.SkipAll
+		}
+		if walked >= maxSessionWalkEntries {
+			return fs.SkipAll
+		}
+		walked++
 		if wErr != nil {
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if entry.IsDir() {
@@ -396,7 +408,7 @@ func collectRecentFiles(root, suffix string, cutoff time.Time, limit int) []stri
 			return nil
 		}
 		fi, statErr := entry.Info()
-		if statErr != nil || fi.ModTime().Before(cutoff) {
+		if statErr != nil || !fi.Mode().IsRegular() || fi.ModTime().Before(cutoff) {
 			return nil
 		}
 		found = append(found, recentFile{path: path, modTime: fi.ModTime()})
@@ -415,19 +427,25 @@ func collectRecentFiles(root, suffix string, cutoff time.Time, limit int) []stri
 	return paths
 }
 
-func collectAntigravityTranscripts(brainDir string, cutoff time.Time, limit int) []string {
+func collectAntigravityTranscripts(ctx context.Context, brainDir string, cutoff time.Time, limit int) []string {
 	entries, err := os.ReadDir(brainDir)
 	if err != nil {
 		return nil
 	}
 	var found []recentFile
-	for _, entry := range entries {
-		if !entry.IsDir() {
+	for i, entry := range entries {
+		if ctx != nil && ctx.Err() != nil {
+			break
+		}
+		if i >= maxSessionWalkEntries {
+			break
+		}
+		if !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
 			continue
 		}
 		p := filepath.Join(brainDir, entry.Name(), ".system_generated", "logs", "transcript.jsonl")
-		fi, statErr := os.Stat(p)
-		if statErr != nil || fi.IsDir() || fi.ModTime().Before(cutoff) {
+		fi, statErr := os.Lstat(p)
+		if statErr != nil || !fi.Mode().IsRegular() || fi.ModTime().Before(cutoff) {
 			continue
 		}
 		found = append(found, recentFile{path: p, modTime: fi.ModTime()})
@@ -446,6 +464,10 @@ func collectAntigravityTranscripts(brainDir string, cutoff time.Time, limit int)
 }
 
 func readBoundedLines(path string, maxBytes int64) []string {
+	fi, lErr := os.Lstat(path)
+	if lErr != nil || !fi.Mode().IsRegular() {
+		return nil
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil

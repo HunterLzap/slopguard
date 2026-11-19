@@ -2,15 +2,14 @@ package ui
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -18,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/HunterLzap/slopguard/internal/engine"
 	"github.com/HunterLzap/slopguard/internal/store"
 	"github.com/HunterLzap/slopguard/skills"
 )
@@ -49,13 +49,15 @@ type skillTargetStatus struct {
 }
 
 type configBackupRecord struct {
-	ID            string `json:"id"`
-	Kind          string `json:"kind"`
-	TargetPath    string `json:"target_path"`
-	Existed       bool   `json:"existed"`
-	OriginalMode  uint32 `json:"original_mode"`
-	OriginalBytes []byte `json:"original_bytes,omitempty"`
-	BackupAt      string `json:"backup_at"`
+	ID              string `json:"id"`
+	Kind            string `json:"kind"`
+	TargetPath      string `json:"target_path"`
+	Existed         bool   `json:"existed"`
+	OriginalMode    uint32 `json:"original_mode"`
+	OriginalSHA256  string `json:"original_sha256,omitempty"`
+	InstalledSHA256 string `json:"installed_sha256,omitempty"`
+	OriginalBytes   []byte `json:"original_bytes,omitempty"`
+	BackupAt        string `json:"backup_at"`
 }
 
 func sanitizeBackupToken(raw string) string {
@@ -82,20 +84,66 @@ func backupRecordPath(backupsDir, kind, id, targetPath string) string {
 	return filepath.Join(backupsDir, name)
 }
 
-func lookupBackup(backupsDir, kind, id, targetPath string) (string, configBackupRecord, bool) {
+func fileSHA256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func currentFileSHA256(path string) (hash string, existed bool, err error) {
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		if os.IsNotExist(readErr) {
+			return "", false, nil
+		}
+		return "", false, readErr
+	}
+	return fileSHA256Hex(data), true, nil
+}
+
+func existingFileModeOrDefault(path string, fallback os.FileMode) os.FileMode {
+	if info, err := os.Stat(path); err == nil && !info.IsDir() {
+		if perm := info.Mode().Perm(); perm != 0 {
+			return perm
+		}
+	}
+	return fallback
+}
+
+func defaultModeForTarget(scope, kind string) os.FileMode {
+	if scope == "global" && kind == "mcp" {
+		return 0o600
+	}
+	return 0o644
+}
+
+func lookupBackupChecked(backupsDir, kind, id, targetPath string) (string, configBackupRecord, bool, error) {
 	if strings.TrimSpace(backupsDir) == "" || strings.TrimSpace(targetPath) == "" {
-		return "", configBackupRecord{}, false
+		return "", configBackupRecord{}, false, nil
 	}
 	path := backupRecordPath(backupsDir, kind, id, targetPath)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", configBackupRecord{}, false
+		if os.IsNotExist(err) {
+			return "", configBackupRecord{}, false, nil
+		}
+		return path, configBackupRecord{}, false, fmt.Errorf("读取备份记录失败 (%s): %w", path, err)
 	}
 	var rec configBackupRecord
 	if err := json.Unmarshal(data, &rec); err != nil {
+		return path, configBackupRecord{}, false, fmt.Errorf("备份记录已损坏 (%s)，已阻止盲目还原或删除: %w", path, err)
+	}
+	if rec.TargetPath != "" && filepath.Clean(rec.TargetPath) != filepath.Clean(targetPath) {
+		return path, configBackupRecord{}, false, fmt.Errorf("备份目标路径校验不一致 (%s != %s)", rec.TargetPath, targetPath)
+	}
+	return path, rec, true, nil
+}
+
+func lookupBackup(backupsDir, kind, id, targetPath string) (string, configBackupRecord, bool) {
+	p, rec, ok, err := lookupBackupChecked(backupsDir, kind, id, targetPath)
+	if err != nil || !ok {
 		return "", configBackupRecord{}, false
 	}
-	return path, rec, true
+	return p, rec, true
 }
 
 // ensureBackup creates a backup of targetPath before SlopGuard modifies it.
@@ -105,7 +153,15 @@ func ensureBackup(backupsDir, kind, id, targetPath string) (string, configBackup
 	if strings.TrimSpace(backupsDir) == "" {
 		return "", configBackupRecord{}, errors.New("无法定位备份目录")
 	}
-	if existingPath, existingRec, ok := lookupBackup(backupsDir, kind, id, targetPath); ok {
+	if err := os.MkdirAll(backupsDir, 0o700); err != nil {
+		return "", configBackupRecord{}, fmt.Errorf("创建备份目录失败: %w", err)
+	}
+	_ = os.Chmod(backupsDir, 0o700)
+
+	if existingPath, existingRec, ok, checkErr := lookupBackupChecked(backupsDir, kind, id, targetPath); checkErr != nil {
+		return "", configBackupRecord{}, checkErr
+	} else if ok {
+		_ = os.Chmod(existingPath, 0o600)
 		return existingPath, existingRec, nil
 	}
 	rec := configBackupRecord{
@@ -123,6 +179,7 @@ func ensureBackup(backupsDir, kind, id, targetPath string) (string, configBackup
 		}
 		rec.Existed = true
 		rec.OriginalMode = uint32(info.Mode().Perm())
+		rec.OriginalSHA256 = fileSHA256Hex(data)
 		rec.OriginalBytes = data
 	case os.IsNotExist(err):
 		rec.Existed = false
@@ -137,17 +194,56 @@ func ensureBackup(backupsDir, kind, id, targetPath string) (string, configBackup
 	}
 	encoded = append(encoded, '\n')
 	backupPath := backupRecordPath(backupsDir, kind, id, targetPath)
-	if err := writeFileAtomic(backupPath, encoded, 0o644); err != nil {
+	if err := writeFileAtomicWithDirMode(backupPath, encoded, 0o600, 0o700); err != nil {
 		return "", configBackupRecord{}, fmt.Errorf("保存备份文件失败: %w", err)
 	}
 	return backupPath, rec, nil
 }
 
+func recordBackupInstalledHash(backupsDir, kind, id, targetPath string, installedBytes []byte) error {
+	backupPath, rec, ok, err := lookupBackupChecked(backupsDir, kind, id, targetPath)
+	if err != nil || !ok {
+		return err
+	}
+	rec.InstalledSHA256 = fileSHA256Hex(installedBytes)
+	encoded, mErr := json.MarshalIndent(rec, "", "  ")
+	if mErr != nil {
+		return mErr
+	}
+	encoded = append(encoded, '\n')
+	return writeFileAtomicWithDirMode(backupPath, encoded, 0o600, 0o700)
+}
+
+func targetExternallyModifiedSinceInstall(rec configBackupRecord, targetPath string) (modified bool, currentExisted bool, err error) {
+	if strings.TrimSpace(rec.InstalledSHA256) == "" {
+		return false, true, nil
+	}
+	currHash, existed, err := currentFileSHA256(targetPath)
+	if err != nil {
+		return false, false, err
+	}
+	if !existed {
+		return true, false, nil
+	}
+	return currHash != rec.InstalledSHA256, true, nil
+}
+
 func restoreFromBackup(backupsDir, kind, id, targetPath string) (restoredFromBackup bool, removedFile bool, err error) {
-	backupPath, rec, ok := lookupBackup(backupsDir, kind, id, targetPath)
+	backupPath, rec, ok, checkErr := lookupBackupChecked(backupsDir, kind, id, targetPath)
+	if checkErr != nil {
+		return false, false, checkErr
+	}
 	if !ok {
 		return false, false, nil
 	}
+	extMod, existed, modErr := targetExternallyModifiedSinceInstall(rec, targetPath)
+	if modErr != nil {
+		return false, false, modErr
+	}
+	if extMod && existed {
+		return false, false, fmt.Errorf("目标文件 %s 在接入 SlopGuard 后已被外部修改，已阻止快照覆盖（请使用安全卸载或先预览确认）", targetPath)
+	}
+
 	if rec.Existed {
 		mode := os.FileMode(rec.OriginalMode)
 		if mode == 0 {
@@ -156,7 +252,7 @@ func restoreFromBackup(backupsDir, kind, id, targetPath string) (restoredFromBac
 		if err := writeFileAtomic(targetPath, rec.OriginalBytes, mode); err != nil {
 			return false, false, fmt.Errorf("还原原文件失败: %w", err)
 		}
-	} else {
+	} else if !extMod {
 		if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
 			return false, false, fmt.Errorf("删除新建配置文件失败: %w", err)
 		}
@@ -167,6 +263,81 @@ func restoreFromBackup(backupsDir, kind, id, targetPath string) (restoredFromBac
 		return true, removedFile, fmt.Errorf("清理备份元数据失败: %w", err)
 	}
 	return true, removedFile, nil
+}
+
+// uninstallManagedTarget safely removes SlopGuard's own entries when disabling.
+// If the target file has not been modified externally since install, it restores the exact
+// original snapshot (or removes the newly created file). If external additions exist, it
+// performs a targeted removal of SlopGuard entries only so user edits are never lost.
+func uninstallManagedTarget(backupsDir, kind, id, targetPath, scope string) (restoredFromBackup bool, removedFile bool, err error) {
+	backupPath, rec, hasBackup, checkErr := lookupBackupChecked(backupsDir, kind, id, targetPath)
+	if checkErr != nil {
+		return false, false, checkErr
+	}
+	if hasBackup {
+		extMod, existed, modErr := targetExternallyModifiedSinceInstall(rec, targetPath)
+		if modErr != nil {
+			return false, false, modErr
+		}
+		if !extMod {
+			return restoreFromBackup(backupsDir, kind, id, targetPath)
+		}
+		// File was modified after SlopGuard install: never blindly overwrite or delete it.
+		if !existed {
+			_ = os.Remove(backupPath)
+			return false, false, nil
+		}
+		if kind == "skill" {
+			return false, false, fmt.Errorf("护栏规则文件 %s 在接入后被手动修改过，已保留你的自定义内容（如需移除请手动删除或确认预览）", targetPath)
+		}
+		// Targeted MCP field removal preserves all user additions made after SlopGuard install.
+		_, newText, shouldRemove, remErr := renderMCPRemove(targetPath)
+		if remErr != nil {
+			return false, false, remErr
+		}
+		if shouldRemove {
+			if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
+				return false, false, err
+			}
+			removedFile = true
+		} else {
+			mode := existingFileModeOrDefault(targetPath, defaultModeForTarget(scope, kind))
+			if err := writeFileAtomic(targetPath, []byte(newText), mode); err != nil {
+				return false, false, err
+			}
+		}
+		_ = os.Remove(backupPath)
+		return false, removedFile, nil
+	}
+
+	// No backup exists: only remove SlopGuard's own fields (never delete unknown content).
+	if kind == "skill" {
+		if isSkillConfigured(targetPath) {
+			if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
+				return false, false, err
+			}
+			cleanupEmptySkillLeafDir("skill", targetPath)
+			return false, true, nil
+		}
+		return false, false, nil
+	}
+	_, newText, shouldRemove, remErr := renderMCPRemove(targetPath)
+	if remErr != nil {
+		return false, false, remErr
+	}
+	if shouldRemove {
+		if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
+			return false, false, err
+		}
+		return false, true, nil
+	}
+	if newText != "" {
+		mode := existingFileModeOrDefault(targetPath, defaultModeForTarget(scope, kind))
+		if err := writeFileAtomic(targetPath, []byte(newText), mode); err != nil {
+			return false, false, err
+		}
+	}
+	return false, false, nil
 }
 
 func cleanupEmptySkillLeafDir(kind, targetPath string) {
@@ -180,8 +351,12 @@ func cleanupEmptySkillLeafDir(kind, targetPath string) {
 }
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	return writeFileAtomicWithDirMode(path, data, mode, 0o755)
+}
+
+func writeFileAtomicWithDirMode(path string, data []byte, mode, dirMode os.FileMode) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return err
 	}
 	tmp, err := os.CreateTemp(dir, ".slopguard-tmp-*")
@@ -359,6 +534,151 @@ func isSlopGuardConfigured(path string) bool {
 	return configured
 }
 
+func parseTOMLHeaderName(line string) (string, bool) {
+	clean := stripTOMLInlineComment(line)
+	if !strings.HasPrefix(clean, "[") || !strings.HasSuffix(clean, "]") {
+		return "", false
+	}
+	if strings.HasPrefix(clean, "[[") && strings.HasSuffix(clean, "]]") {
+		return strings.TrimSpace(clean[2 : len(clean)-2]), true
+	}
+	return strings.TrimSpace(clean[1 : len(clean)-1]), true
+}
+
+func stripTOMLInlineComment(line string) string {
+	inBasic, inLiteral := false, false
+	escaped := false
+	for i := 0; i < len(line); i++ {
+		ch := line[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if inBasic {
+			if ch == '\\' {
+				escaped = true
+			} else if ch == '"' {
+				inBasic = false
+			}
+			continue
+		}
+		if inLiteral {
+			if ch == '\'' {
+				inLiteral = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inBasic = true
+		case '\'':
+			inLiteral = true
+		case '#':
+			return strings.TrimSpace(line[:i])
+		}
+	}
+	return strings.TrimSpace(line)
+}
+
+func isSlopGuardTOMLSection(sec string) bool {
+	return sec == "mcp_servers.slopguard" || strings.HasPrefix(sec, "mcp_servers.slopguard.")
+}
+
+// validateTOMLBasic performs structural pure-Go TOML validation (multiline string closure,
+// bracket matching, and header syntax) before writing ~/.codex/config.toml.
+func validateTOMLBasic(text string) error {
+	normalized := strings.ReplaceAll(text, "\r\n", "\n")
+	lines := strings.Split(normalized, "\n")
+	var multiDelim string
+	arrayDepth := 0
+	for lineNo, raw := range lines {
+		line := raw
+		if multiDelim != "" {
+			if strings.Contains(line, multiDelim) {
+				multiDelim = ""
+			}
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.Contains(line, `"""`) && strings.Count(line, `"""`)%2 == 1 {
+			multiDelim = `"""`
+			continue
+		}
+		if strings.Contains(line, `'''`) && strings.Count(line, `'''`)%2 == 1 {
+			multiDelim = `'''`
+			continue
+		}
+		clean := stripTOMLInlineComment(line)
+		if clean == "" {
+			continue
+		}
+		if arrayDepth == 0 && strings.HasPrefix(clean, "[") {
+			if !strings.HasSuffix(clean, "]") {
+				return fmt.Errorf("TOML 第 %d 行表头括号未闭合: %s", lineNo+1, clean)
+			}
+			inner := strings.TrimSpace(clean[1 : len(clean)-1])
+			if strings.HasPrefix(clean, "[[") && strings.HasSuffix(clean, "]]") {
+				inner = strings.TrimSpace(clean[2 : len(clean)-2])
+			}
+			if inner == "" {
+				return fmt.Errorf("TOML 第 %d 行存在空表头", lineNo+1)
+			}
+			continue
+		}
+		if arrayDepth == 0 && !strings.Contains(clean, "=") {
+			return fmt.Errorf("TOML 第 %d 行缺少 '=' 赋值: %s", lineNo+1, clean)
+		}
+		inBasic, inLiteral, escaped := false, false, false
+		for i := 0; i < len(clean); i++ {
+			ch := clean[i]
+			if escaped {
+				escaped = false
+				continue
+			}
+			if inBasic {
+				if ch == '\\' {
+					escaped = true
+				} else if ch == '"' {
+					inBasic = false
+				}
+				continue
+			}
+			if inLiteral {
+				if ch == '\'' {
+					inLiteral = false
+				}
+				continue
+			}
+			switch ch {
+			case '"':
+				inBasic = true
+			case '\'':
+				inLiteral = true
+			case '[', '{':
+				arrayDepth++
+			case ']', '}':
+				arrayDepth--
+				if arrayDepth < 0 {
+					return fmt.Errorf("TOML 第 %d 行存在多余闭合括号", lineNo+1)
+				}
+			}
+		}
+		if inBasic || inLiteral {
+			return fmt.Errorf("TOML 第 %d 行字符串引号未闭合", lineNo+1)
+		}
+	}
+	if multiDelim != "" {
+		return errors.New("TOML 多行字符串未闭合")
+	}
+	if arrayDepth != 0 {
+		return errors.New("TOML 多行数组或内联表括号未闭合")
+	}
+	return nil
+}
+
 func formatCodexSlopGuardSection(binaryPath string, args []string) string {
 	argsJSON, _ := json.Marshal(args)
 	return fmt.Sprintf("[mcp_servers.slopguard]\ncommand = %s\nargs = %s\n", strconv.Quote(binaryPath), string(argsJSON))
@@ -370,12 +690,26 @@ func replaceOrRemoveCodexSection(oldText, replacement string, remove bool) strin
 	var out []string
 	inSection := false
 	replaced := false
+	multiDelim := ""
 
 	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
-			sec := strings.TrimSpace(trimmed[1 : len(trimmed)-1])
-			if sec == "mcp_servers.slopguard" {
+		if multiDelim != "" {
+			if strings.Contains(line, multiDelim) {
+				multiDelim = ""
+			}
+			if !inSection {
+				out = append(out, line)
+			}
+			continue
+		}
+		if strings.Contains(line, `"""`) && strings.Count(line, `"""`)%2 == 1 {
+			multiDelim = `"""`
+		} else if strings.Contains(line, `'''`) && strings.Count(line, `'''`)%2 == 1 {
+			multiDelim = `'''`
+		}
+
+		if sec, isHeader := parseTOMLHeaderName(line); isHeader {
+			if isSlopGuardTOMLSection(sec) {
 				inSection = true
 				if !remove && !replaced {
 					out = append(out, strings.TrimRight(replacement, "\n"))
@@ -409,11 +743,18 @@ func renderMCPUpsert(path, binaryPath string, args []string) (oldText, newText s
 		if data, readErr := os.ReadFile(path); readErr == nil {
 			existed = true
 			oldText = string(data)
+			if err := validateTOMLBasic(oldText); err != nil {
+				return "", "", true, fmt.Errorf("现有 Codex 配置 %s 语法校验失败: %w", path, err)
+			}
 		} else if !os.IsNotExist(readErr) {
 			return "", "", false, readErr
 		}
 		section := formatCodexSlopGuardSection(binaryPath, args)
-		return oldText, replaceOrRemoveCodexSection(oldText, section, false), existed, nil
+		newText = replaceOrRemoveCodexSection(oldText, section, false)
+		if err := validateTOMLBasic(newText); err != nil {
+			return "", "", existed, fmt.Errorf("生成 Codex 配置校验失败: %w", err)
+		}
+		return oldText, newText, existed, nil
 	}
 
 	root := map[string]any{}
@@ -429,9 +770,14 @@ func renderMCPUpsert(path, binaryPath string, args []string) (oldText, newText s
 		return "", "", false, readErr
 	}
 
-	servers, ok := root["mcpServers"].(map[string]any)
-	if !ok || servers == nil {
+	rawServers, hasKey := root["mcpServers"]
+	var servers map[string]any
+	if !hasKey || rawServers == nil {
 		servers = map[string]any{}
+	} else if m, ok := rawServers.(map[string]any); ok {
+		servers = m
+	} else {
+		return "", "", existed, fmt.Errorf("配置文件 %s 的 mcpServers 字段不是 JSON 对象（已拒绝覆盖）", path)
 	}
 	servers["slopguard"] = map[string]any{
 		"command": binaryPath,
@@ -457,6 +803,9 @@ func renderMCPRemove(path string) (oldText, newText string, removeFile bool, err
 	}
 	oldText = string(data)
 	if isTOMLPath(path) {
+		if err := validateTOMLBasic(oldText); err != nil {
+			return "", "", false, fmt.Errorf("现有 Codex 配置 %s 语法校验失败: %w", path, err)
+		}
 		newText = replaceOrRemoveCodexSection(oldText, "", true)
 		return oldText, newText, strings.TrimSpace(newText) == "", nil
 	}
@@ -467,9 +816,13 @@ func renderMCPRemove(path string) (oldText, newText string, removeFile bool, err
 	if err := json.Unmarshal(data, &root); err != nil {
 		return "", "", false, fmt.Errorf("现有配置文件 %s 不是合法 JSON: %w", path, err)
 	}
-	servers, ok := root["mcpServers"].(map[string]any)
-	if !ok {
+	rawServers, hasKey := root["mcpServers"]
+	if !hasKey || rawServers == nil {
 		return oldText, oldText, false, nil
+	}
+	servers, ok := rawServers.(map[string]any)
+	if !ok {
+		return "", "", false, fmt.Errorf("配置文件 %s 的 mcpServers 字段不是 JSON 对象（已拒绝修改）", path)
 	}
 	if _, exists := servers["slopguard"]; !exists {
 		return oldText, oldText, false, nil
@@ -689,15 +1042,17 @@ func isSlopGuardInAgyMCPList(home string) bool {
 	if agyBin == "" {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, agyBin, "mcp", "list")
-	cmd.Env = augmentedCLIEnv(home)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
+	res := engine.RunProcess(context.Background(), engine.ProcessSpec{
+		Command:        agyBin,
+		Args:           []string{"mcp", "list"},
+		Env:            augmentedCLIEnv(home),
+		Timeout:        4 * time.Second,
+		MaxOutputBytes: 128 * 1024,
+	})
+	if res.Err != nil || res.ExitCode != 0 {
 		return false
 	}
-	for _, line := range strings.Split(string(out), "\n") {
+	for _, line := range strings.Split(res.Stdout, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) >= 3 && fields[0] == "slopguard" && strings.EqualFold(fields[2], "enabled") {
 			return true
@@ -706,23 +1061,43 @@ func isSlopGuardInAgyMCPList(home string) bool {
 	return false
 }
 
-func syncAgyMCPRegistry(home, exe string, enable bool) {
+func syncAgyMCPRegistry(home, exe string, enable bool) error {
 	agyBin := lookupAgentCLIBinary(home, "agy")
 	if agyBin == "" {
-		return
+		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	// Remove first so re-adding updates path cleanly when SlopGuard.app moves.
-	rmCmd := exec.CommandContext(ctx, agyBin, "mcp", "remove", "slopguard")
-	rmCmd.Env = augmentedCLIEnv(home)
-	_ = rmCmd.Run()
+	rmRes := engine.RunProcess(context.Background(), engine.ProcessSpec{
+		Command:        agyBin,
+		Args:           []string{"mcp", "remove", "slopguard"},
+		Env:            augmentedCLIEnv(home),
+		Timeout:        5 * time.Second,
+		MaxOutputBytes: 64 * 1024,
+	})
 	if !enable || strings.TrimSpace(exe) == "" {
-		return
+		if rmRes.Err != nil {
+			return fmt.Errorf("agy mcp remove failed: %w", rmRes.Err)
+		}
+		return nil
 	}
-	addCmd := exec.CommandContext(ctx, agyBin, "mcp", "add", "slopguard", exe, "mcp")
-	addCmd.Env = augmentedCLIEnv(home)
-	_ = addCmd.Run()
+	addRes := engine.RunProcess(context.Background(), engine.ProcessSpec{
+		Command:        agyBin,
+		Args:           []string{"mcp", "add", "slopguard", exe, "mcp"},
+		Env:            augmentedCLIEnv(home),
+		Timeout:        5 * time.Second,
+		MaxOutputBytes: 64 * 1024,
+	})
+	if addRes.Err != nil || addRes.ExitCode != 0 {
+		msg := strings.TrimSpace(addRes.Stderr)
+		if msg == "" {
+			msg = strings.TrimSpace(addRes.Stdout)
+		}
+		if msg == "" && addRes.Err != nil {
+			msg = addRes.Err.Error()
+		}
+		return fmt.Errorf("agy mcp add 失败: %s", msg)
+	}
+	return nil
 }
 
 func discoverAgentProfiles(home, project string) []agentProfile {
@@ -756,8 +1131,12 @@ func discoverAgentProfiles(home, project string) []agentProfile {
 				total++
 				if m.Configured {
 					configured++
-					cmd, _, _ := readConfiguredMCPCommand(m.ConfigPath)
-					prof.BinaryOK = isExecutableFile(cmd)
+					cmd, args, _ := readConfiguredMCPCommand(m.ConfigPath)
+					expectedProj := ""
+					if scope == "project" {
+						expectedProj = project
+					}
+					prof.BinaryOK = validateTrustedSlopGuardCommand(cmd, args, expectedProj) == nil
 				}
 				prof.Detected = prof.Detected || m.Detected
 				prof.HasBackup = prof.HasBackup || m.HasBackup
@@ -814,96 +1193,200 @@ func discoverAgentProfiles(home, project string) []agentProfile {
 }
 
 type AgentVerifyReport struct {
-	AgentID       string   `json:"agent_id"`
-	Name          string   `json:"name"`
-	Installed     bool     `json:"installed"`
-	Configured    bool     `json:"configured"`
-	BinaryPath    string   `json:"binary_path,omitempty"`
-	BinaryOK      bool     `json:"binary_ok"`
-	SkillOK       bool     `json:"skill_ok"`
-	HandshakeOK   bool     `json:"handshake_ok"`
-	LatencyMS     int64    `json:"latency_ms,omitempty"`
-	Tools         []string `json:"tools,omitempty"`
-	CLIRegistered *bool    `json:"cli_registered,omitempty"`
-	EventCount    int      `json:"event_count"`
-	LastEventAt   string   `json:"last_event_at,omitempty"`
-	HealthStatus  string   `json:"health_status"`
-	Diagnosis     string   `json:"diagnosis"`
+	AgentID           string   `json:"agent_id"`
+	Name              string   `json:"name"`
+	Scope             string   `json:"scope"`
+	Installed         bool     `json:"installed"`
+	Configured        bool     `json:"configured"`
+	ProjectConfigured bool     `json:"project_configured"`
+	GlobalConfigured  bool     `json:"global_configured"`
+	ConfigMatched     bool     `json:"config_matched"`
+	BinaryPath        string   `json:"binary_path,omitempty"`
+	BinaryOK          bool     `json:"binary_ok"`
+	SkillOK           bool     `json:"skill_ok"`
+	HandshakeOK       bool     `json:"handshake_ok"`
+	LatencyMS         int64    `json:"latency_ms,omitempty"`
+	Tools             []string `json:"tools,omitempty"`
+	CLIRegistered     *bool    `json:"cli_registered,omitempty"`
+	EventCount        int      `json:"event_count"`
+	LastEventAt       string   `json:"last_event_at,omitempty"`
+	HealthStatus      string   `json:"health_status"`
+	ActivationStatus  string   `json:"activation_status"`
+	Diagnosis         string   `json:"diagnosis"`
+}
+
+// validateTrustedSlopGuardCommand ensures self-check never launches an arbitrary
+// command read from project/global JSON or TOML files.
+func validateTrustedSlopGuardCommand(cmd string, args []string, expectedProject string) error {
+	cmd = strings.TrimSpace(cmd)
+	if !isExecutableFile(cmd) {
+		return fmt.Errorf("配置里的命令不可用 (%s)", cmd)
+	}
+	selfExe, err := resolveSelfBinary()
+	if err != nil {
+		return err
+	}
+	selfInfo, selfErr := os.Stat(selfExe)
+	cmdReal := cmd
+	if resolved, rErr := filepath.EvalSymlinks(cmd); rErr == nil && resolved != "" {
+		cmdReal = resolved
+	}
+	cmdInfo, cmdErr := os.Stat(cmdReal)
+	sameBinary := (selfErr == nil && cmdErr == nil && os.SameFile(selfInfo, cmdInfo)) || filepath.Clean(cmdReal) == filepath.Clean(selfExe)
+	if !sameBinary {
+		return fmt.Errorf("MCP 命令与当前可信 SlopGuard 二进制不一致 (%s != %s)，已拒绝执行（请重新开关修复路径）", cmdReal, selfExe)
+	}
+
+	if len(args) == 1 && args[0] == "mcp" {
+		return nil
+	}
+	if len(args) == 3 && args[0] == "mcp" && args[1] == "--root" && strings.TrimSpace(args[2]) != "" {
+		if expectedProject != "" {
+			wantRoot, _ := filepath.Abs(strings.TrimSpace(expectedProject))
+			gotRoot, _ := filepath.Abs(strings.TrimSpace(args[2]))
+			if wantReal, err := filepath.EvalSymlinks(wantRoot); err == nil && wantReal != "" {
+				wantRoot = wantReal
+			}
+			if gotReal, err := filepath.EvalSymlinks(gotRoot); err == nil && gotReal != "" {
+				gotRoot = gotReal
+			}
+			if wantRoot != gotRoot {
+				return fmt.Errorf("项目 MCP --root (%s) 与当前项目 (%s) 不匹配", gotRoot, wantRoot)
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("MCP 参数不合法 %v，仅允许 [\"mcp\"] 或 [\"mcp\", \"--root\", \"<project>\"]", args)
 }
 
 func runStdioMCPHandshake(ctx context.Context, binaryPath string, args []string) (tools []string, latencyMS int64, err error) {
-	if !isExecutableFile(binaryPath) {
-		return nil, 0, errors.New("MCP 可执行文件不存在或不可执行")
+	if err := validateTrustedSlopGuardCommand(binaryPath, args, ""); err != nil {
+		return nil, 0, err
 	}
-	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(callCtx, binaryPath, args...)
-	var stdinBuf bytes.Buffer
-	stdinBuf.WriteString(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"slopguard-selfcheck","version":"1.0"}}}` + "\n")
-	stdinBuf.WriteString(`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}` + "\n")
-	cmd.Stdin = &stdinBuf
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
 	started := time.Now()
-	if runErr := cmd.Run(); runErr != nil {
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = runErr.Error()
-		}
-		return nil, time.Since(started).Milliseconds(), fmt.Errorf("MCP 进程启动失败: %s", msg)
-	}
-	latencyMS = time.Since(started).Milliseconds()
+	var parsedTools []string
+	var handshakeErr error
 
-	scanner := bufio.NewScanner(&stdout)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var resp struct {
-			ID     int             `json:"id"`
-			Result json.RawMessage `json:"result"`
-			Error  *struct {
-				Message string `json:"message"`
-			} `json:"error"`
-		}
-		if json.Unmarshal([]byte(line), &resp) != nil {
-			continue
-		}
-		if resp.Error != nil && resp.Error.Message != "" {
-			return nil, latencyMS, errors.New(resp.Error.Message)
-		}
-		if resp.ID == 2 && len(resp.Result) > 0 {
-			var listRes struct {
-				Tools []struct {
-					Name string `json:"name"`
-				} `json:"tools"`
-			}
-			if json.Unmarshal(resp.Result, &listRes) == nil {
-				for _, t := range listRes.Tools {
-					if t.Name != "" {
-						tools = append(tools, t.Name)
-					}
+	res := engine.RunStdioSession(ctx, engine.ProcessSpec{
+		Command:        binaryPath,
+		Args:           args,
+		Env:            augmentedCLIEnv(""),
+		Timeout:        5 * time.Second,
+		MaxOutputBytes: 64 * 1024,
+	}, func(stdin io.WriteCloser, stdout io.Reader) error {
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 16*1024), 512*1024)
+
+		readResponse := func(wantID int) (json.RawMessage, error) {
+			for scanner.Scan() {
+				line := strings.TrimSpace(scanner.Text())
+				if line == "" {
+					continue
+				}
+				var resp struct {
+					ID     *int            `json:"id"`
+					Result json.RawMessage `json:"result"`
+					Error  *struct {
+						Message string `json:"message"`
+					} `json:"error"`
+				}
+				if json.Unmarshal([]byte(line), &resp) != nil {
+					continue
+				}
+				if resp.Error != nil && resp.Error.Message != "" {
+					return nil, errors.New(resp.Error.Message)
+				}
+				if resp.ID != nil && *resp.ID == wantID {
+					return resp.Result, nil
 				}
 			}
+			if scanErr := scanner.Err(); scanErr != nil {
+				return nil, fmt.Errorf("读取 MCP 响应失败: %w", scanErr)
+			}
+			return nil, fmt.Errorf("MCP 进程在响应 id=%d 前提前关闭", wantID)
 		}
+
+		initReq := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"slopguard-selfcheck","version":"1.0"}}}` + "\n"
+		if _, wErr := io.WriteString(stdin, initReq); wErr != nil {
+			return fmt.Errorf("发送 MCP initialize 失败: %w", wErr)
+		}
+		initResult, rErr := readResponse(1)
+		if rErr != nil {
+			return rErr
+		}
+		var initPayload struct {
+			ServerInfo struct {
+				Name string `json:"name"`
+			} `json:"serverInfo"`
+		}
+		if json.Unmarshal(initResult, &initPayload) != nil || strings.TrimSpace(initPayload.ServerInfo.Name) != "slopguard" {
+			return fmt.Errorf("MCP initialize serverInfo 异常: %q", initPayload.ServerInfo.Name)
+		}
+
+		notif := `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}` + "\n"
+		if _, wErr := io.WriteString(stdin, notif); wErr != nil {
+			return fmt.Errorf("发送 notifications/initialized 失败: %w", wErr)
+		}
+		listReq := `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}` + "\n"
+		if _, wErr := io.WriteString(stdin, listReq); wErr != nil {
+			return fmt.Errorf("发送 tools/list 失败: %w", wErr)
+		}
+		_ = stdin.Close()
+
+		listResult, rErr := readResponse(2)
+		if rErr != nil {
+			return rErr
+		}
+		var listRes struct {
+			Tools []struct {
+				Name string `json:"name"`
+			} `json:"tools"`
+		}
+		if err := json.Unmarshal(listResult, &listRes); err != nil {
+			return fmt.Errorf("解析 MCP tools/list 失败: %w", err)
+		}
+		toolSet := make(map[string]bool, len(listRes.Tools))
+		for _, t := range listRes.Tools {
+			if t.Name != "" {
+				parsedTools = append(parsedTools, t.Name)
+				toolSet[t.Name] = true
+			}
+		}
+		for _, required := range []string{"sg_verify", "sg_radar", "sg_list_inbox", "sg_submit_analysis"} {
+			if !toolSet[required] {
+				return fmt.Errorf("MCP 缺少核心工具 %s", required)
+			}
+		}
+		return nil
+	})
+	latencyMS = time.Since(started).Milliseconds()
+	if res.Err != nil {
+		msg := strings.TrimSpace(res.Stderr)
+		if msg == "" {
+			msg = res.Err.Error()
+		}
+		handshakeErr = fmt.Errorf("MCP 握手失败: %s", msg)
+		return nil, latencyMS, handshakeErr
 	}
-	if len(tools) == 0 {
+	if len(parsedTools) == 0 {
 		return nil, latencyMS, errors.New("MCP 握手未返回任何工具列表")
 	}
-	return tools, latencyMS, nil
+	return parsedTools, latencyMS, nil
 }
 
 func verifyAgentProfile(ctx context.Context, home, project string, prof agentProfile, db *store.Store, checkRealCLI bool) AgentVerifyReport {
 	rep := AgentVerifyReport{
 		AgentID:   prof.ID,
 		Name:      prof.Name,
+		Scope:     prof.Scope,
 		Installed: prof.Detected,
 		SkillOK:   prof.SkillTarget == nil || prof.SkillTarget.Configured,
+	}
+
+	if prof.Scope == "project" {
+		rep.ProjectConfigured = prof.Enabled
+	} else {
+		rep.GlobalConfigured = prof.Enabled
 	}
 
 	if db != nil {
@@ -919,16 +1402,20 @@ func verifyAgentProfile(ctx context.Context, home, project string, prof agentPro
 
 	if prof.NeedsProject {
 		rep.HealthStatus = "not_configured"
+		rep.ActivationStatus = "not_configured"
 		rep.Diagnosis = "请先在顶部下拉框选择或添加项目"
 		return rep
 	}
 	if prof.MCPTarget == nil {
 		if rep.SkillOK {
 			rep.Configured = true
+			rep.ConfigMatched = true
 			rep.HealthStatus = "active"
+			rep.ActivationStatus = "active"
 			rep.Diagnosis = "规则文件已部署就绪"
 		} else {
 			rep.HealthStatus = "not_configured"
+			rep.ActivationStatus = "not_configured"
 			rep.Diagnosis = "尚未部署规则文件"
 		}
 		return rep
@@ -937,20 +1424,30 @@ func verifyAgentProfile(ctx context.Context, home, project string, prof agentPro
 	cmd, args, configured := readConfiguredMCPCommand(prof.MCPTarget.ConfigPath)
 	rep.Configured = configured
 	rep.BinaryPath = cmd
-	rep.BinaryOK = configured && isExecutableFile(cmd)
 
 	if !configured {
 		rep.HealthStatus = "not_configured"
+		rep.ActivationStatus = "not_configured"
 		rep.Diagnosis = "尚未开启接入"
 		return rep
 	}
-	if !rep.BinaryOK {
+
+	expectedProj := ""
+	if prof.Scope == "project" {
+		expectedProj = project
+	}
+	matchErr := validateTrustedSlopGuardCommand(cmd, args, expectedProj)
+	rep.ConfigMatched = matchErr == nil
+	rep.BinaryOK = isExecutableFile(cmd) && matchErr == nil
+	if matchErr != nil {
 		rep.HealthStatus = "broken"
-		rep.Diagnosis = fmt.Sprintf("配置里的命令不可用 (%s)，请关闭后重新开启接入修复路径", cmd)
+		rep.ActivationStatus = "broken"
+		rep.Diagnosis = matchErr.Error()
 		return rep
 	}
 	if !rep.SkillOK {
 		rep.HealthStatus = "broken"
+		rep.ActivationStatus = "broken"
 		rep.Diagnosis = "MCP 已写但缺少 SKILL 规则文件，建议重新开关补全"
 		return rep
 	}
@@ -961,6 +1458,7 @@ func verifyAgentProfile(ctx context.Context, home, project string, prof agentPro
 	rep.HandshakeOK = hsErr == nil
 	if hsErr != nil {
 		rep.HealthStatus = "broken"
+		rep.ActivationStatus = "broken"
 		rep.Diagnosis = hsErr.Error()
 		return rep
 	}
@@ -975,14 +1473,17 @@ func verifyAgentProfile(ctx context.Context, home, project string, prof agentPro
 	if rep.EventCount > 0 || cliRegistered {
 		rep.HealthStatus = "active"
 		if rep.EventCount > 0 {
+			rep.ActivationStatus = "active"
 			rep.Diagnosis = fmt.Sprintf("MCP 握手通过 (%dms, %d个工具) · 已记录 %d 次真实调用", latencyMS, len(tools), rep.EventCount)
 		} else {
+			rep.ActivationStatus = "registered_idle"
 			rep.Diagnosis = fmt.Sprintf("MCP 握手通过 (%dms, %d个工具) · 客户端 CLI 已注册", latencyMS, len(tools))
 		}
 		return rep
 	}
 
 	rep.HealthStatus = "pending_activation"
+	rep.ActivationStatus = "pending_activation"
 	rep.Diagnosis = fmt.Sprintf("MCP 握手通过 (%dms, %d个工具) · 请重启「%s」并运行一次任务完成激活", latencyMS, len(tools), prof.Name)
 	return rep
 }

@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -356,5 +358,80 @@ func TestMCPEventsAndInboxWorkflow(t *testing.T) {
 	approved, err := s.QueryMistakes(ctx, MistakeQuery{ReviewStatus: "approved"})
 	if err != nil || len(approved) != 1 || approved[0].Status != "promoted" {
 		t.Fatalf("approved = %+v, err=%v", approved, err)
+	}
+}
+
+func TestApproveMistakeAndCreateRuleAtomicityAndStateGuard(t *testing.T) {
+	s := openMemoryStore(t)
+	ctx := context.Background()
+	proj := filepath.Join(t.TempDir(), "repo-atomic")
+
+	if _, err := s.RecordMistake(ctx, contract.Mistake{
+		ProjectPath: proj,
+		Fingerprint: "fp-atomic-fail",
+		Category:    "type",
+		Summary:     "atomic rollback test",
+		Source:      "auto_verify",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordMistake(ctx, contract.Mistake{
+		ProjectPath: proj,
+		Fingerprint: "fp-atomic-ok",
+		Category:    "lint",
+		Summary:     "idempotent rule test",
+		Source:      "auto_verify",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Failure during rule creation must roll back mistake promotion atomically.
+	_, err := s.ApproveMistakeAndCreateRule(ctx, "fp-atomic-fail", func(_ MistakeRecord) (Rule, error) {
+		return Rule{}, errors.New("simulated rule generation failure")
+	})
+	if err == nil {
+		t.Fatalf("expected error from failing rule builder")
+	}
+	stillPending, _ := s.QueryMistakes(ctx, MistakeQuery{ProjectPath: proj, Status: "pending"})
+	foundPending := false
+	for _, m := range stillPending {
+		if m.Fingerprint == "fp-atomic-fail" && m.ReviewStatus == "pending_ai" {
+			foundPending = true
+		}
+	}
+	if !foundPending {
+		t.Fatalf("expected fp-atomic-fail to roll back to pending/pending_ai, got %+v", stillPending)
+	}
+
+	// 2. Repeated approval inserts rule only once due to DB unique constraint.
+	ruleBuilder := func(m MistakeRecord) (Rule, error) {
+		return Rule{
+			Scope:       "project",
+			ProjectPath: m.ProjectPath,
+			Engine:      "ruff",
+			RuleID:      "F401",
+			Payload:     "extend-select = [\"F401\"]",
+			Rationale:   "unused import",
+			Source:      "manual",
+			Status:      "active",
+		}, nil
+	}
+	created1, err := s.ApproveMistakeAndCreateRule(ctx, "fp-atomic-ok", ruleBuilder)
+	if err != nil || !created1 {
+		t.Fatalf("first ApproveMistakeAndCreateRule = created=%v err=%v", created1, err)
+	}
+	created2, err := s.ApproveMistakeAndCreateRule(ctx, "fp-atomic-ok", ruleBuilder)
+	if err != nil || created2 {
+		t.Fatalf("second ApproveMistakeAndCreateRule = created=%v err=%v, want created=false nil", created2, err)
+	}
+	rules, _ := s.ListRuleLedger(ctx, RuleLedgerQuery{ProjectPath: proj})
+	if len(rules) != 1 {
+		t.Fatalf("expected 1 deduplicated rule, got %d", len(rules))
+	}
+
+	// 3. Approved mistake cannot be overwritten back to pending_user via SubmitMistakeAnalysis.
+	err = s.SubmitMistakeAnalysis(ctx, "fp-atomic-ok", "skip", "late stale response", "")
+	if !errors.Is(err, ErrMistakeStateConflict) {
+		t.Fatalf("expected ErrMistakeStateConflict on approved mistake, got %v", err)
 	}
 }

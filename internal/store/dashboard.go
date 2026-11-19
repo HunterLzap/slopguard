@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -628,14 +630,39 @@ func (s *Store) ListInboxMistakes(ctx context.Context, projectPath, reviewStatus
 	return inbox, nil
 }
 
+func canonicalProjectPath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	if resolved, err := filepath.EvalSymlinks(p); err == nil && resolved != "" {
+		p = resolved
+	}
+	return filepath.Clean(p)
+}
+
+func sameProjectScope(a, b string) bool {
+	ca, cb := canonicalProjectPath(a), canonicalProjectPath(b)
+	return ca != "" && ca == cb
+}
+
 // SubmitMistakeAnalysis 保存宿主 Agent 对错题的中文分析与入库建议，并将 review_status 置为 pending_user。
 func (s *Store) SubmitMistakeAnalysis(ctx context.Context, fingerprint, decision, reason, ruleDraft string) error {
+	return s.SubmitMistakeAnalysisScoped(ctx, "", fingerprint, decision, reason, ruleDraft)
+}
+
+// SubmitMistakeAnalysisScoped 在严格校验项目作用域（当 projectScope 非空）及当前 review_status 后更新 AI 分析建议。
+func (s *Store) SubmitMistakeAnalysisScoped(ctx context.Context, projectScope, fingerprint, decision, reason, ruleDraft string) error {
 	if s == nil || s.db == nil {
 		return errors.New("store: not opened")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	projectScope = strings.TrimSpace(projectScope)
 	fingerprint = strings.TrimSpace(fingerprint)
 	if fingerprint == "" {
 		return errors.New("store: fingerprint is required")
@@ -652,27 +679,238 @@ func (s *Store) SubmitMistakeAnalysis(ctx context.Context, fingerprint, decision
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	result, err := s.db.ExecContext(ctx, `UPDATE mistakes SET
-		ai_decision = ?,
-		ai_reason = ?,
-		ai_rule_draft = ?,
-		ai_analyzed_at = ?,
-		review_status = 'pending_user'
-		WHERE fingerprint = ?`,
-		decision, reason, ruleDraft, time.Now().UTC().Format(time.RFC3339Nano), fingerprint,
-	)
-	if err != nil {
-		return fmt.Errorf("store: submit mistake analysis: %w", err)
-	}
-	if affected, err := result.RowsAffected(); err != nil {
-		return fmt.Errorf("store: submit mistake analysis rows: %w", err)
-	} else if affected == 0 {
-		return ErrMistakeNotFound
-	}
-	return nil
+
+	return s.withBusyRetry(ctx, func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("store: begin submit analysis: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+
+		var (
+			rowProject   string
+			rowStatus    string
+			reviewStatus string
+		)
+		err = tx.QueryRowContext(ctx,
+			`SELECT project_path, status, COALESCE(review_status, 'pending_ai')
+			 FROM mistakes WHERE fingerprint = ?`,
+			fingerprint,
+		).Scan(&rowProject, &rowStatus, &reviewStatus)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrMistakeNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("store: query mistake for analysis: %w", err)
+		}
+		if projectScope != "" && !sameProjectScope(rowProject, projectScope) {
+			return fmt.Errorf("%w: fingerprint %s", ErrCrossProjectScope, fingerprint)
+		}
+		if reviewStatus != "pending_ai" && reviewStatus != "pending_user" {
+			return fmt.Errorf("%w: review_status is already %q", ErrMistakeStateConflict, reviewStatus)
+		}
+
+		if _, err := tx.ExecContext(ctx, `UPDATE mistakes SET
+			ai_decision = ?,
+			ai_reason = ?,
+			ai_rule_draft = ?,
+			ai_analyzed_at = ?,
+			review_status = 'pending_user'
+			WHERE fingerprint = ?`,
+			decision, reason, ruleDraft, time.Now().UTC().Format(time.RFC3339Nano), fingerprint,
+		); err != nil {
+			return fmt.Errorf("store: submit mistake analysis: %w", err)
+		}
+		return tx.Commit()
+	})
 }
 
 // ApproveMistake 确认错题入库，将 review_status 置为 approved、status 置为 promoted。
 func (s *Store) ApproveMistake(ctx context.Context, fingerprint string) error {
 	return s.UpdateMistakeStatus(ctx, fingerprint, "promoted")
+}
+
+// ApproveMistakeAndCreateRule 在单个事务中原子地批准错题并幂等写入对应规则（由数据库唯一索引兜底去重）。
+func (s *Store) ApproveMistakeAndCreateRule(
+	ctx context.Context,
+	fingerprint string,
+	buildRule func(MistakeRecord) (Rule, error),
+) (ruleCreated bool, err error) {
+	if s == nil || s.db == nil {
+		return false, errors.New("store: not opened")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	fingerprint = strings.TrimSpace(fingerprint)
+	if fingerprint == "" {
+		return false, errors.New("store: fingerprint is required")
+	}
+	if buildRule == nil {
+		return false, errors.New("store: buildRule callback is required")
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	err = s.withBusyRetry(ctx, func() error {
+		tx, txErr := s.db.BeginTx(ctx, nil)
+		if txErr != nil {
+			return fmt.Errorf("store: begin approve mistake tx: %w", txErr)
+		}
+		defer func() { _ = tx.Rollback() }()
+
+		created, stepErr := approveMistakeAndInsertRuleTx(ctx, tx, fingerprint, buildRule)
+		if stepErr != nil {
+			return stepErr
+		}
+		if commitErr := tx.Commit(); commitErr != nil {
+			return fmt.Errorf("store: commit approve mistake tx: %w", commitErr)
+		}
+		ruleCreated = created
+		return nil
+	})
+	return ruleCreated, err
+}
+
+// ApplyAIRecommendationsBatch 在单个事务中批量采纳 AI 审查建议（recommend -> 批准并建规则，skip -> 忽略）。
+func (s *Store) ApplyAIRecommendationsBatch(
+	ctx context.Context,
+	projectPath string,
+	buildRule func(MistakeRecord) (Rule, error),
+) (appliedRules, ignoredCount int, err error) {
+	if s == nil || s.db == nil {
+		return 0, 0, errors.New("store: not opened")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if buildRule == nil {
+		return 0, 0, errors.New("store: buildRule callback is required")
+	}
+	pendingUser, qErr := s.ListInboxMistakes(ctx, strings.TrimSpace(projectPath), "pending_user")
+	if qErr != nil {
+		return 0, 0, qErr
+	}
+	if len(pendingUser) == 0 {
+		return 0, 0, nil
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	err = s.withBusyRetry(ctx, func() error {
+		tx, txErr := s.db.BeginTx(ctx, nil)
+		if txErr != nil {
+			return fmt.Errorf("store: begin apply recommendations tx: %w", txErr)
+		}
+		defer func() { _ = tx.Rollback() }()
+
+		rulesCnt, ignCnt := 0, 0
+		for _, m := range pendingUser {
+			decision := strings.ToLower(strings.TrimSpace(m.AIDecision))
+			switch decision {
+			case "recommend", "approve", "promote", "recommend_approve":
+				if _, stepErr := approveMistakeAndInsertRuleTx(ctx, tx, m.Fingerprint, buildRule); stepErr != nil {
+					return stepErr
+				}
+				rulesCnt++
+			case "skip", "ignore":
+				res, upErr := tx.ExecContext(ctx,
+					`UPDATE mistakes SET status = 'ignored', review_status = 'ignored' WHERE fingerprint = ?`,
+					m.Fingerprint,
+				)
+				if upErr != nil {
+					return fmt.Errorf("store: ignore mistake %s: %w", m.Fingerprint, upErr)
+				}
+				if aff, _ := res.RowsAffected(); aff > 0 {
+					ignCnt++
+				}
+			}
+		}
+		if commitErr := tx.Commit(); commitErr != nil {
+			return fmt.Errorf("store: commit apply recommendations tx: %w", commitErr)
+		}
+		appliedRules = rulesCnt
+		ignoredCount = ignCnt
+		return nil
+	})
+	return appliedRules, ignoredCount, err
+}
+
+func approveMistakeAndInsertRuleTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	fingerprint string,
+	buildRule func(MistakeRecord) (Rule, error),
+) (bool, error) {
+	var (
+		rec        MistakeRecord
+		created    any
+		aiAnalyzed any
+	)
+	err := tx.QueryRowContext(ctx, `SELECT id, project_path, fingerprint, category, summary,
+		COALESCE(bad_snippet, ''), COALESCE(good_snippet, ''),
+		source, status, count, created_at,
+		COALESCE(ai_decision, ''), COALESCE(ai_reason, ''), COALESCE(ai_rule_draft, ''),
+		ai_analyzed_at, COALESCE(review_status, 'pending_ai')
+		FROM mistakes WHERE fingerprint = ?`, fingerprint,
+	).Scan(
+		&rec.ID, &rec.ProjectPath, &rec.Fingerprint, &rec.Category, &rec.Summary,
+		&rec.BadSnippet, &rec.GoodSnippet, &rec.Source, &rec.Status,
+		&rec.Count, &created,
+		&rec.AIDecision, &rec.AIReason, &rec.AIRuleDraft,
+		&aiAnalyzed, &rec.ReviewStatus,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, ErrMistakeNotFound
+	}
+	if err != nil {
+		return false, fmt.Errorf("store: load mistake %s: %w", fingerprint, err)
+	}
+	rec.CreatedAt = coerceTime(created)
+	rec.AIAnalyzedAt = coerceTime(aiAnalyzed)
+	rec.UpdatedAt = rec.CreatedAt
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE mistakes SET status = 'promoted', review_status = 'approved' WHERE fingerprint = ?`,
+		fingerprint,
+	); err != nil {
+		return false, fmt.Errorf("store: promote mistake %s: %w", fingerprint, err)
+	}
+
+	rule, err := buildRule(rec)
+	if err != nil {
+		return false, fmt.Errorf("store: derive rule for %s: %w", fingerprint, err)
+	}
+	rule = normalizeRule(rule)
+	if rule.Engine == "" {
+		return false, errors.New("store: derived rule engine is required")
+	}
+	if rule.RuleID == "" {
+		return false, errors.New("store: derived rule id is required")
+	}
+	if rule.ID == "" {
+		rule.ID = newID("rule")
+	}
+	if rule.CreatedAt.IsZero() {
+		rule.CreatedAt = time.Now().UTC()
+	}
+
+	res, err := tx.ExecContext(ctx, `INSERT INTO rules
+		(id, scope, project_path, engine, rule_key, payload, rationale, hit_count, source, status, applied_at, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(scope, project_path, engine, LOWER(rule_key)) DO NOTHING`,
+		rule.ID, rule.Scope, rule.ProjectPath, rule.Engine, rule.RuleID, rule.Payload,
+		rule.Rationale, rule.HitCount, rule.Source, rule.Status, nullableTime(rule.AppliedAt),
+		rule.CreatedAt.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return false, fmt.Errorf("store: upsert rule for %s: %w", fingerprint, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: check inserted rule rows: %w", err)
+	}
+	return affected > 0, nil
 }

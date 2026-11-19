@@ -133,3 +133,67 @@ func TestMCPVerifyReturnsPendingInboxAndNextAction(t *testing.T) {
 		t.Fatalf("expected non-empty NextAction guiding sg_submit_analysis")
 	}
 }
+
+func TestMCPInboxAndSubmitEnforceProjectScope(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "slopguard.db")
+	oldOpen := openMCPStore
+	openMCPStore = func() (*store.Store, error) {
+		return store.Open(dbPath)
+	}
+	t.Cleanup(func() { openMCPStore = oldOpen })
+
+	repoA := t.TempDir()
+	repoB := t.TempDir()
+	s, err := openMCPStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordMistake(context.Background(), contract.Mistake{
+		ProjectPath: repoA,
+		Fingerprint: "fp-repo-a",
+		Category:    "type",
+		Summary:     "issue A",
+		Source:      "auto_verify",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordMistake(context.Background(), contract.Mistake{
+		ProjectPath: repoB,
+		Fingerprint: "fp-repo-b",
+		Category:    "type",
+		Summary:     "secret issue B",
+		Source:      "auto_verify",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+
+	tools := buildMCPTools(repoA)
+	inboxTool := findMCPTool(t, tools, "sg_list_inbox")
+	submitTool := findMCPTool(t, tools, "sg_submit_analysis")
+
+	// Empty project filter must only return repoA mistakes, never repoB.
+	res, err := inboxTool.Handler(context.Background(), json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("sg_list_inbox(repoA): %v", err)
+	}
+	items := res.([]store.MistakeRecord)
+	if len(items) != 1 || items[0].Fingerprint != "fp-repo-a" {
+		t.Fatalf("expected only repoA mistakes, got %+v", items)
+	}
+
+	// Explicit cross-project query must be rejected.
+	crossArgs, _ := json.Marshal(map[string]any{"project": repoB})
+	if _, err := inboxTool.Handler(context.Background(), crossArgs); err == nil {
+		t.Fatalf("expected error when querying repoB from repoA MCP session")
+	}
+
+	// Cross-project sg_submit_analysis must be rejected.
+	if _, err := submitTool.Handler(context.Background(), json.RawMessage(`{
+		"fingerprint": "fp-repo-b",
+		"decision": "skip",
+		"reason": "cross-project attempt"
+	}`)); err == nil {
+		t.Fatalf("expected error when submitting analysis for repoB fingerprint from repoA session")
+	}
+}

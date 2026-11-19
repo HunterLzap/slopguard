@@ -20,7 +20,7 @@ import (
 
 const (
 	driverName     = "sqlite"
-	schemaVersion  = 3
+	schemaVersion  = 4
 	defaultDirName = ".slopguard"
 	defaultDBName  = "slopguard.db"
 )
@@ -70,7 +70,7 @@ func Open(path string) (*Store, error) {
 		}
 	}
 
-	db, err := sql.Open(driverName, path)
+	db, err := sql.Open(driverName, buildSQLiteDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}
@@ -94,6 +94,40 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	return store, nil
+}
+
+func buildSQLiteDSN(path string) string {
+	if path == ":memory:" {
+		return path
+	}
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	return path + sep + "_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)"
+}
+
+func isSQLiteBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "sqlite_busy") || strings.Contains(msg, "database is locked") || strings.Contains(msg, "database table is locked")
+}
+
+func (s *Store) withBusyRetry(ctx context.Context, fn func() error) error {
+	backoffs := []time.Duration{15 * time.Millisecond, 35 * time.Millisecond, 75 * time.Millisecond, 150 * time.Millisecond}
+	for i := 0; ; i++ {
+		err := fn()
+		if err == nil || !isSQLiteBusy(err) || i >= len(backoffs) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoffs[i]):
+		}
+	}
 }
 
 // Path 返回数据库文件路径。
@@ -231,6 +265,16 @@ var migrations = []migration{
 			`CREATE INDEX IF NOT EXISTS idx_mistakes_review_status ON mistakes(review_status)`,
 			`UPDATE mistakes SET review_status = 'approved' WHERE status = 'promoted' AND review_status = 'pending_ai'`,
 			`UPDATE mistakes SET review_status = 'ignored' WHERE status = 'ignored' AND review_status = 'pending_ai'`,
+		},
+	},
+	{
+		version: 4,
+		statements: []string{
+			`DELETE FROM rules WHERE rowid NOT IN (
+				SELECT MIN(rowid) FROM rules GROUP BY scope, project_path, engine, LOWER(rule_key)
+			)`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_rules_scope_project_engine_key
+				ON rules(scope, project_path, engine, LOWER(rule_key))`,
 		},
 	},
 }

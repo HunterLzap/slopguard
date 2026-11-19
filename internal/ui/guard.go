@@ -37,12 +37,15 @@ type GuardProjectConfig struct {
 }
 
 type GuardRuntimeState struct {
-	Running      bool   `json:"running"`
-	LastScanAt   string `json:"last_scan_at,omitempty"`
-	LastPassed   *bool  `json:"last_passed,omitempty"`
-	LastFindings int    `json:"last_findings"`
-	LastError    string `json:"last_error,omitempty"`
-	LastTrigger  string `json:"last_trigger,omitempty"`
+	Running        bool   `json:"running"`
+	LastScanAt     string `json:"last_scan_at,omitempty"`
+	LastPassed     *bool  `json:"last_passed,omitempty"`
+	LastFindings   int    `json:"last_findings"`
+	LastError      string `json:"last_error,omitempty"`
+	LastTrigger    string `json:"last_trigger,omitempty"`
+	WatchedFiles   int    `json:"watched_files,omitempty"`
+	Degraded       bool   `json:"degraded,omitempty"`
+	DegradedReason string `json:"degraded_reason,omitempty"`
 }
 
 type GuardProjectStatus struct {
@@ -135,7 +138,7 @@ func (g *GuardManager) saveLocked() error {
 		return err
 	}
 	encoded = append(encoded, '\n')
-	return writeFileAtomic(path, encoded, 0o644)
+	return writeFileAtomicWithDirMode(path, encoded, 0o600, 0o700)
 }
 
 // Start launches the background debounce watcher loop until Stop or ctx cancellation.
@@ -298,7 +301,7 @@ func (g *GuardManager) pollOnce(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		treeHash, headHash, err := computeProjectSnapshot(t.project)
+		treeHash, headHash, watchedFiles, capped, err := computeProjectSnapshot(t.project)
 		if err != nil {
 			continue
 		}
@@ -307,6 +310,16 @@ func (g *GuardManager) pollOnce(ctx context.Context) {
 		var lastCommit bool
 
 		g.mu.Lock()
+		rt := g.runtime[t.project]
+		rt.WatchedFiles = watchedFiles
+		rt.Degraded = capped
+		if capped {
+			rt.DegradedReason = fmt.Sprintf("项目文件超过 %d 个监视上限，已降级为仅监测前 %d 个文件（建议配合 Git Hook）", maxGuardWatchFiles, maxGuardWatchFiles)
+		} else {
+			rt.DegradedReason = ""
+		}
+		g.runtime[t.project] = rt
+
 		ws := g.watch[t.project]
 		if ws == nil {
 			g.watch[t.project] = &guardWatchState{
@@ -391,10 +404,10 @@ func (g *GuardManager) finishRun(project string, passed *bool, runErr error, fin
 	g.runtime[project] = rt
 }
 
-func computeProjectSnapshot(root string) (treeHash, headHash string, err error) {
+func computeProjectSnapshot(root string) (treeHash, headHash string, watchedFiles int, capped bool, err error) {
 	info, err := os.Stat(root)
 	if err != nil || !info.IsDir() {
-		return "", "", errors.New("project directory unavailable")
+		return "", "", 0, false, errors.New("project directory unavailable")
 	}
 
 	headHasher := sha256.New()
@@ -429,11 +442,15 @@ func computeProjectSnapshot(root string) (treeHash, headHash string, err error) 
 			}
 			return nil
 		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
 		if count >= maxGuardWatchFiles {
+			capped = true
 			return fs.SkipAll
 		}
 		fi, statErr := entry.Info()
-		if statErr != nil {
+		if statErr != nil || !fi.Mode().IsRegular() {
 			return nil
 		}
 		rel, relErr := filepath.Rel(root, path)
@@ -445,10 +462,10 @@ func computeProjectSnapshot(root string) (treeHash, headHash string, err error) 
 		return nil
 	})
 	if walkErr != nil && !errors.Is(walkErr, fs.SkipAll) {
-		return "", "", walkErr
+		return "", "", count, capped, walkErr
 	}
 	treeHash = hex.EncodeToString(treeHasher.Sum(nil))
-	return treeHash, headHash, nil
+	return treeHash, headHash, count, capped, nil
 }
 
 func isGuardSkippedDir(name string) bool {
@@ -495,6 +512,27 @@ func resolveGitDir(project string) string {
 }
 
 func resolveGitHookPath(project string) (hookPath string, isGitRepo bool) {
+	if strings.TrimSpace(project) == "" {
+		return "", false
+	}
+	// First ask Git itself via --git-path so worktrees and core.hooksPath are respected.
+	res := engine.RunProcess(context.Background(), engine.ProcessSpec{
+		Command:        "git",
+		Args:           []string{"rev-parse", "--git-path", "hooks/post-commit"},
+		Dir:            project,
+		Timeout:        3 * time.Second,
+		MaxOutputBytes: 16 * 1024,
+	})
+	if res.Err == nil && res.ExitCode == 0 {
+		out := strings.TrimSpace(res.Stdout)
+		if out != "" {
+			if !filepath.IsAbs(out) {
+				out = filepath.Join(project, out)
+			}
+			return filepath.Clean(out), true
+		}
+	}
+
 	gitDir := resolveGitDir(project)
 	if gitDir == "" {
 		return "", false
@@ -529,7 +567,12 @@ func buildGitHookBlock(binaryPath string) string {
 		`fi`,
 		`if [ -n "$_sg_bin" ]; then`,
 		`  _sg_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"`,
-		`  nohup "$_sg_bin" verify --record --last-commit --source git_hook --root "$_sg_root" >/dev/null 2>&1 </dev/null &`,
+		`  _sg_rev="$(git rev-parse --verify HEAD 2>/dev/null || true)"`,
+		`  if [ -n "$_sg_rev" ]; then`,
+		`    nohup "$_sg_bin" verify --record --commit "$_sg_rev" --source git_hook --root "$_sg_root" >/dev/null 2>&1 </dev/null &`,
+		`  else`,
+		`    nohup "$_sg_bin" verify --record --last-commit --source git_hook --root "$_sg_root" >/dev/null 2>&1 </dev/null &`,
+		`  fi`,
 		`fi`,
 		gitHookEndMarker,
 	}, "\n")
@@ -570,7 +613,10 @@ func uninstallGitPostCommitHook(backupsDir, project string) (string, error) {
 	stripped := stripHookMarkerBlock(string(data))
 	trimmed := strings.TrimSpace(stripped)
 
-	backupPath, rec, hasBackup := lookupBackup(backupsDir, "hook", "post-commit", hookPath)
+	backupPath, rec, hasBackup, checkErr := lookupBackupChecked(backupsDir, "hook", "post-commit", hookPath)
+	if checkErr != nil {
+		return hookPath, checkErr
+	}
 	if hasBackup {
 		if !rec.Existed && (trimmed == "" || trimmed == "#!/bin/sh" || trimmed == "#!/usr/bin/env sh") {
 			_, _, restoreErr := restoreFromBackup(backupsDir, "hook", "post-commit", hookPath)
@@ -772,8 +818,7 @@ func (s *Server) handleGuardToggle(w http.ResponseWriter, r *http.Request) {
 		HookEnabled *bool  `json:"hook_enabled"`
 		DebounceSec int    `json:"debounce_sec"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON payload")
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 

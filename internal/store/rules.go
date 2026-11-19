@@ -11,9 +11,11 @@ import (
 
 // 规则/错题状态相关的可识别错误。
 var (
-	ErrRuleNotFound    = errors.New("store: rule not found")
-	ErrMistakeNotFound = errors.New("store: mistake not found")
-	ErrInvalidStatus   = errors.New("store: invalid mistake status")
+	ErrRuleNotFound         = errors.New("store: rule not found")
+	ErrMistakeNotFound      = errors.New("store: mistake not found")
+	ErrInvalidStatus        = errors.New("store: invalid mistake status")
+	ErrMistakeStateConflict = errors.New("store: mistake state does not allow transition")
+	ErrCrossProjectScope    = errors.New("store: mistake belongs to another project")
 )
 
 // Rule 是已沉淀规则的台账记录。

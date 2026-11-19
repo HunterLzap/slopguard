@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"encoding/xml"
 	"flag"
 	"fmt"
@@ -203,10 +204,19 @@ func buildLaunchAgentPlist(exe string, port int, logPath string) string {
 
 func isLocalDashboardResponding(port int) bool {
 	client := &http.Client{Timeout: 500 * time.Millisecond}
-	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/overview", port))
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/identity", port))
 	if err != nil {
 		return false
 	}
-	_ = resp.Body.Close()
-	return resp.StatusCode >= 200 && resp.StatusCode < 500
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	var identity struct {
+		Service string `json:"service"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&identity); err != nil {
+		return false
+	}
+	return identity.Service == "slopguard"
 }

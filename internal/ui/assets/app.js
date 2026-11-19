@@ -1467,9 +1467,7 @@
         : (item.partial ? '<span class="pill warn">部分接入</span>' : '');
       const recPill = item.recommended ? '<span class="pill accent">推荐</span>' : "";
       const backupPill = item.has_backup ? '<span class="pill">已备份</span>' : "";
-      const subtitle = item.note
-        ? `${shortPathDisplay(item.primary_path || "")} · ${item.note}`
-        : shortPathDisplay(item.primary_path || "");
+      const pathText = shortPathDisplay(item.primary_path || "");
 
       row.innerHTML = `
         <div class="agent-row-main">
@@ -1481,7 +1479,7 @@
               ${statusPill}
               ${backupPill}
             </div>
-            <div class="agent-path mono" title="${escapeHTML(item.primary_path || "")}">${escapeHTML(subtitle)}</div>
+            <div class="agent-path mono" title="${escapeHTML(item.primary_path || "")}">${escapeHTML(pathText)}</div>
           </div>
         </div>
         <div class="agent-row-controls">
@@ -1619,6 +1617,9 @@
     const badge = $("guard-project-badge");
     const emptyEl = $("guard-empty-project");
     const controlsEl = $("guard-controls");
+    const masterSwitchWrap = $("guard-master-switch-wrap");
+    const masterSwitch = $("guard-master-switch");
+    const masterPill = $("guard-master-pill");
 
     const guardedCount = Number(data?.guarded_projects || 0);
     const st = data?.status || null;
@@ -1630,6 +1631,8 @@
         renderQuickProjectAction(emptyEl, "尚未添加项目");
       }
       if (controlsEl) controlsEl.hidden = true;
+      if (masterSwitchWrap) masterSwitchWrap.hidden = true;
+      if (masterPill) masterPill.hidden = true;
       if (topbarPill) {
         if (guardedCount > 0) {
           topbarPill.hidden = false;
@@ -1645,6 +1648,7 @@
     if (badge) badge.textContent = shortProject(state.project);
     if (emptyEl) emptyEl.hidden = true;
     if (controlsEl) controlsEl.hidden = false;
+    if (masterSwitchWrap) masterSwitchWrap.hidden = false;
 
     const active = Boolean(st.enabled || st.hook_installed);
     if (topbarPill) {
@@ -1653,34 +1657,23 @@
       topbarPill.className = `pill ${st.running ? "accent" : "pass"}`;
     }
 
-    const masterSwitch = $("guard-master-switch");
-    const masterPill = $("guard-master-pill");
-    const masterDetail = $("guard-master-detail");
-    if (masterSwitch) masterSwitch.checked = active;
+    if (masterSwitch) {
+      masterSwitch.disabled = false;
+      masterSwitch.checked = active;
+    }
     if (masterPill) {
+      masterPill.hidden = false;
       masterPill.textContent = st.running ? "体检中…" : (active ? "守护中" : "未开启");
       masterPill.className = `pill ${st.running ? "accent" : (active ? "pass" : "")}`;
-    }
-    if (masterDetail) {
-      if (st.last_error) {
-        masterDetail.textContent = `最近异常：${st.last_error}`;
-      } else if (st.last_scan_at) {
-        const outcomeText = st.last_passed === false ? `发现 ${st.last_findings || 0} 项` : "通过";
-        masterDetail.textContent = `最近触发 (${formatShortTime(st.last_scan_at)})：${outcomeText}`;
-      } else if (active) {
-        const parts = [];
-        if (st.enabled) parts.push("文件监听已就绪");
-        if (st.hook_installed) parts.push("Git 钩子已安装");
-        masterDetail.textContent = parts.join(" · ");
-      } else {
-        masterDetail.textContent = "开启后将在代码改动或提交时静默留痕错题";
-      }
     }
 
     const watchSwitch = $("guard-watch-switch");
     const watchPill = $("guard-watch-pill");
     const watchDetail = $("guard-watch-detail");
-    if (watchSwitch) watchSwitch.checked = Boolean(st.enabled);
+    if (watchSwitch) {
+      watchSwitch.disabled = false;
+      watchSwitch.checked = Boolean(st.enabled);
+    }
     if (watchPill) {
       if (st.running) {
         watchPill.textContent = "体检中…";

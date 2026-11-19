@@ -319,25 +319,19 @@
               <div class="title-with-tip">
                 <h2>自动守护</h2>
                 <button type="button" class="help-tip" data-tip="添加项目后默认开启；代码保存或提交时在后台静默检查，发现问题自动记入「错题栏」，不打断工作" aria-label="自动守护说明">?</button>
+                <span id="guard-master-pill" class="pill" hidden>未开启</span>
               </div>
-              <span id="guard-project-badge" class="pill">全部项目</span>
+              <div class="card-header-actions">
+                <span id="guard-project-badge" class="pill">全部项目</span>
+                <label id="guard-master-switch-wrap" class="switch" aria-label="后台无感自动守护总开关" hidden>
+                  <input id="guard-master-switch" type="checkbox">
+                  <span class="switch-slider"></span>
+                </label>
+              </div>
             </div>
             <div class="card-body stack-list">
               <div id="guard-empty-project" class="quick-project-bar"></div>
               <div id="guard-controls" class="stack-list" hidden>
-                <div class="guard-master-row">
-                  <div class="guard-master-info">
-                    <div class="mcp-client-title">
-                      <span>后台无感自动守护</span>
-                      <span id="guard-master-pill" class="pill">未开启</span>
-                    </div>
-                    <div id="guard-master-detail" class="mcp-client-path muted">文件保存与 Git 提交时静默留痕错题</div>
-                  </div>
-                  <label class="switch" aria-label="后台无感自动守护总开关">
-                    <input id="guard-master-switch" type="checkbox">
-                    <span class="switch-slider"></span>
-                  </label>
-                </div>
                 <details class="inline-details">
                   <summary>查看包含的守护功能（文件监听 · Git 钩子）</summary>
                   <div class="guard-sub-list">
@@ -413,7 +407,6 @@
 
               <div class="agent-section-head">
                 <span class="section-subhead">AGENT</span>
-                <span class="muted" style="font-size: 11px;">勾选即接入 MCP 与共享护栏规则 · 点击 › 查看变更详情或还原</span>
               </div>
               <div id="agents-list" class="agent-list"></div>
             </div>

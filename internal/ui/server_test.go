@@ -301,10 +301,10 @@ func TestDashboardEmbeddedAssets(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("index status = %d", status)
 	}
-	if !strings.Contains(header.Get("Content-Type"), "text/html") || !strings.Contains(string(body), "SlopGuard Dashboard") {
+	if !strings.Contains(header.Get("Content-Type"), "text/html") || !strings.Contains(string(body), "SlopGuard") {
 		t.Fatalf("index content-type=%q body=%q", header.Get("Content-Type"), body)
 	}
-	for _, section := range []string{"效果总览", "错题本与规则进化", "规则台账", "项目雷达与 UI 截图"} {
+	for _, section := range []string{"总览", "错题栏", "Agent 活动", "规则台账", "坏样本雷达", "配置与体检"} {
 		if !strings.Contains(string(body), section) {
 			t.Fatalf("index missing dashboard section %q", section)
 		}
@@ -372,5 +372,327 @@ func TestDashboardRunLoopbackAndGracefulShutdown(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after context cancellation")
+	}
+}
+
+type fakeUIRunner struct {
+	lookups map[string]string
+	runFunc func(ctx context.Context, spec contract.RunSpec) contract.RunResult
+}
+
+func (f *fakeUIRunner) LookPath(name string) (string, bool) {
+	if f.lookups != nil {
+		if p, ok := f.lookups[name]; ok {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+func (f *fakeUIRunner) Run(ctx context.Context, spec contract.RunSpec) contract.RunResult {
+	if f.runFunc != nil {
+		return f.runFunc(ctx, spec)
+	}
+	return contract.RunResult{ExitCode: 0}
+}
+
+func TestOpenBrowserCommandStandaloneAndFallback(t *testing.T) {
+	url := "http://127.0.0.1:7788/"
+	noFile := func(string) bool { return false }
+	noLook := func(string) (string, error) { return "", fmt.Errorf("not found") }
+
+	name, args := openBrowserCommand("darwin", url, func(p string) bool {
+		return strings.Contains(p, "SlopGuard.app")
+	}, noLook)
+	if name != "open" || len(args) != 1 || args[0] != "/Applications/SlopGuard.app" {
+		t.Fatalf("darwin slopguard.app = %q %v", name, args)
+	}
+
+	name, args = openBrowserCommand("darwin", url, func(p string) bool {
+		return strings.Contains(p, "Google Chrome.app")
+	}, noLook)
+	if !strings.Contains(name, "Google Chrome") || len(args) != 2 || args[0] != "--app="+url || args[1] != "--window-size=1180,780" {
+		t.Fatalf("darwin chrome = %q %v", name, args)
+	}
+
+	name, args = openBrowserCommand("darwin", url, noFile, noLook)
+	if name != "open" || len(args) != 1 || args[0] != url {
+		t.Fatalf("darwin fallback = %q %v", name, args)
+	}
+
+	name, args = openBrowserCommand("linux", url, noFile, func(bin string) (string, error) {
+		if bin == "chromium" {
+			return "/usr/bin/chromium", nil
+		}
+		return "", fmt.Errorf("not found")
+	})
+	if name != "/usr/bin/chromium" || args[0] != "--app="+url {
+		t.Fatalf("linux chromium = %q %v", name, args)
+	}
+
+	name, args = openBrowserCommand("linux", url, noFile, noLook)
+	if name != "xdg-open" || args[0] != url {
+		t.Fatalf("linux fallback = %q %v", name, args)
+	}
+
+	name, args = openBrowserCommand("windows", url, noFile, noLook)
+	if name != "rundll32" || len(args) != 2 || args[1] != url {
+		t.Fatalf("windows fallback = %q %v", name, args)
+	}
+}
+
+func TestDashboardMistakeRestoreFiltersProjectMetaAndVerify(t *testing.T) {
+	db := openDashboardStore(t)
+	ctx := context.Background()
+	project := filepath.Join(t.TempDir(), "py-proj")
+	writeDashboardFile(t, filepath.Join(project, "pyproject.toml"), "[project]\nname = \"demo\"\n")
+	writeDashboardFile(t, filepath.Join(project, "app.py"), "x = 1  # noqa\n")
+	writeDashboardFile(t, filepath.Join(project, ".slopguard", "config.yaml"), "version: 1\nadapters:\n  - python\nverify:\n  jobs: 3\n")
+	writeDashboardFile(t, filepath.Join(project, ".slopguard", "ui.yaml"), "base_url: http://127.0.0.1:3000\nroutes:\n  - /\nscreenshot_dir: .slopguard/screenshots\ntimeout_sec: 30\n")
+	writeDashboardFile(t, filepath.Join(project, ".slopguard", "baseline.json"), `{"metrics":{"noqa":0},"updated_at":"2026-01-01T00:00:00Z"}`)
+
+	if _, err := db.RecordMistake(ctx, contract.Mistake{
+		ProjectPath: project, Fingerprint: "fp-restore", Category: "type",
+		Summary: "missing annotation", BadSnippet: "def f(x):", GoodSnippet: "def f(x: int):", Source: "agent",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &fakeUIRunner{
+		lookups: map[string]string{
+			"ruff":    "/usr/local/bin/ruff",
+			"pyright": "/usr/local/bin/pyright",
+		},
+		runFunc: func(_ context.Context, spec contract.RunSpec) contract.RunResult {
+			if strings.Contains(spec.Name, "ruff") {
+				return contract.RunResult{
+					ExitCode: 1,
+					Stdout:   `[{"code":"F401","message":"unused import","filename":"app.py","location":{"row":1,"column":1}}]`,
+				}
+			}
+			return contract.RunResult{ExitCode: 0}
+		},
+	}
+
+	server := NewServer(db, runner)
+	handler := server.Handler()
+
+	// Ignore then restore
+	status, body, _ := dashboardRequest(t, handler, http.MethodPost, "/api/mistakes/fp-restore/ignore")
+	if status != http.StatusOK {
+		t.Fatalf("ignore status = %d, body = %s", status, body)
+	}
+	status, body, _ = dashboardRequest(t, handler, http.MethodPost, "/api/mistakes/fp-restore/restore")
+	if status != http.StatusOK {
+		t.Fatalf("restore status = %d, body = %s", status, body)
+	}
+	restoreJSON := decodeDashboardJSON(t, body)
+	if restoreJSON["status"] != "pending" {
+		t.Fatalf("restore = %v", restoreJSON)
+	}
+
+	// Filter mistakes by category/source/q
+	status, body, _ = dashboardRequest(t, handler, http.MethodGet, "/api/mistakes?category=type&source=agent&q=annotation")
+	if status != http.StatusOK {
+		t.Fatalf("mistakes filter status = %d, body = %s", status, body)
+	}
+	mJSON := decodeDashboardJSON(t, body)
+	if items, _ := mJSON["mistakes"].([]any); len(items) != 1 {
+		t.Fatalf("filtered mistakes = %v", mJSON)
+	}
+
+	// Project meta
+	status, body, _ = dashboardRequest(t, handler, http.MethodGet, "/api/project-meta?project="+url.QueryEscape(project))
+	if status != http.StatusOK {
+		t.Fatalf("project-meta status = %d, body = %s", status, body)
+	}
+	metaJSON := decodeDashboardJSON(t, body)
+	if metaJSON["exists"] != true {
+		t.Fatalf("meta exists = %v", metaJSON)
+	}
+	adapters, _ := metaJSON["adapters"].([]any)
+	if len(adapters) != 1 {
+		t.Fatalf("meta adapters = %v", metaJSON["adapters"])
+	}
+
+	// POST /api/verify with record=true
+	reqBody := fmt.Sprintf(`{"project":%q,"all":true,"ui":false,"record":true}`, project)
+	req := httptest.NewRequest(http.MethodPost, "/api/verify", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("verify status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	verifyJSON := decodeDashboardJSON(t, rec.Body.Bytes())
+	if verifyJSON["passed"] != false {
+		t.Fatalf("verify passed = %v, want false (ruff + ratchet)", verifyJSON)
+	}
+	findings, _ := verifyJSON["findings"].([]any)
+	if len(findings) < 2 {
+		t.Fatalf("verify findings = %v, want ruff + ratchet findings", findings)
+	}
+
+	// Verify scan_runs was recorded in overview
+	status, body, _ = dashboardRequest(t, handler, http.MethodGet, "/api/overview?project="+url.QueryEscape(project))
+	if status != http.StatusOK {
+		t.Fatalf("overview status = %d", status)
+	}
+	ov := decodeDashboardJSON(t, body)
+	if runs, _ := ov["recent_runs"].([]any); len(runs) != 1 {
+		t.Fatalf("recent_runs = %v, want 1", ov["recent_runs"])
+	}
+}
+
+func TestDashboardEventsApproveAndServiceStatusAPI(t *testing.T) {
+	db := openDashboardStore(t)
+	ctx := context.Background()
+	projectA := filepath.Join(t.TempDir(), "project-a")
+	projectB := filepath.Join(t.TempDir(), "project-b")
+	for _, dir := range []string{projectA, projectB} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Seed MCP events
+	if err := db.RecordMCPEvent(ctx, store.MCPEvent{
+		ID:            "evt-1",
+		ProjectPath:   projectA,
+		ToolName:      "sg_verify",
+		ArgsSummary:   "all=true",
+		Passed:        true,
+		FindingsCount: 0,
+		DurationMs:    42,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordMCPEvent(ctx, store.MCPEvent{
+		ID:            "evt-2",
+		ProjectPath:   projectB,
+		ToolName:      "sg_radar",
+		ArgsSummary:   "top=5",
+		Passed:        false,
+		FindingsCount: 3,
+		DurationMs:    120,
+		ErrorText:     "hotspots found",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed mistake, submit AI analysis, then test review_status filter + approve
+	if _, err := db.RecordMistake(ctx, contract.Mistake{
+		ProjectPath: projectA,
+		Fingerprint: "fp-approve-1",
+		Category:    "type",
+		Summary:     "avoid any",
+		BadSnippet:  "const x: any = 1",
+		GoodSnippet: "const x: number = 1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SubmitMistakeAnalysis(ctx, "fp-approve-1", "recommend", "滥用 any 会绕过类型检查", "no-explicit-any"); err != nil {
+		t.Fatal(err)
+	}
+
+	server := NewServer(db, nil)
+	handler := server.Handler()
+
+	// 1. GET /api/events
+	status, body, _ := dashboardRequest(t, handler, http.MethodGet, "/api/events?project="+url.QueryEscape(projectA)+"&tool=sg_verify&limit=10")
+	if status != http.StatusOK {
+		t.Fatalf("events status = %d, body = %s", status, body)
+	}
+	eventsJSON := decodeDashboardJSON(t, body)
+	events, _ := eventsJSON["events"].([]any)
+	if len(events) != 1 {
+		t.Fatalf("events = %v, want 1 event", eventsJSON)
+	}
+	ev, _ := events[0].(map[string]any)
+	if ev["tool_name"] != "sg_verify" || ev["passed"] != true || ev["duration_ms"] != float64(42) {
+		t.Fatalf("event = %v", ev)
+	}
+
+	// Invalid limit & method check
+	status, _, _ = dashboardRequest(t, handler, http.MethodGet, "/api/events?limit=-1")
+	if status != http.StatusBadRequest {
+		t.Fatalf("negative limit status = %d, want 400", status)
+	}
+	status, _, _ = dashboardRequest(t, handler, http.MethodPost, "/api/events")
+	if status != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /api/events status = %d, want 405", status)
+	}
+
+	// 2. GET /api/mistakes?review_status=pending_user + AI fields
+	status, body, _ = dashboardRequest(t, handler, http.MethodGet, "/api/mistakes?review_status=pending_user")
+	if status != http.StatusOK {
+		t.Fatalf("mistakes review_status filter = %d, body = %s", status, body)
+	}
+	mistakesJSON := decodeDashboardJSON(t, body)
+	records, _ := mistakesJSON["mistakes"].([]any)
+	if len(records) != 1 {
+		t.Fatalf("pending_user mistakes = %v, want 1", mistakesJSON)
+	}
+	rec, _ := records[0].(map[string]any)
+	if rec["review_status"] != "pending_user" || rec["ai_decision"] != "recommend" || rec["ai_reason"] != "滥用 any 会绕过类型检查" || rec["ai_rule_draft"] != "no-explicit-any" {
+		t.Fatalf("mistake AI fields = %v", rec)
+	}
+	if _, ok := rec["ai_analyzed_at"]; !ok {
+		t.Fatalf("expected ai_analyzed_at in mistake record: %v", rec)
+	}
+
+	// 3. POST /api/mistakes/{fp}/approve
+	status, body, _ = dashboardRequest(t, handler, http.MethodPost, "/api/mistakes/fp-approve-1/approve")
+	if status != http.StatusOK {
+		t.Fatalf("approve status = %d, body = %s", status, body)
+	}
+	approveJSON := decodeDashboardJSON(t, body)
+	if approveJSON["ok"] != true || approveJSON["fingerprint"] != "fp-approve-1" || approveJSON["status"] != "promoted" || approveJSON["review_status"] != "approved" {
+		t.Fatalf("approve response = %v", approveJSON)
+	}
+
+	// Verify review_status=approved filter after approve
+	status, body, _ = dashboardRequest(t, handler, http.MethodGet, "/api/mistakes?review_status=approved")
+	if status != http.StatusOK {
+		t.Fatalf("approved mistakes status = %d", status)
+	}
+	approvedJSON := decodeDashboardJSON(t, body)
+	if items, _ := approvedJSON["mistakes"].([]any); len(items) != 1 {
+		t.Fatalf("approved mistakes = %v, want 1", approvedJSON)
+	}
+
+	// Missing fingerprint & wrong method
+	status, _, _ = dashboardRequest(t, handler, http.MethodPost, "/api/mistakes/nonexistent/approve")
+	if status != http.StatusNotFound {
+		t.Fatalf("missing approve status = %d, want 404", status)
+	}
+	status, _, _ = dashboardRequest(t, handler, http.MethodGet, "/api/mistakes/fp-approve-1/approve")
+	if status != http.StatusMethodNotAllowed {
+		t.Fatalf("GET approve status = %d, want 405", status)
+	}
+
+	// 4. GET /api/service-status
+	status, body, _ = dashboardRequest(t, handler, http.MethodGet, "/api/service-status")
+	if status != http.StatusOK {
+		t.Fatalf("service-status = %d, body = %s", status, body)
+	}
+	svcJSON := decodeDashboardJSON(t, body)
+	if svcJSON["port"] != float64(7788) || svcJSON["platform"] == "" || svcJSON["pid_hint"] == nil {
+		t.Fatalf("service-status = %v", svcJSON)
+	}
+	status, _, _ = dashboardRequest(t, handler, http.MethodPost, "/api/service-status")
+	if status != http.StatusMethodNotAllowed {
+		t.Fatalf("POST service-status = %d, want 405", status)
+	}
+
+	// Unit test detectServiceStatus helper directly
+	plist := filepath.Join("/Users/tester", "Library", "LaunchAgents", "com.slopguard.ui.plist")
+	installed := detectServiceStatus("darwin", "/Users/tester", 7788, func(p string) bool { return p == plist })
+	if !installed.Installed || installed.Platform != "darwin" || installed.Port != 7788 || installed.PIDHint <= 0 {
+		t.Fatalf("detectServiceStatus(installed) = %+v", installed)
+	}
+	notInstalled := detectServiceStatus("darwin", "/Users/tester", 8899, func(string) bool { return false })
+	if notInstalled.Installed || notInstalled.Port != 8899 {
+		t.Fatalf("detectServiceStatus(not installed) = %+v", notInstalled)
 	}
 }

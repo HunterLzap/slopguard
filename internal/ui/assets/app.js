@@ -4,10 +4,21 @@
   const state = {
     projects: [],
     project: localStorage.getItem("slopguard.project") || "",
+    tab: localStorage.getItem("slopguard.tab") || "overview",
+    theme: localStorage.getItem("slopguard.theme") || "system",
+    granularity: "day",
+    radarTop: "10",
+    reviewStatus: "pending_user",
     overview: null,
     mistakes: [],
+    events: [],
     rules: [],
     radar: null,
+    meta: null,
+    verifyResult: null,
+    verifying: false,
+    guardStatus: null,
+    diffPreview: null,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -16,7 +27,7 @@
     const response = await fetch(path, options);
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw new Error(data.error || response.statusText || "request failed");
+      throw new Error(data.error || response.statusText || "请求失败");
     }
     return data;
   }
@@ -34,7 +45,18 @@
     if (!value) return "—";
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return String(value);
-    return date.toLocaleString();
+    return date.toLocaleString("zh-CN");
+  }
+
+  function formatShortTime(value) {
+    if (!value) return "—";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return (
+      date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) +
+      " " +
+      date.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" })
+    );
   }
 
   function shortProject(path) {
@@ -44,11 +66,101 @@
   }
 
   function projectQuery(extra = {}) {
-    const params = new URLSearchParams(extra);
+    const params = new URLSearchParams();
+    for (const [k, v] of Object.entries(extra)) {
+      if (v !== undefined && v !== null && v !== "") {
+        params.set(k, String(v));
+      }
+    }
     if (state.project) params.set("project", state.project);
     return params.toString();
   }
 
+  // 主题切换
+  function applyTheme(theme) {
+    state.theme = theme;
+    localStorage.setItem("slopguard.theme", theme);
+    if (theme === "light" || theme === "dark") {
+      document.documentElement.setAttribute("data-theme", theme);
+    } else {
+      document.documentElement.removeAttribute("data-theme");
+    }
+    document.querySelectorAll(".theme-btn").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.themeChoice === theme);
+    });
+  }
+
+  // 导航与侧边栏
+  function switchTab(tab) {
+    const validTabs = ["overview", "mistakes", "events", "rules", "radar", "verify"];
+    const target = validTabs.includes(tab) ? tab : "overview";
+    state.tab = target;
+    localStorage.setItem("slopguard.tab", target);
+    document.querySelectorAll(".nav-item").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.tab === target);
+    });
+    document.querySelectorAll(".tab-panel").forEach((panel) => {
+      panel.hidden = panel.id !== `tab-${target}`;
+    });
+    closeSidebar();
+  }
+
+  function openSidebar() {
+    $("sidebar").classList.add("open");
+    $("sidebar-backdrop").hidden = false;
+  }
+
+  function closeSidebar() {
+    $("sidebar").classList.remove("open");
+    $("sidebar-backdrop").hidden = true;
+  }
+
+  // 服务运行状态与切换
+  let serviceInstalled = false;
+
+  async function loadServiceStatus() {
+    const dot = $("service-status-dot");
+    const text = $("service-status-text");
+    const btn = $("btn-toggle-service");
+    try {
+      const data = await api("/api/service-status");
+      serviceInstalled = Boolean(data && data.installed);
+      if (serviceInstalled) {
+        dot.className = "health-dot pass";
+        text.textContent = "后台常驻";
+        text.title = `已安装开机后台常驻 (${data.platform || "local"}${data.port ? ` · :${data.port}` : ""})`;
+        if (btn) btn.textContent = "关闭常驻";
+      } else {
+        dot.className = "health-dot neutral";
+        text.textContent = "按需运行";
+        text.title = "未安装后台常驻服务，当前仅在打开应用时运行";
+        if (btn) btn.textContent = "开启常驻";
+      }
+    } catch {
+      dot.className = "health-dot neutral";
+      text.textContent = "按需运行";
+    }
+  }
+
+  async function toggleService() {
+    const btn = $("btn-toggle-service");
+    if (!btn) return;
+    btn.disabled = true;
+    try {
+      await api("/api/service/toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enable: !serviceInstalled }),
+      });
+      await loadServiceStatus();
+    } catch (error) {
+      alert(`操作失败：${error.message}`);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  // 项目列表
   async function loadProjects() {
     try {
       const data = await api("/api/projects");
@@ -59,30 +171,93 @@
       all.value = "";
       all.textContent = "全部项目";
       select.appendChild(all);
+
       for (const project of state.projects) {
         const option = document.createElement("option");
         option.value = project.project_path;
-        option.textContent = `${shortProject(project.project_path)}  ·  ${project.scan_count} 次`;
+        const count = project.scan_count ?? project.total_runs ?? 0;
+        option.textContent = `${shortProject(project.project_path)} (${count})`;
         option.title = project.project_path;
         select.appendChild(option);
       }
+
       if (state.project && !state.projects.some((p) => p.project_path === state.project)) {
         state.project = "";
       }
       select.value = state.project;
+      updateTopbarProject();
+      renderProjectsTable(state.projects);
     } catch (error) {
       console.error(error);
     }
   }
 
+  function updateTopbarProject() {
+    const pathEl = $("current-project-path");
+    const dot = $("project-health-dot");
+    if (!state.project) {
+      pathEl.textContent = "全部项目";
+      pathEl.title = "全部项目";
+      dot.className = "health-dot neutral";
+      return;
+    }
+    pathEl.textContent = state.project;
+    pathEl.title = state.project;
+    const proj = state.projects.find((p) => p.project_path === state.project);
+    if (!proj) {
+      dot.className = "health-dot neutral";
+    } else if (proj.pass_rate !== undefined && Number(proj.pass_rate) < 50) {
+      dot.className = "health-dot fail";
+    } else if (Number(proj.latest_escapes || 0) > 0) {
+      dot.className = "health-dot warn";
+    } else {
+      dot.className = "health-dot pass";
+    }
+  }
+
+  // 总览
   function renderOverview(overview) {
-    state.overview = overview;
-    $("stat-runs").textContent = Number(overview.total_runs || 0).toLocaleString();
-    $("stat-failed").textContent = Number(overview.failed_runs || 0).toLocaleString();
-    $("stat-rules").textContent = Number(overview.rule_count || 0).toLocaleString();
-    $("stat-duration").textContent = Number(overview.avg_duration_ms || 0).toFixed(1);
-    $("overview-scope").textContent = state.project ? shortProject(state.project) : "全部项目";
+    state.overview = overview || {};
+    const t = overview.totals || overview;
+    const totalRuns = Number(t.total_runs || 0);
+    const failedRuns = Number(t.failed_runs || 0);
+    const passedRuns = t.passed_runs !== undefined
+      ? Number(t.passed_runs)
+      : Math.max(0, totalRuns - failedRuns);
+    const passRate = t.pass_rate !== undefined
+      ? Number(t.pass_rate)
+      : (totalRuns > 0 ? (passedRuns / totalRuns) * 100 : 0);
+
+    $("stat-runs").textContent = totalRuns.toLocaleString();
+    $("stat-runs-sub").textContent = `通过 ${passedRuns} · 未通过 ${failedRuns}`;
+
+    const passEl = $("stat-pass-rate");
+    passEl.textContent = totalRuns > 0 ? `${passRate.toFixed(1)}%` : "—";
+    passEl.className = "stat-value " + (totalRuns === 0 ? "" : passRate >= 80 ? "pass" : passRate >= 50 ? "warn" : "fail");
+    $("stat-pass-sub").textContent = totalRuns > 0 ? `${passedRuns}/${totalRuns} 次` : "暂无扫描";
+
+    $("stat-duration").textContent = Number(t.avg_duration_ms || 0).toFixed(1);
+
+    const recentRuns = Array.isArray(overview.recent_runs) ? overview.recent_runs : [];
+    const currentEscapes = t.latest_escapes !== undefined
+      ? Number(t.latest_escapes)
+      : (recentRuns.length ? Number(recentRuns[0].escapes_cnt || 0) : 0);
+    const escEl = $("stat-escapes");
+    escEl.textContent = (recentRuns.length || t.latest_escapes !== undefined) ? currentEscapes.toLocaleString() : "—";
+    escEl.className = "stat-value " + (currentEscapes > 0 ? "warn" : "pass");
+
+    if (t.candidate_mistakes !== undefined || t.pending_mistakes !== undefined) {
+      const candCount = Number(t.candidate_mistakes || 0);
+      const pendCount = Number(t.pending_mistakes || 0);
+      $("stat-candidates").textContent = pendCount.toLocaleString();
+      $("stat-candidates").className = "stat-value " + (pendCount > 0 ? "warn" : "");
+      $("stat-candidates-sub").textContent = `高频候选 ${candCount} · 共待审 ${pendCount}`;
+    }
+
+    $("stat-rules").textContent = Number(t.rule_count || 0).toLocaleString();
+
     renderTrend(Array.isArray(overview.trend) ? overview.trend : []);
+    renderRecentRuns(recentRuns);
   }
 
   function renderTrend(points) {
@@ -91,106 +266,375 @@
     svg.innerHTML = "";
     if (!points.length) {
       empty.hidden = false;
+      svg.style.display = "none";
       return;
     }
     empty.hidden = true;
+    svg.style.display = "block";
 
     const width = 1000;
-    const height = 180;
-    const left = 34;
-    const right = 16;
-    const top = 12;
+    const height = 190;
+    const left = 36;
+    const right = 24;
+    const top = 14;
     const bottom = 26;
     const plotW = width - left - right;
     const plotH = height - top - bottom;
+
+    const maxRuns = Math.max(1, ...points.map((p) => {
+      const passed = Number(p.passed || 0);
+      const failed = Number(p.failed || 0);
+      return Math.max(Number(p.runs || 0), passed + failed);
+    }));
     const maxEscapes = Math.max(1, ...points.map((p) => Number(p.escapes || 0)));
-    const maxRuns = Math.max(1, ...points.map((p) => Number(p.runs || 0)));
+    const maxDur = Math.max(1, ...points.map((p) => Number(p.avg_duration_ms || 0)));
+
     const n = points.length;
-    const barW = Math.min(34, Math.max(7, (plotW / n) * 0.48));
+    const barW = Math.min(28, Math.max(6, (plotW / n) * 0.48));
 
     const grid = [];
     for (let i = 0; i <= 3; i++) {
       const y = top + (plotH * i) / 3;
-      grid.push(`<line x1="${left}" y1="${y}" x2="${width - right}" y2="${y}" class="chart-grid" />`);
+      grid.push(`<line x1="${left}" y1="${y.toFixed(1)}" x2="${width - right}" y2="${y.toFixed(1)}" class="chart-grid" />`);
     }
 
-    const bars = points.map((point, index) => {
-      const x = left + (plotW / n) * (index + 0.5) - barW / 2;
-      const value = Number(point.escapes || 0);
-      const h = Math.max(1, (value / maxEscapes) * plotH);
-      const y = top + plotH - h;
-      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" rx="3" class="chart-bar"><title>${escapeHTML(point.bucket)} · escapes ${value}</title></rect>`;
+    const bars = points.map((p, i) => {
+      const cx = left + (plotW / n) * (i + 0.5);
+      const x = cx - barW / 2;
+      const passed = Number(p.passed || 0);
+      const failed = Number(p.failed || 0);
+      const total = passed + failed || Number(p.runs || 0);
+      const totalH = (total / maxRuns) * plotH;
+      const passH = total > 0 ? (passed / total) * totalH : 0;
+      const failH = totalH - passH;
+      const yPass = top + plotH - passH;
+      const yFail = yPass - failH;
+      const title = `${escapeHTML(p.bucket)} · 通过: ${passed}, 未通过: ${failed}, 逃生舱: ${p.escapes || 0}, 平均耗时: ${Number(p.avg_duration_ms || 0).toFixed(1)}ms`;
+      let rects = "";
+      if (passH > 0) {
+        rects += `<rect x="${x.toFixed(1)}" y="${yPass.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(1, passH).toFixed(1)}" rx="2" fill="var(--success)" opacity="0.78"><title>${title}</title></rect>`;
+      }
+      if (failH > 0) {
+        rects += `<rect x="${x.toFixed(1)}" y="${yFail.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(1, failH).toFixed(1)}" rx="2" fill="var(--error)" opacity="0.85"><title>${title}</title></rect>`;
+      }
+      return rects;
     }).join("");
 
-    const linePoints = points.map((point, index) => {
-      const x = left + (plotW / n) * (index + 0.5);
-      const value = Number(point.runs || 0);
-      const y = top + plotH - (value / maxRuns) * plotH * 0.72;
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    const escCoords = points.map((p, i) => {
+      const cx = left + (plotW / n) * (i + 0.5);
+      const y = top + plotH - (Number(p.escapes || 0) / maxEscapes) * plotH * 0.85;
+      return `${cx.toFixed(1)},${y.toFixed(1)}`;
     }).join(" ");
-    const line = `<polyline points="${linePoints}" class="chart-line" fill="none" />`;
+    const escLine = `<polyline points="${escCoords}" fill="none" stroke="var(--warning)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" />`;
 
-    const labels = points.map((point, index) => {
-      if (n > 9 && index % Math.ceil(n / 8) !== 0 && index !== n - 1) return "";
-      const x = left + (plotW / n) * (index + 0.5);
-      return `<text x="${x.toFixed(1)}" y="${height - 7}" text-anchor="middle" class="chart-label">${escapeHTML(point.bucket)}</text>`;
+    const durCoords = points.map((p, i) => {
+      const cx = left + (plotW / n) * (i + 0.5);
+      const y = top + plotH - (Number(p.avg_duration_ms || 0) / maxDur) * plotH * 0.75;
+      return `${cx.toFixed(1)},${y.toFixed(1)}`;
+    }).join(" ");
+    const durLine = `<polyline points="${durCoords}" fill="none" stroke="var(--accent)" stroke-width="1.75" stroke-dasharray="4 3" stroke-linejoin="round" />`;
+
+    const labels = points.map((p, i) => {
+      if (n > 10 && i % Math.ceil(n / 8) !== 0 && i !== n - 1) return "";
+      const cx = left + (plotW / n) * (i + 0.5);
+      return `<text x="${cx.toFixed(1)}" y="${height - 6}" text-anchor="middle" class="chart-label">${escapeHTML(p.bucket)}</text>`;
     }).join("");
 
     svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
-    svg.innerHTML = `${grid}${bars}${line}${labels}`;
+    svg.innerHTML = `${grid.join("")}${bars}${durLine}${escLine}${labels}`;
   }
 
-  function renderMistakes(mistakes) {
-    state.mistakes = mistakes;
-    const list = $("mistakes-list");
-    const empty = $("mistakes-empty");
-    list.innerHTML = "";
-    if (!mistakes.length) {
+  function renderRecentRuns(runs) {
+    const body = $("recent-runs-body");
+    const empty = $("recent-runs-empty");
+    $("recent-runs-count").textContent = `最近 ${runs.length} 次`;
+    body.innerHTML = "";
+    if (!runs.length) {
       empty.hidden = false;
       return;
     }
     empty.hidden = true;
-    for (const mistake of mistakes) {
-      const count = Number(mistake.count || 0);
-      const isHot = count >= 2;
-      const article = document.createElement("article");
-      article.className = "mistake-card" + (isHot ? " hot" : "");
-      const snippets = [];
-      if (mistake.bad_snippet) {
-        snippets.push(`<pre class="snippet bad">${escapeHTML(mistake.bad_snippet)}</pre>`);
-      }
-      if (mistake.good_snippet) {
-        snippets.push(`<pre class="snippet good">${escapeHTML(mistake.good_snippet)}</pre>`);
-      }
-      const status = mistake.status || "pending";
-      const statusClass = status === "pending" ? "pending" : status === "ignored" ? "ignored" : "active";
-      article.innerHTML = `
-        <div class="mistake-count">${count}</div>
-        <div class="mistake-main">
-          <p class="mistake-title">${escapeHTML(mistake.summary || "未命名错题")}</p>
-          <div class="mistake-meta">
-            <span class="pill ${statusClass}">${escapeHTML(status)}</span>
-            ${escapeHTML(mistake.category || "other")} · ${escapeHTML(shortProject(mistake.project_path))}
-            · ${formatDate(mistake.created_at)}
-          </div>
-          ${snippets.length ? `<div class="snippet-row">${snippets.join("")}</div>` : ""}
-        </div>
-        <div class="mistake-actions">
-          ${status === "pending" ? `<button class="button button-ghost" data-fingerprint="${escapeHTML(mistake.fingerprint)}" type="button">标记 ignored</button>` : ""}
-        </div>`;
-      const ignore = article.querySelector("button[data-fingerprint]");
-      if (ignore) {
-        ignore.addEventListener("click", () => ignoreMistake(mistake.fingerprint, ignore));
-      }
-      list.appendChild(article);
+    for (const run of runs) {
+      const tr = document.createElement("tr");
+      const passed = Boolean(run.passed);
+      tr.innerHTML = `
+        <td class="mono muted">${escapeHTML(formatShortTime(run.created_at))}</td>
+        <td class="mono" title="${escapeHTML(run.project_path)}">${escapeHTML(shortProject(run.project_path))}</td>
+        <td><span class="pill ${passed ? "pass" : "fail"}">${passed ? "通过" : "未通过"}</span></td>
+        <td class="num">${Number(run.escapes_cnt || 0)}</td>
+        <td class="num">${Number(run.duration_ms || 0)}ms</td>`;
+      body.appendChild(tr);
     }
   }
 
-  async function ignoreMistake(fingerprint, button) {
+  function renderProjectsTable(projects) {
+    const body = $("projects-body");
+    const empty = $("projects-empty");
+    $("projects-count").textContent = `${projects.length} 个项目`;
+    body.innerHTML = "";
+    if (!projects.length) {
+      empty.hidden = false;
+      return;
+    }
+    empty.hidden = true;
+    for (const p of projects) {
+      const tr = document.createElement("tr");
+      tr.className = "clickable";
+      const runs = Number(p.scan_count ?? p.total_runs ?? 0);
+      const passRate = p.pass_rate !== undefined ? `${Number(p.pass_rate).toFixed(0)}%` : "—";
+      const escapes = p.latest_escapes !== undefined ? Number(p.latest_escapes) : "—";
+      const pending = p.pending_mistakes !== undefined ? Number(p.pending_mistakes) : "—";
+      const guardCell = p.guard_enabled
+        ? '<span class="pill pass">守护中</span>'
+        : '<span class="muted">—</span>';
+      tr.innerHTML = `
+        <td>
+          <div style="font-weight:600">${escapeHTML(shortProject(p.project_path))}</div>
+          <div class="mono muted">${escapeHTML(p.project_path)}</div>
+        </td>
+        <td class="mono muted">${escapeHTML(formatShortTime(p.last_scan_at))}</td>
+        <td class="num">${runs}</td>
+        <td class="num">${passRate}</td>
+        <td class="num">${escapes}</td>
+        <td class="num">${pending}</td>
+        <td>${guardCell}</td>`;
+      tr.addEventListener("click", () => {
+        state.project = p.project_path;
+        localStorage.setItem("slopguard.project", state.project);
+        $("project-select").value = state.project;
+        updateTopbarProject();
+        refresh();
+      });
+      body.appendChild(tr);
+    }
+  }
+
+  // 错题栏（含 Agent 分析建议 + 人工校验）
+  function populateSelectOptions(selectEl, values, currentVal) {
+    const existing = Array.from(new Set(values.filter(Boolean))).sort();
+    selectEl.innerHTML = '<option value="">全部</option>';
+    for (const val of existing) {
+      const opt = document.createElement("option");
+      opt.value = val;
+      opt.textContent = val;
+      selectEl.appendChild(opt);
+    }
+    selectEl.value = existing.includes(currentVal) ? currentVal : "";
+  }
+
+  function normalizeReviewStatus(m) {
+    if (m.review_status) return m.review_status;
+    if (m.status === "ignored") return "ignored";
+    if (m.status === "applied" || m.status === "promoted") return "approved";
+    return m.ai_decision ? "pending_user" : "pending_ai";
+  }
+
+  function formatSourceLabel(src) {
+    const map = {
+      auto: "自动捕获",
+      verify: "自动捕获",
+      auto_verify: "自动体检",
+      auto_watch: "文件守护",
+      git_hook: "Git 钩子",
+      git_fix: "Git 返工",
+      session_claude: "Claude 会话",
+      session_codex: "Codex 会话",
+      session_antigravity: "Antigravity 会话",
+      manual: "手动记录",
+      cli: "CLI 记录",
+      agent: "Agent 记录",
+      mcp: "Agent 记录",
+    };
+    return map[src] || src || "未知来源";
+  }
+
+  function renderMistakes(mistakes) {
+    state.mistakes = mistakes;
+
+    const counts = {
+      pending_user: 0,
+      pending_ai: 0,
+      approved: 0,
+      ignored: 0,
+    };
+    let candidateCount = 0;
+    for (const m of mistakes) {
+      const rs = normalizeReviewStatus(m);
+      if (counts[rs] !== undefined) counts[rs]++;
+      if ((rs === "pending_user" || rs === "pending_ai") && (m.is_candidate || Number(m.count || 0) >= 2)) {
+        candidateCount++;
+      }
+    }
+
+    $("count-pending-user").textContent = String(counts.pending_user);
+    $("count-pending-ai").textContent = String(counts.pending_ai);
+    $("count-all-mistakes").textContent = String(mistakes.length);
+    $("count-approved").textContent = String(counts.approved);
+    $("count-ignored").textContent = String(counts.ignored);
+
+    const actionNeeded = counts.pending_user + counts.pending_ai;
+    $("stat-candidates").textContent = counts.pending_user.toLocaleString();
+    $("stat-candidates").className = "stat-value " + (counts.pending_user > 0 ? "warn" : "");
+    $("stat-candidates-sub").textContent = `待我校验 ${counts.pending_user} · 高频候选 ${candidateCount}`;
+
+    const badge = $("badge-mistakes");
+    badge.textContent = String(counts.pending_user || actionNeeded);
+    badge.hidden = actionNeeded === 0;
+
+    populateSelectOptions($("mistakes-filter-category"), mistakes.map((m) => m.category), $("mistakes-filter-category").value);
+    populateSelectOptions($("mistakes-filter-source"), mistakes.map((m) => m.source), $("mistakes-filter-source").value);
+
+    applyMistakeFilters();
+  }
+
+  function buildAnalyzePrompt(m) {
+    const fp = m.fingerprint || "";
+    const summary = m.summary || "未命名错题";
+    return `请调用 SlopGuard MCP 工具 sg_list_inbox 查看错题详情（fingerprint: ${fp}，摘要：${summary}），分析其是否值得沉淀为防线规则，并用通俗中文说明原因后调用 sg_submit_analysis 提交分析建议。`;
+  }
+
+  function applyMistakeFilters() {
+    const reviewF = state.reviewStatus;
+    const catF = $("mistakes-filter-category").value;
+    const srcF = $("mistakes-filter-source").value;
+    const q = $("mistakes-filter-q").value.trim().toLowerCase();
+
+    const filtered = state.mistakes.filter((m) => {
+      const rs = normalizeReviewStatus(m);
+      if (reviewF && rs !== reviewF) return false;
+      if (catF && m.category !== catF) return false;
+      if (srcF && m.source !== srcF) return false;
+      if (q) {
+        const hay = `${m.summary || ""} ${m.fingerprint || ""} ${m.bad_snippet || ""} ${m.good_snippet || ""} ${m.ai_reason || ""} ${m.category || ""}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+
+    $("mistakes-summary").textContent = `显示 ${filtered.length} / 共 ${state.mistakes.length} 条`;
+    const list = $("mistakes-list");
+    const empty = $("mistakes-empty");
+    list.innerHTML = "";
+    if (!filtered.length) {
+      empty.hidden = false;
+      return;
+    }
+    empty.hidden = true;
+
+    const statusBadgeMap = {
+      pending_user: { cls: "pending", text: "待我校验" },
+      pending_ai: { cls: "", text: "待 Agent 分析" },
+      approved: { cls: "pass", text: "已确认入库" },
+      ignored: { cls: "ignored", text: "已忽略" },
+    };
+
+    for (const m of filtered) {
+      const count = Number(m.count || 0);
+      const isCandidate = Boolean(m.is_candidate) || count >= 2;
+      const rs = normalizeReviewStatus(m);
+      const badgeInfo = statusBadgeMap[rs] || { cls: "", text: rs };
+
+      const card = document.createElement("article");
+      card.className = "mistake-card" + (rs === "pending_user" || (isCandidate && rs === "pending_ai") ? " candidate" : "");
+
+      const snippets = [];
+      if (m.bad_snippet) {
+        snippets.push(`<div class="snippet-box"><span class="snippet-label">错误示例</span><pre class="snippet bad">${escapeHTML(m.bad_snippet)}</pre></div>`);
+      }
+      if (m.good_snippet) {
+        snippets.push(`<div class="snippet-box"><span class="snippet-label">修复参考</span><pre class="snippet good">${escapeHTML(m.good_snippet)}</pre></div>`);
+      }
+
+      // Agent 分析建议区
+      let aiAdviceHTML = "";
+      if (rs === "pending_user" || m.ai_decision || m.ai_reason) {
+        const decision = String(m.ai_decision || "").toLowerCase();
+        const isApproveRec = decision === "recommend" || decision === "approve" || decision === "promote" || decision === "recommend_approve";
+        const decisionBadge = decision
+          ? `<span class="pill ${isApproveRec ? "warn" : "ignored"}">${isApproveRec ? "建议入库" : "建议忽略"}</span>`
+          : "";
+        const ruleDraftHTML = m.ai_rule_draft
+          ? `<pre class="code-block">${escapeHTML(m.ai_rule_draft)}</pre>`
+          : "";
+        aiAdviceHTML = `
+          <div class="ai-advice">
+            <div class="ai-advice-head">
+              <span class="ai-advice-title">Agent 分析建议 ${decisionBadge}</span>
+              ${m.ai_analyzed_at ? `<span class="muted mono">${escapeHTML(formatShortTime(m.ai_analyzed_at))}</span>` : ""}
+            </div>
+            <p class="ai-advice-reason">${escapeHTML(m.ai_reason || "Agent 已完成分析，请结合代码上下文确认是否入库为规则。")}</p>
+            ${ruleDraftHTML}
+          </div>`;
+      } else if (rs === "pending_ai") {
+        aiAdviceHTML = `
+          <div class="ai-advice pending-ai">
+            <div class="ai-advice-head">
+              <span class="ai-advice-title">等待 Agent 分析（通过 <code>sg_list_inbox</code> + <code>sg_submit_analysis</code>）</span>
+              <button class="btn btn-secondary btn-sm copy-prompt-btn" type="button">复制分析指令</button>
+            </div>
+            <p class="ai-advice-reason muted">点击右侧按钮复制提示词发送给你的编程 Agent，Agent 将自动评估该错题并给出中文理由与规则草案。</p>
+          </div>`;
+      }
+
+      // 人工校验操作按钮
+      const actionBtns = [];
+      if (rs !== "approved") {
+        actionBtns.push(`<button class="btn btn-primary btn-sm" data-action="approve" data-fp="${escapeHTML(m.fingerprint)}" type="button">确认入库</button>`);
+      }
+      if (rs !== "ignored") {
+        actionBtns.push(`<button class="btn btn-ghost btn-sm" data-action="ignore" data-fp="${escapeHTML(m.fingerprint)}" type="button">忽略</button>`);
+      } else {
+        actionBtns.push(`<button class="btn btn-secondary btn-sm" data-action="restore" data-fp="${escapeHTML(m.fingerprint)}" type="button">恢复</button>`);
+      }
+
+      card.innerHTML = `
+        <div class="mistake-count" title="出现 ${count} 次">${count}</div>
+        <div class="mistake-main">
+          <div class="mistake-title-row">
+            <h3 class="mistake-title">${escapeHTML(m.summary || "未命名错题")}</h3>
+            <span class="pill ${badgeInfo.cls}">${escapeHTML(badgeInfo.text)}</span>
+            ${isCandidate ? `<span class="pill warn">高频候选 &ge;2</span>` : ""}
+          </div>
+          <div class="mistake-meta">
+            <span>${escapeHTML(m.category || "general")}</span>
+            <span class="pill">${escapeHTML(formatSourceLabel(m.source))}</span>
+            <span class="pill">出现 ${count} 次</span>
+            ${m.fingerprint ? `<code class="pill mono" title="${escapeHTML(m.fingerprint)}">${escapeHTML(m.fingerprint.slice(0, 12))}</code>` : ""}
+            <span>${escapeHTML(shortProject(m.project_path))}</span>
+            <span>${escapeHTML(formatDate(m.updated_at || m.created_at))}</span>
+          </div>
+          ${snippets.length ? `<div class="snippet-row">${snippets.join("")}</div>` : ""}
+          ${aiAdviceHTML}
+        </div>
+        <div class="mistake-actions">${actionBtns.join("")}</div>`;
+
+      card.querySelectorAll("button[data-action]").forEach((btn) => {
+        btn.addEventListener("click", () => handleMistakeAction(btn.dataset.fp, btn.dataset.action, btn));
+      });
+
+      const copyBtn = card.querySelector(".copy-prompt-btn");
+      if (copyBtn) {
+        copyBtn.addEventListener("click", async () => {
+          const prompt = buildAnalyzePrompt(m);
+          try {
+            await navigator.clipboard.writeText(prompt);
+            copyBtn.textContent = "已复制";
+            setTimeout(() => { copyBtn.textContent = "复制分析指令"; }, 1800);
+          } catch {
+            copyBtn.textContent = "复制失败";
+          }
+        });
+      }
+
+      list.appendChild(card);
+    }
+  }
+
+  async function handleMistakeAction(fingerprint, action, button) {
     if (!fingerprint) return;
     button.disabled = true;
     try {
-      await api(`/api/mistakes/${encodeURIComponent(fingerprint)}/ignore`, { method: "POST" });
+      await api(`/api/mistakes/${encodeURIComponent(fingerprint)}/${action}`, { method: "POST" });
       await refresh();
     } catch (error) {
       button.disabled = false;
@@ -199,133 +643,1123 @@
     }
   }
 
-  function renderRules(rules) {
-    state.rules = rules;
-    const body = $("rules-body");
-    const empty = $("rules-empty");
+  // Agent 活动流
+  function renderEvents(events) {
+    state.events = events;
+    const badge = $("badge-events");
+    badge.textContent = String(events.length);
+    badge.hidden = events.length === 0;
+
+    populateSelectOptions($("events-filter-tool"), events.map((e) => e.tool || e.tool_name), $("events-filter-tool").value);
+    applyEventFilters();
+  }
+
+  function applyEventFilters() {
+    const toolF = $("events-filter-tool").value;
+    const q = $("events-filter-q").value.trim().toLowerCase();
+
+    const filtered = state.events.filter((e) => {
+      const tool = e.tool || e.tool_name || "";
+      if (toolF && tool !== toolF) return false;
+      if (q) {
+        const hay = `${tool} ${e.project_path || ""} ${e.args_summary || ""} ${e.summary || ""}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+
+    $("events-summary").textContent = `显示 ${filtered.length} / 共 ${state.events.length} 条活动`;
+    const body = $("events-body");
+    const empty = $("events-empty");
     body.innerHTML = "";
-    if (!rules.length) {
+    if (!filtered.length) {
       empty.hidden = false;
       return;
     }
     empty.hidden = true;
-    for (const rule of rules) {
-      const row = document.createElement("tr");
-      const scope = rule.scope || "project";
-      row.innerHTML = `
-        <td><span class="pill ${scope === "global" ? "active" : ""}">${escapeHTML(scope)}</span></td>
-        <td>${escapeHTML(rule.engine || "—")}</td>
-        <td><code>${escapeHTML(rule.rule_id || "—")}</code></td>
-        <td class="rule-reason">${escapeHTML(rule.rationale || "—")}</td>
-        <td>${formatDate(rule.created_at)}</td>
-        <td class="num">${Number(rule.hit_count || 0).toLocaleString()}</td>`;
-      body.appendChild(row);
+
+    for (const ev of filtered) {
+      const tr = document.createElement("tr");
+      const tool = ev.tool || ev.tool_name || "—";
+      const passed = ev.passed !== false && ev.status !== "intercepted" && ev.status !== "failed";
+      const findings = Number(ev.findings_cnt ?? ev.findings_count ?? 0);
+      const duration = Number(ev.duration_ms || 0);
+      const argsSummary = ev.args_summary || ev.summary || "—";
+      const detailText = ev.error_text ? `${argsSummary} · 错误: ${ev.error_text}` : argsSummary;
+
+      tr.innerHTML = `
+        <td class="mono muted">${escapeHTML(formatShortTime(ev.created_at))}</td>
+        <td class="mono" title="${escapeHTML(ev.project_path || "")}">${escapeHTML(shortProject(ev.project_path))}</td>
+        <td><code class="pill mono">${escapeHTML(tool)}</code></td>
+        <td class="args-summary" title="${escapeHTML(detailText)}">${escapeHTML(detailText)}</td>
+        <td><span class="pill ${passed ? "pass" : "fail"}">${passed ? "通过" : "已拦截"}</span></td>
+        <td class="num">${findings}</td>
+        <td class="num">${duration}ms</td>`;
+      body.appendChild(tr);
     }
   }
 
+  // 规则台账
+  function renderRules(rules) {
+    state.rules = rules;
+    const badge = $("badge-rules");
+    badge.textContent = String(rules.length);
+    badge.hidden = rules.length === 0;
+
+    populateSelectOptions($("rules-filter-engine"), rules.map((r) => r.engine), $("rules-filter-engine").value);
+    populateSelectOptions($("rules-filter-status"), rules.map((r) => r.status), $("rules-filter-status").value);
+
+    applyRuleFilters();
+  }
+
+  function applyRuleFilters() {
+    const engineF = $("rules-filter-engine").value;
+    const scopeF = $("rules-filter-scope").value;
+    const statusF = $("rules-filter-status").value;
+
+    const filtered = state.rules.filter((r) => {
+      if (engineF && r.engine !== engineF) return false;
+      if (scopeF && r.scope !== scopeF) return false;
+      if (statusF && r.status !== statusF) return false;
+      return true;
+    });
+
+    $("rules-summary").textContent = `显示 ${filtered.length} / 共 ${state.rules.length} 条规则`;
+    const body = $("rules-body");
+    const empty = $("rules-empty");
+    body.innerHTML = "";
+    if (!filtered.length) {
+      empty.hidden = false;
+      return;
+    }
+    empty.hidden = true;
+
+    for (const rule of filtered) {
+      const tr = document.createElement("tr");
+      const scope = rule.scope || "project";
+      const scopeLabel = scope === "global" ? "全局" : "项目级";
+      const ruleKey = rule.rule_key || rule.rule_id || "—";
+      const hasPayload = Boolean(rule.payload);
+      tr.innerHTML = `
+        <td><span class="pill ${scope === "global" ? "accent" : ""}">${escapeHTML(scopeLabel)}</span></td>
+        <td class="mono">${escapeHTML(rule.engine || "—")}</td>
+        <td><code>${escapeHTML(ruleKey)}</code></td>
+        <td>${escapeHTML(rule.rationale || "—")}</td>
+        <td>${rule.source ? `<span class="pill">${escapeHTML(formatSourceLabel(rule.source))}</span>` : "—"}</td>
+        <td class="mono muted">${escapeHTML(formatShortTime(rule.applied_at || rule.created_at))}</td>
+        <td class="num">${Number(rule.hit_count || 0).toLocaleString()}</td>
+        <td class="num">${hasPayload ? `<button class="btn btn-ghost btn-sm" type="button">查看</button>` : "—"}</td>`;
+      body.appendChild(tr);
+
+      if (hasPayload) {
+        const payloadTr = document.createElement("tr");
+        payloadTr.className = "payload-row";
+        payloadTr.hidden = true;
+        payloadTr.innerHTML = `<td colspan="8"><pre class="code-block">${escapeHTML(rule.payload)}</pre></td>`;
+        body.appendChild(payloadTr);
+
+        const toggleBtn = tr.querySelector("button");
+        toggleBtn.addEventListener("click", () => {
+          payloadTr.hidden = !payloadTr.hidden;
+          toggleBtn.textContent = payloadTr.hidden ? "查看" : "收起";
+        });
+      }
+    }
+  }
+
+  // 坏样本雷达与基线棘轮
   function renderRadar(data) {
-    state.radar = data;
-    $("radar-project").textContent = state.project ? shortProject(state.project) : "选择项目查看";
+    state.radar = data || {};
+    $("radar-project-badge").textContent = state.project ? shortProject(state.project) : "请选择项目";
+
+    const skipped = Array.isArray(data.skipped) ? data.skipped : [];
+    const skipBanner = $("radar-skipped-banner");
+    if (skipped.length) {
+      skipBanner.hidden = false;
+      skipBanner.innerHTML = `<strong>雷达已跳过 ${skipped.length} 个维度：</strong> ` +
+        skipped.map((s) => `<span class="mono">${escapeHTML(s.dimension || "?")}/${escapeHTML(s.tool || "?")}</span> (${escapeHTML(s.reason || "不可用")})`).join(" · ");
+    } else {
+      skipBanner.hidden = true;
+    }
+
     const baseline = data.baseline || {};
     const statePill = $("baseline-state");
+    $("baseline-updated").textContent = baseline.updated_at ? `更新时间：${formatDate(baseline.updated_at)}` : "更新时间：—";
     if (!baseline.available) {
       statePill.textContent = "未配置";
       statePill.className = "pill";
     } else {
-      statePill.textContent = baseline.passed ? "PASS" : "FAIL";
-      statePill.className = `pill ${baseline.passed ? "active" : "bad"}`;
+      statePill.textContent = baseline.passed ? "通过" : "未通过";
+      statePill.className = `pill ${baseline.passed ? "pass" : "fail"}`;
     }
+
+    const badgeRadar = $("badge-radar");
+    if (baseline.available) {
+      badgeRadar.textContent = baseline.passed ? "正常" : "超标";
+      badgeRadar.hidden = false;
+    } else {
+      badgeRadar.hidden = true;
+    }
+
     const metricList = $("baseline-list");
     metricList.innerHTML = "";
     const metrics = Array.isArray(baseline.metrics) ? baseline.metrics : [];
     if (!metrics.length) {
-      metricList.innerHTML = `<p class="empty">${baseline.available ? "baseline 中没有逃生舱指标。" : "尚未找到项目 baseline.json，先运行 slopguard init。"}</p>`;
+      metricList.innerHTML = `<p class="empty-state">${baseline.available ? "基线中暂无逃生舱指标。" : "未找到 baseline.json，请先运行 <code>slopguard init</code>。"}</p>`;
     } else {
-      const max = Math.max(1, ...metrics.map((metric) => Math.max(Number(metric.baseline || 0), Number(metric.current || 0))));
-      for (const metric of metrics) {
-        const width = Math.min(100, (Number(metric.current || 0) / max) * 100);
+      const head = document.createElement("div");
+      head.className = "metric-row metric-head";
+      head.innerHTML = `<span>指标</span><span class="metric-num">基线配额</span><span class="metric-num">当前</span><span class="metric-num">变化</span><span></span>`;
+      metricList.appendChild(head);
+
+      const max = Math.max(1, ...metrics.map((m) => Math.max(Number(m.baseline || 0), Number(m.current || 0))));
+      for (const m of metrics) {
+        const curr = Number(m.current || 0);
+        const base = Number(m.baseline || 0);
+        const delta = m.delta !== undefined ? Number(m.delta) : (curr - base);
+        const width = Math.min(100, (curr / max) * 100);
+        const deltaStr = delta > 0 ? `+${delta}` : String(delta);
+        const deltaCls = delta > 0 ? "delta-pos" : delta < 0 ? "delta-neg" : "delta-zero";
         const row = document.createElement("div");
         row.className = "metric-row";
-        row.innerHTML = `<span class="metric-name">${escapeHTML(metric.name)}</span>
-          <span class="metric-num">${Number(metric.baseline || 0)}</span>
-          <span class="metric-num">${Number(metric.current || 0)}</span>
-          <span class="metric-bar"><span class="${Number(metric.delta || 0) > 0 ? "over" : ""}" style="width:${width.toFixed(1)}%"></span></span>`;
+        row.innerHTML = `
+          <span class="mono">${escapeHTML(m.name)}</span>
+          <span class="metric-num muted">${base}</span>
+          <span class="metric-num">${curr}</span>
+          <span class="metric-num ${deltaCls}">${deltaStr}</span>
+          <span class="metric-bar"><span class="${delta > 0 ? "over" : ""}" style="width:${width.toFixed(1)}%"></span></span>`;
         metricList.appendChild(row);
       }
     }
 
-    const hotspots = Array.isArray(data.hotspots) ? data.hotspots : [];
-    const hotspotList = $("hotspot-list");
-    hotspotList.innerHTML = "";
-    if (!hotspots.length) {
-      hotspotList.innerHTML = `<p class="empty">暂无热点数据。</p>`;
+    const suppressed = Array.isArray(baseline.suppressed_files) ? baseline.suppressed_files : [];
+    const supWrap = $("suppressed-wrap");
+    if (suppressed.length) {
+      supWrap.hidden = false;
+      $("suppressed-count").textContent = String(suppressed.length);
+      $("suppressed-list").innerHTML = suppressed.map((f) => `<li>${escapeHTML(f)}</li>`).join("");
     } else {
-      for (const hotspot of hotspots) {
-        const row = document.createElement("div");
-        row.className = "hotspot-row";
-        row.innerHTML = `<span class="hotspot-file" title="${escapeHTML(hotspot.file)}">${escapeHTML(hotspot.file)}</span>
-          <span class="hotspot-score">${Number(hotspot.risk_score || 0)}</span>`;
-        hotspotList.appendChild(row);
+      supWrap.hidden = true;
+    }
+
+    const hotspots = Array.isArray(data.hotspots) ? data.hotspots : [];
+    $("hotspots-count").textContent = `${hotspots.length} 个文件`;
+    const body = $("hotspot-body");
+    const empty = $("hotspot-empty");
+    body.innerHTML = "";
+    if (!hotspots.length) {
+      empty.hidden = false;
+    } else {
+      empty.hidden = true;
+      for (const h of hotspots) {
+        const risk = Number(h.risk_score || 0);
+        const riskCls = risk >= 15 ? "high" : risk >= 7 ? "med" : "low";
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td class="hotspot-file" title="${escapeHTML(h.file)}">${escapeHTML(h.file)}</td>
+          <td class="num"><span class="risk-badge ${riskCls}">${risk}</span></td>
+          <td class="num">${Number(h.references || 0)}</td>
+          <td class="num">${Number(h.complexity || 0)}</td>
+          <td class="num">${Number(h.escapes || 0)}</td>
+          <td class="num">${Number(h.rework || 0)}</td>
+          <td class="num">${Number(h.dead_code || 0)}</td>
+          <td class="num">${Number(h.duplicate || 0)}</td>`;
+        body.appendChild(tr);
       }
     }
 
-    const screenshots = Array.isArray(data.screenshots) ? data.screenshots : [];
-    const grid = $("screenshot-grid");
-    grid.innerHTML = "";
-    if (!screenshots.length) {
-      grid.innerHTML = `<p class="empty">暂无 UI 截图。安装 Playwright 后运行 <code>slopguard verify --ui</code>。</p>`;
-    } else {
-      for (const shot of screenshots) {
-        const card = document.createElement("div");
-        card.className = "screenshot-card";
-        const img = document.createElement("img");
-        img.alt = shot.path;
-        img.loading = "lazy";
-        img.src = `/api/screenshot?${projectQuery({ path: shot.path })}`;
-        const label = document.createElement("span");
-        label.textContent = `${shot.path} · ${formatDate(shot.modified_at)}`;
-        card.append(img, label);
-        grid.appendChild(card);
+    renderScreenshots(Array.isArray(data.screenshots) ? data.screenshots : []);
+  }
+
+  // 适配器与配置
+  function renderKV(container, obj, emptyText) {
+    container.innerHTML = "";
+    if (!obj || typeof obj !== "object" || !Object.keys(obj).length) {
+      container.innerHTML = `<span class="muted">${escapeHTML(emptyText)}</span>`;
+      return;
+    }
+    const entries = flattenObject(obj);
+    for (const [k, v] of entries) {
+      const kEl = document.createElement("span");
+      kEl.className = "kv-key";
+      kEl.textContent = k;
+      const vEl = document.createElement("span");
+      vEl.className = "kv-val";
+      vEl.textContent = Array.isArray(v) ? v.join(", ") : String(v);
+      const mEl = document.createElement("span");
+      mEl.className = "kv-meta";
+      container.append(kEl, vEl, mEl);
+    }
+  }
+
+  function flattenObject(obj, prefix = "") {
+    const out = [];
+    for (const [k, v] of Object.entries(obj)) {
+      const key = prefix ? `${prefix}.${k}` : k;
+      if (v && typeof v === "object" && !Array.isArray(v)) {
+        out.push(...flattenObject(v, key));
+      } else {
+        out.push([key, v ?? "—"]);
       }
     }
+    return out;
+  }
+
+  function renderProjectMeta(meta) {
+    state.meta = meta;
+    const emptyProj = $("adapters-empty-project");
+    const content = $("adapters-content");
+    if (!state.project) {
+      emptyProj.hidden = false;
+      content.hidden = true;
+      return;
+    }
+    emptyProj.hidden = true;
+    content.hidden = false;
+
+    const adapters = Array.isArray(meta?.adapters) ? meta.adapters : [];
+    $("adapters-count").textContent = `${adapters.length} 个适配器`;
+
+    const list = $("adapters-list");
+    list.innerHTML = "";
+    if (!adapters.length) {
+      list.innerHTML = `<p class="empty-state">当前项目未检测到语言适配器。</p>`;
+    } else {
+      for (const a of adapters) {
+        const card = document.createElement("div");
+        card.className = "adapter-card";
+        const exts = Array.isArray(a.extensions) ? a.extensions : [];
+        const checks = Array.isArray(a.checks) ? a.checks : [];
+        const patterns = Array.isArray(a.escape_patterns) ? a.escape_patterns : [];
+
+        const checksHTML = checks.length
+          ? `<div class="sub-block-title">检查项 (${checks.length})</div>
+             <table class="mini-table">
+               <thead><tr><th>ID</th><th>命令</th><th>可选</th><th>超时</th></tr></thead>
+               <tbody>${checks.map((c) => `
+                 <tr>
+                   <td class="mono">${escapeHTML(c.id)}</td>
+                   <td class="mono">${escapeHTML(Array.isArray(c.cmd) ? c.cmd.join(" ") : (c.cmd || ""))}</td>
+                   <td>${c.optional ? "是" : "否"}</td>
+                   <td class="mono">${c.timeout_sec ? `${c.timeout_sec}s` : "—"}</td>
+                 </tr>`).join("")}
+               </tbody>
+             </table>`
+          : "";
+
+        const patternsHTML = patterns.length
+          ? `<div class="sub-block-title">逃生舱正则 (${patterns.length})</div>
+             <table class="mini-table">
+               <thead><tr><th>名称</th><th>正则</th></tr></thead>
+               <tbody>${patterns.map((p) => `
+                 <tr>
+                   <td>${escapeHTML(p.name)}</td>
+                   <td class="mono">${escapeHTML(p.regex)}</td>
+                 </tr>`).join("")}
+               </tbody>
+             </table>`
+          : "";
+
+        card.innerHTML = `
+          <div class="adapter-head">
+            <span class="adapter-name">${escapeHTML(a.name)}</span>
+            <div class="pill-row">${exts.map((e) => `<span class="pill mono">${escapeHTML(e)}</span>`).join("")}</div>
+          </div>
+          ${checksHTML}
+          ${patternsHTML}`;
+        list.appendChild(card);
+      }
+    }
+
+    const cfg = meta?.config || null;
+    const cfgLoaded = Boolean(cfg && cfg.exists !== false);
+    $("config-status").textContent = cfgLoaded ? "已加载" : "缺失";
+    $("config-status").className = `pill ${cfgLoaded ? "pass" : ""}`;
+    renderKV($("config-kv"), cfgLoaded ? cfg : null, "未找到 .slopguard/config.yaml。");
+
+    const uiCfg = meta?.ui_config || meta?.ui || null;
+    const uiLoaded = Boolean(uiCfg && uiCfg.exists !== false);
+    $("ui-config-status").textContent = uiLoaded ? "已加载" : "未配置";
+    $("ui-config-status").className = `pill ${uiLoaded ? "pass" : ""}`;
+    renderKV($("ui-config-kv"), uiLoaded ? uiCfg : null, "未配置 .slopguard/ui.yaml。");
+  }
+
+  // 添加项目弹窗与原生文件夹选择
+  function openAddProjectModal() {
+    $("add-project-modal").hidden = false;
+    $("add-project-feedback").hidden = true;
+    $("add-project-feedback").textContent = "";
+    $("add-project-path").focus();
+  }
+
+  function closeAddProjectModal() {
+    $("add-project-modal").hidden = true;
+  }
+
+  async function pickFolder() {
+    const btn = $("btn-pick-folder");
+    const feedback = $("add-project-feedback");
+    btn.disabled = true;
+    try {
+      const res = await api("/api/pick-folder");
+      if (res.ok && res.path) {
+        $("add-project-path").value = res.path;
+        feedback.hidden = true;
+      } else if (!res.cancelled && res.error) {
+        feedback.hidden = false;
+        feedback.textContent = res.error;
+      }
+    } catch (error) {
+      feedback.hidden = false;
+      feedback.textContent = `打开文件夹选择器失败：${error.message}`;
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function submitAddProject() {
+    const path = $("add-project-path").value.trim();
+    const feedback = $("add-project-feedback");
+    const btn = $("btn-submit-add-project");
+    if (!path) {
+      feedback.hidden = false;
+      feedback.textContent = "请先选择或输入项目目录路径。";
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = "正在初始化与体检…";
+    feedback.hidden = false;
+    feedback.textContent = "正在初始化项目配置并运行首次全量体检，请稍候…";
+    try {
+      const res = await api("/api/projects/add", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+      });
+      state.project = res.project || path;
+      localStorage.setItem("slopguard.project", state.project);
+      closeAddProjectModal();
+      await loadProjects();
+      updateTopbarProject();
+      await refresh();
+    } catch (error) {
+      feedback.hidden = false;
+      feedback.textContent = error.message;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "初始化并首次体检";
+    }
+  }
+
+  // 基线操作
+  async function runBaselineAction(mode) {
+    if (!state.project) {
+      alert("请先在左侧工作区选择一个具体项目。");
+      return;
+    }
+    if (mode === "reset" && !confirm("确认将基线重置为当前项目的逃生舱数量吗？")) {
+      return;
+    }
+    const btn = $(mode === "tighten" ? "btn-baseline-tighten" : "btn-baseline-reset");
+    if (btn) btn.disabled = true;
+    try {
+      await api(`/api/baseline/${mode}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project: state.project }),
+      });
+      await refreshRadar();
+    } catch (error) {
+      alert(error.message);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  // Diff 预览弹窗 + AI Agent (MCP & Skill) 安全接入与一键还原
+  function renderDiffHTML(diffText, action, hasChanges) {
+    if (!diffText) {
+      if (action === "restore") {
+        return '<span class="diff-line head">当前文件与原始备份一致或未接入 SlopGuard，无需还原。</span>';
+      }
+      return hasChanges
+        ? '<span class="diff-line head">（空变更）</span>'
+        : '<span class="diff-line head">目标文件已包含最新 SlopGuard 配置，无需修改。</span>';
+    }
+    return diffText
+      .split("\n")
+      .map((line) => {
+        let cls = "diff-line";
+        if (line.startsWith("+++") || line.startsWith("---")) {
+          cls += " head";
+        } else if (line.startsWith("@@")) {
+          cls += " hunk";
+        } else if (line.startsWith("+")) {
+          cls += " add";
+        } else if (line.startsWith("-")) {
+          cls += " del";
+        }
+        return `<span class="${cls}">${escapeHTML(line)}</span>`;
+      })
+      .join("");
+  }
+
+  function closeDiffModal() {
+    $("diff-preview-modal").hidden = true;
+    state.diffPreview = null;
+  }
+
+  function openDiffModal(preview) {
+    state.diffPreview = preview;
+    const isRestore = preview.action === "restore";
+    const kindLabel = preview.kind === "skill" ? "Skill / 规则" : "MCP 配置";
+    $("diff-preview-title").textContent = isRestore
+      ? `预览撤销 / 还原 ${kindLabel}：${preview.name || preview.target_id}`
+      : `预览写入 ${kindLabel}：${preview.name || preview.target_id}`;
+    $("diff-scope-pill").textContent = preview.scope === "global" ? "全局配置" : "项目级配置";
+    $("diff-scope-pill").className = `pill ${preview.scope === "global" ? "warn" : "accent"}`;
+    $("diff-preview-path").textContent = preview.config_path || "";
+    $("diff-global-warning").hidden = preview.scope !== "global" || isRestore;
+    $("diff-preview-content").innerHTML = renderDiffHTML(preview.diff, preview.action, preview.has_changes);
+
+    const feedback = $("diff-preview-feedback");
+    feedback.hidden = true;
+    feedback.textContent = "";
+    if (preview.has_backup && preview.backup_at) {
+      feedback.hidden = false;
+      feedback.textContent = `已存在原配置备份（${formatDate(preview.backup_at)}），支持随时还原。`;
+    }
+
+    const confirmBtn = $("btn-confirm-diff-apply");
+    confirmBtn.disabled = false;
+    confirmBtn.textContent = isRestore
+      ? (preview.has_backup ? "确认从备份还原" : "确认撤销接入")
+      : (preview.scope === "global" ? "我已确认 Diff，写入全局配置" : "确认写入");
+
+    $("diff-preview-modal").hidden = false;
+  }
+
+  async function previewTargetChange(kind, item, action) {
+    const endpoint = kind === "skill" ? "/api/skills/preview" : "/api/mcp-clients/preview";
+    const preview = await api(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_id: item.id,
+        target_id: item.id,
+        project: state.project || "",
+        action,
+      }),
+    });
+    openDiffModal(preview);
+  }
+
+  async function confirmDiffApply() {
+    const preview = state.diffPreview;
+    if (!preview) return;
+    const confirmBtn = $("btn-confirm-diff-apply");
+    const feedback = $("diff-preview-feedback");
+    confirmBtn.disabled = true;
+    const isRestore = preview.action === "restore";
+    confirmBtn.textContent = isRestore ? "正在还原…" : "正在备份并写入…";
+
+    try {
+      let endpoint;
+      if (preview.kind === "skill") {
+        endpoint = isRestore ? "/api/skills/restore" : "/api/skills/install";
+      } else {
+        endpoint = isRestore ? "/api/mcp-clients/restore" : "/api/mcp-clients/install";
+      }
+      await api(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          client_id: preview.client_id || preview.target_id,
+          target_id: preview.target_id || preview.client_id,
+          project: state.project || "",
+          confirmed: true,
+        }),
+      });
+      closeDiffModal();
+      await loadMCPClients();
+    } catch (error) {
+      feedback.hidden = false;
+      feedback.textContent = `操作失败：${error.message}`;
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = isRestore ? "确认还原" : "确认写入";
+    }
+  }
+
+  function renderTargetList(container, items, kind, emptyMessage) {
+    if (!container) return;
+    container.innerHTML = "";
+    if (!items.length) {
+      container.innerHTML = `<p class="empty-state">${escapeHTML(emptyMessage)}</p>`;
+      return;
+    }
+    for (const item of items) {
+      const row = document.createElement("div");
+      row.className = "mcp-client-row";
+      const statusPill = item.configured
+        ? '<span class="pill pass">已接入</span>'
+        : (item.detected ? '<span class="pill warn">未接入</span>' : '<span class="pill">未检测到</span>');
+      const recPill = item.recommended ? '<span class="pill accent">推荐</span>' : "";
+      const backupPill = item.has_backup ? '<span class="pill" title="已自动备份至 ~/.slopguard/backups/">已备份</span>' : "";
+      const applyLabel = item.configured ? "预览更新" : "预览并接入";
+      const restoreLabel = item.has_backup ? "一键还原" : "撤销接入";
+      const restoreBtnHTML = (item.configured || item.has_backup)
+        ? `<button class="btn btn-sm btn-ghost" data-op="restore" type="button">${restoreLabel}</button>`
+        : "";
+
+      row.innerHTML = `
+        <div class="mcp-client-info">
+          <div class="mcp-client-title">
+            <span>${escapeHTML(item.name)}</span>
+            ${recPill}
+            ${statusPill}
+            ${backupPill}
+          </div>
+          <div class="mcp-client-path mono" title="${escapeHTML(item.config_path)}">${escapeHTML(item.config_path)}</div>
+        </div>
+        <div class="mcp-client-actions">
+          ${restoreBtnHTML}
+          <button class="btn btn-sm ${item.configured ? "btn-secondary" : "btn-primary"}" data-op="install" type="button">${applyLabel}</button>
+        </div>`;
+
+      row.querySelector('button[data-op="install"]').addEventListener("click", async (e) => {
+        const btn = e.currentTarget;
+        btn.disabled = true;
+        try {
+          await previewTargetChange(kind, item, "install");
+        } catch (error) {
+          alert(`预览失败：${error.message}`);
+        } finally {
+          btn.disabled = false;
+        }
+      });
+
+      const restoreBtn = row.querySelector('button[data-op="restore"]');
+      if (restoreBtn) {
+        restoreBtn.addEventListener("click", async (e) => {
+          const btn = e.currentTarget;
+          btn.disabled = true;
+          try {
+            await previewTargetChange(kind, item, "restore");
+          } catch (error) {
+            alert(`预览还原失败：${error.message}`);
+          } finally {
+            btn.disabled = false;
+          }
+        });
+      }
+      container.appendChild(row);
+    }
+  }
+
+  async function loadMCPClients() {
+    const mcpContainer = $("mcp-clients-list");
+    const skillContainer = $("skill-targets-list");
+    if (!mcpContainer) return;
+    try {
+      const data = await api(`/api/mcp-clients?${projectQuery()}`);
+      const clients = Array.isArray(data.clients) ? data.clients : [];
+      const skillTargets = Array.isArray(data.skills) ? data.skills : [];
+      renderTargetList(mcpContainer, clients, "mcp", "未探测到支持的 AI 客户端配置路径。");
+      renderTargetList(skillContainer, skillTargets, "skill", "选择一个具体项目后可一键部署项目级 SKILL.md / Cursor Rule。");
+    } catch (error) {
+      mcpContainer.innerHTML = `<p class="empty-state">加载 Agent 客户端列表失败：${escapeHTML(error.message)}</p>`;
+      if (skillContainer) skillContainer.innerHTML = "";
+    }
+  }
+
+  // 后台无感自动守护
+  async function loadGuardStatus() {
+    try {
+      const data = await api(`/api/guard/status?${projectQuery()}`);
+      state.guardStatus = data;
+      renderGuardStatus(data);
+    } catch (error) {
+      console.error(error);
+    }
+  }
+
+  function renderGuardStatus(data) {
+    const topbarPill = $("topbar-guard-pill");
+    const badge = $("guard-project-badge");
+    const emptyEl = $("guard-empty-project");
+    const controlsEl = $("guard-controls");
+
+    const guardedCount = Number(data?.guarded_projects || 0);
+    const st = data?.status || null;
+
+    if (!state.project || !st) {
+      if (badge) badge.textContent = "全部项目";
+      if (emptyEl) emptyEl.hidden = false;
+      if (controlsEl) controlsEl.hidden = true;
+      if (topbarPill) {
+        if (guardedCount > 0) {
+          topbarPill.hidden = false;
+          topbarPill.textContent = `已守护 ${guardedCount} 个项目`;
+          topbarPill.className = "pill pass";
+        } else {
+          topbarPill.hidden = true;
+        }
+      }
+      return;
+    }
+
+    if (badge) badge.textContent = shortProject(state.project);
+    if (emptyEl) emptyEl.hidden = true;
+    if (controlsEl) controlsEl.hidden = false;
+
+    const active = Boolean(st.enabled || st.hook_installed);
+    if (topbarPill) {
+      topbarPill.hidden = !active;
+      topbarPill.textContent = st.running ? "自动体检中…" : "自动守护中";
+      topbarPill.className = `pill ${st.running ? "accent" : "pass"}`;
+    }
+
+    const watchPill = $("guard-watch-pill");
+    const watchDetail = $("guard-watch-detail");
+    const watchBtn = $("btn-toggle-guard-watch");
+    if (st.running) {
+      watchPill.textContent = "体检中…";
+      watchPill.className = "pill accent";
+    } else if (st.enabled) {
+      watchPill.textContent = "监听中";
+      watchPill.className = "pill pass";
+    } else {
+      watchPill.textContent = "未开启";
+      watchPill.className = "pill";
+    }
+    if (st.last_error) {
+      watchDetail.textContent = `最近异常：${st.last_error}`;
+    } else if (st.last_scan_at) {
+      const outcomeText = st.last_passed === false ? `发现 ${st.last_findings || 0} 项问题（已记入错题栏）` : "通过";
+      watchDetail.textContent = `最近自动守护体检 (${formatShortTime(st.last_scan_at)})：${outcomeText}`;
+    } else {
+      watchDetail.textContent = `检测到项目文件变更并稳定 ${st.debounce_sec || 5} 秒后自动后台局部体检`;
+    }
+    watchBtn.textContent = st.enabled ? "关闭守护" : "开启守护";
+    watchBtn.className = `btn btn-sm ${st.enabled ? "btn-ghost" : "btn-primary"}`;
+
+    const hookPill = $("guard-hook-pill");
+    const hookDetail = $("guard-hook-detail");
+    const hookBtn = $("btn-toggle-guard-hook");
+    if (!st.is_git_repo) {
+      hookPill.textContent = "非 Git 仓库";
+      hookPill.className = "pill";
+      hookDetail.textContent = "当前目录未检测到 .git，无法安装 Git post-commit 钩子";
+      hookBtn.disabled = true;
+      hookBtn.textContent = "不可用";
+    } else {
+      hookBtn.disabled = false;
+      if (st.hook_installed) {
+        hookPill.textContent = "已安装";
+        hookPill.className = "pill pass";
+        hookDetail.textContent = `已安装非阻塞钩子 (${st.hook_path || ".git/hooks/post-commit"})，提交后后台静默留痕`;
+        hookBtn.textContent = "移除钩子";
+        hookBtn.className = "btn btn-sm btn-ghost";
+      } else {
+        hookPill.textContent = "未安装";
+        hookPill.className = "pill warn";
+        hookDetail.textContent = "提交后后台静默记录错题，绝不阻塞 git commit（写入前自动备份原钩子）";
+        hookBtn.textContent = "安装钩子";
+        hookBtn.className = "btn btn-sm btn-secondary";
+      }
+    }
+  }
+
+  async function toggleGuard(patch) {
+    if (!state.project) {
+      alert("请先在左侧工作区选择一个具体项目。");
+      return;
+    }
+    const watchBtn = $("btn-toggle-guard-watch");
+    const hookBtn = $("btn-toggle-guard-hook");
+    if (watchBtn) watchBtn.disabled = true;
+    if (hookBtn) hookBtn.disabled = true;
+    try {
+      await api("/api/guard/toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project: state.project, ...patch }),
+      });
+      await Promise.all([loadGuardStatus(), loadProjects()]);
+    } catch (error) {
+      alert(`守护设置失败：${error.message}`);
+    } finally {
+      if (watchBtn) watchBtn.disabled = false;
+      if (hookBtn) hookBtn.disabled = false;
+    }
+  }
+
+  // 只读本地 Agent 会话与 Git 返工嗅探
+  function selectReviewTab(reviewStatus) {
+    state.reviewStatus = reviewStatus ?? "";
+    document.querySelectorAll("#mistakes-review-tabs .review-pill").forEach((b) => {
+      b.classList.toggle("active", (b.dataset.reviewStatus ?? "") === state.reviewStatus);
+    });
+    applyMistakeFilters();
+  }
+
+  async function scanLocalSessions() {
+    const btn = $("btn-scan-sessions");
+    const banner = $("session-scan-banner");
+    if (!btn) return;
+    btn.disabled = true;
+    btn.textContent = "嗅探中…";
+    try {
+      const res = await api("/api/sessions/scan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project: state.project || "", days: 14 }),
+      });
+      const sc = res.scanned || {};
+      if (banner) {
+        banner.hidden = false;
+        banner.innerHTML = `<strong>只读嗅探完成（近 ${res.days || 14} 天，零文件修改）：</strong>` +
+          `已扫描 Git 提交 ${sc.git_commits || 0} 条、Claude 日志 ${sc.claude_files || 0} 份、Codex 日志 ${sc.codex_files || 0} 份、Antigravity 日志 ${sc.antigravity_files || 0} 份；` +
+          `提取高信号错误 <strong>${res.found || 0}</strong> 条，写入错题栏 <strong>${res.imported || 0}</strong> 条。`;
+      }
+      await refresh();
+      if ((res.imported || 0) > 0 && state.reviewStatus === "pending_user") {
+        const hasPendingUser = state.mistakes.some((m) => normalizeReviewStatus(m) === "pending_user");
+        if (!hasPendingUser) {
+          selectReviewTab("pending_ai");
+        }
+      }
+    } catch (error) {
+      if (banner) {
+        banner.hidden = false;
+        banner.textContent = `嗅探失败：${error.message}`;
+      }
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "嗅探会话与返工";
+    }
+  }
+
+  // 体检与 UI
+  async function runVerify(withUI) {
+    if (state.verifying) return;
+    if (!state.project) {
+      switchTab("verify");
+      $("verify-status-pill").textContent = "请先选择一个项目";
+      $("verify-status-pill").className = "pill warn";
+      return;
+    }
+
+    state.verifying = true;
+    const buttons = [$("btn-run-verify"), $("btn-run-verify-ui"), $("verify-tab-run"), $("verify-tab-run-ui")];
+    buttons.forEach((b) => { b.disabled = true; });
+    $("verify-status-pill").textContent = withUI ? "正在执行体检 + UI..." : "正在执行体检...";
+    $("verify-status-pill").className = "pill accent";
+    switchTab("verify");
+
+    try {
+      const payload = {
+        project: state.project,
+        all: $("verify-opt-all").checked,
+        ui: Boolean(withUI),
+        record: $("verify-opt-record").checked,
+      };
+      const result = await api("/api/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      renderVerifyResult(result);
+      await refresh();
+    } catch (error) {
+      $("verify-status-pill").textContent = `错误：${error.message}`;
+      $("verify-status-pill").className = "pill fail";
+    } finally {
+      state.verifying = false;
+      buttons.forEach((b) => { b.disabled = false; });
+    }
+  }
+
+  function renderVerifyResult(res) {
+    state.verifyResult = res;
+    $("verify-result-wrap").hidden = false;
+    const passed = Boolean(res.passed);
+    $("verify-status-pill").textContent = passed ? "通过" : "未通过";
+    $("verify-status-pill").className = `pill ${passed ? "pass" : "fail"}`;
+
+    const badge = $("badge-verify");
+    badge.textContent = passed ? "通过" : "未通过";
+    badge.hidden = false;
+
+    const passEl = $("verify-res-passed");
+    passEl.textContent = passed ? "通过" : "未通过";
+    passEl.className = `stat-value ${passed ? "pass" : "fail"}`;
+
+    const findings = Array.isArray(res.findings) ? res.findings : [];
+    $("verify-res-findings").textContent = String(findings.length);
+    const escapesCount = Array.isArray(res.escapes)
+      ? res.escapes.length
+      : (res.escapes && typeof res.escapes === "object"
+        ? Object.values(res.escapes).reduce((a, b) => a + Number(b || 0), 0)
+        : Number(res.escapes || 0));
+    $("verify-res-escapes").textContent = String(escapesCount);
+    $("verify-res-duration").textContent = res.duration_ms !== undefined ? String(res.duration_ms) : "—";
+
+    const skipped = Array.isArray(res.skipped_details) ? res.skipped_details : [];
+    const skipBanner = $("verify-skipped-banner");
+    if (skipped.length) {
+      skipBanner.hidden = false;
+      skipBanner.innerHTML = `<strong>已跳过检查项：</strong> ` +
+        skipped.map((s) => `<span class="mono">${escapeHTML(s.id || s.tool || s.name || "?")}</span> (${escapeHTML(s.reason || "已跳过")})`).join(" · ");
+    } else {
+      skipBanner.hidden = true;
+    }
+
+    $("verify-findings-count").textContent = `${findings.length} 项`;
+    const body = $("verify-findings-body");
+    const empty = $("verify-findings-empty");
+    body.innerHTML = "";
+    if (!findings.length) {
+      empty.hidden = false;
+    } else {
+      empty.hidden = true;
+      for (const f of findings) {
+        const sev = (f.severity || "warn").toLowerCase();
+        const sevCls = sev === "error" || sev === "high" ? "fail" : sev === "info" ? "accent" : "warn";
+        const col = f.column ?? f.col;
+        const loc = [f.file, f.line, col].filter((x) => x !== undefined && x !== "" && x !== 0).join(":");
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td><span class="pill ${sevCls}">${escapeHTML(f.severity || "warn")}</span></td>
+          <td class="mono">${escapeHTML(f.rule || f.rule_id || f.check || "—")}</td>
+          <td class="mono">${escapeHTML(loc || "—")}</td>
+          <td>${escapeHTML(f.message || "—")}</td>`;
+        body.appendChild(tr);
+      }
+    }
+
+    const uiCard = $("verify-ui-card");
+    if (res.ui) {
+      uiCard.hidden = false;
+      const uiPassed = res.ui.passed !== false;
+      $("verify-ui-pill").textContent = uiPassed ? "通过" : "未通过";
+      $("verify-ui-pill").className = `pill ${uiPassed ? "pass" : "fail"}`;
+      const uiBody = $("verify-ui-body");
+      uiBody.innerHTML = `<div class="kv"></div>`;
+      renderKV(uiBody.firstElementChild, res.ui, "暂无 UI 详情。");
+    } else {
+      uiCard.hidden = true;
+    }
+  }
+
+  function renderScreenshots(screenshots) {
+    const grid = $("screenshot-grid");
+    const empty = $("screenshot-empty");
+    $("screenshots-count").textContent = `${screenshots.length} 张截图`;
+    grid.innerHTML = "";
+    if (!screenshots.length) {
+      empty.hidden = false;
+      return;
+    }
+    empty.hidden = true;
+    for (const shot of screenshots) {
+      const card = document.createElement("div");
+      card.className = "screenshot-card";
+      const src = `/api/screenshot?${projectQuery({ path: shot.path })}`;
+      const img = document.createElement("img");
+      img.alt = shot.path;
+      img.loading = "lazy";
+      img.src = src;
+      const label = document.createElement("span");
+      label.textContent = `${shot.path} · ${formatShortTime(shot.modified_at)}`;
+      card.append(img, label);
+      card.addEventListener("click", () => openLightbox(src, shot.path));
+      grid.appendChild(card);
+    }
+  }
+
+  function openLightbox(src, caption) {
+    $("lightbox-img").src = src;
+    $("lightbox-caption").textContent = caption;
+    $("lightbox").hidden = false;
+  }
+
+  function closeLightbox() {
+    $("lightbox").hidden = true;
+    $("lightbox-img").src = "";
+  }
+
+  // 刷新周期
+  async function refreshOverview() {
+    const overview = await api(`/api/overview?${projectQuery({ granularity: state.granularity })}`);
+    renderOverview(overview);
+  }
+
+  async function refreshRadar() {
+    const radar = await api(`/api/radar?${projectQuery({ top: state.radarTop })}`);
+    renderRadar(radar);
   }
 
   async function refresh() {
     $("refresh-button").disabled = true;
     try {
-      const query = projectQuery();
-      const [overview, mistakes, rules, radar] = await Promise.all([
-        api(`/api/overview?${query}`),
-        api(`/api/mistakes?${query}`),
-        api(`/api/rules?${query}`),
-        api(`/api/radar?${query}`),
-      ]);
+      const reqs = [
+        api(`/api/overview?${projectQuery({ granularity: state.granularity })}`),
+        api(`/api/mistakes?${projectQuery()}`),
+        api(`/api/events?${projectQuery({ limit: 100 })}`).catch(() => ({ events: [] })),
+        api(`/api/rules?${projectQuery()}`),
+        api(`/api/radar?${projectQuery({ top: state.radarTop })}`),
+        api("/api/projects"),
+      ];
+      if (state.project) {
+        reqs.push(api(`/api/project-meta?${projectQuery()}`).catch(() => null));
+      }
+      const [overview, mistakes, eventsData, rules, radar, projectsData, meta] = await Promise.all(reqs);
+
+      if (projectsData && Array.isArray(projectsData.projects)) {
+        state.projects = projectsData.projects;
+        renderProjectsTable(state.projects);
+        updateTopbarProject();
+      }
       renderOverview(overview);
       renderMistakes(Array.isArray(mistakes.mistakes) ? mistakes.mistakes : []);
+      renderEvents(Array.isArray(eventsData?.events) ? eventsData.events : []);
       renderRules(Array.isArray(rules.rules) ? rules.rules : []);
       renderRadar(radar);
-      $("last-updated").textContent = `更新于 ${new Date().toLocaleTimeString()}`;
+      renderProjectMeta(meta || null);
+      await Promise.all([loadMCPClients(), loadGuardStatus()]);
+
+      $("last-updated").textContent = `更新于 ${new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
     } catch (error) {
       console.error(error);
-      $("last-updated").textContent = `加载失败：${error.message}`;
+      $("last-updated").textContent = `错误：${error.message}`;
     } finally {
       $("refresh-button").disabled = false;
     }
   }
 
+  window.slopguardSwitchTab = (tab) => switchTab(tab);
+
   async function start() {
-    await loadProjects();
-    await refresh();
-    $("project-select").addEventListener("change", async (event) => {
-      state.project = event.target.value;
+    applyTheme(state.theme);
+    const hashMatch = (window.location.hash || "").match(/tab=([a-z]+)/i);
+    if (hashMatch) {
+      state.tab = hashMatch[1];
+    }
+    switchTab(state.tab);
+
+    // 主题按钮
+    document.querySelectorAll(".theme-btn").forEach((btn) => {
+      btn.addEventListener("click", () => applyTheme(btn.dataset.themeChoice));
+    });
+
+    // 导航标签
+    document.querySelectorAll(".nav-item").forEach((btn) => {
+      btn.addEventListener("click", () => switchTab(btn.dataset.tab));
+    });
+
+    // 移动端侧边栏
+    $("sidebar-toggle").addEventListener("click", openSidebar);
+    $("sidebar-close").addEventListener("click", closeSidebar);
+    $("sidebar-backdrop").addEventListener("click", closeSidebar);
+
+    // 趋势粒度
+    document.querySelectorAll(".seg-btn[data-granularity]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        state.granularity = btn.dataset.granularity;
+        document.querySelectorAll(".seg-btn[data-granularity]").forEach((b) => {
+          b.classList.toggle("active", b === btn);
+        });
+        await refreshOverview().catch(console.error);
+      });
+    });
+
+    // 雷达热点数量
+    $("radar-top-select").addEventListener("change", async (e) => {
+      state.radarTop = e.target.value;
+      await refreshRadar().catch(console.error);
+    });
+
+    // 错题栏审核状态筛选胶囊与会话嗅探
+    document.querySelectorAll("#mistakes-review-tabs .review-pill").forEach((btn) => {
+      btn.addEventListener("click", () => selectReviewTab(btn.dataset.reviewStatus ?? ""));
+    });
+    $("btn-scan-sessions").addEventListener("click", scanLocalSessions);
+
+    // 错题栏下拉与搜索筛选
+    ["mistakes-filter-category", "mistakes-filter-source"].forEach((id) => {
+      $(id).addEventListener("change", applyMistakeFilters);
+    });
+    $("mistakes-filter-q").addEventListener("input", applyMistakeFilters);
+
+    // Agent 活动筛选
+    $("events-filter-tool").addEventListener("change", applyEventFilters);
+    $("events-filter-q").addEventListener("input", applyEventFilters);
+
+    // 规则筛选
+    ["rules-filter-engine", "rules-filter-scope", "rules-filter-status"].forEach((id) => {
+      $(id).addEventListener("change", applyRuleFilters);
+    });
+
+    // 体检操作
+    $("btn-run-verify").addEventListener("click", () => runVerify(false));
+    $("btn-run-verify-ui").addEventListener("click", () => runVerify(true));
+    $("verify-tab-run").addEventListener("click", () => runVerify(false));
+    $("verify-tab-run-ui").addEventListener("click", () => runVerify(true));
+
+    // 零命令行交互：添加项目、服务开关、基线操作、自动守护、安全 MCP/Skill 预览与还原
+    $("btn-open-add-project").addEventListener("click", openAddProjectModal);
+    $("add-project-close").addEventListener("click", closeAddProjectModal);
+    $("add-project-cancel").addEventListener("click", closeAddProjectModal);
+    $("add-project-backdrop").addEventListener("click", closeAddProjectModal);
+    $("btn-pick-folder").addEventListener("click", pickFolder);
+    $("btn-submit-add-project").addEventListener("click", submitAddProject);
+    $("btn-toggle-service").addEventListener("click", toggleService);
+    $("btn-baseline-tighten").addEventListener("click", () => runBaselineAction("tighten"));
+    $("btn-baseline-reset").addEventListener("click", () => runBaselineAction("reset"));
+    $("btn-refresh-mcp").addEventListener("click", loadMCPClients);
+    $("btn-toggle-guard-watch").addEventListener("click", () => {
+      const enabled = Boolean(state.guardStatus?.status?.enabled);
+      toggleGuard({ enabled: !enabled });
+    });
+    $("btn-toggle-guard-hook").addEventListener("click", () => {
+      const installed = Boolean(state.guardStatus?.status?.hook_installed);
+      toggleGuard({ hook_enabled: !installed });
+    });
+    $("diff-preview-close").addEventListener("click", closeDiffModal);
+    $("diff-preview-cancel").addEventListener("click", closeDiffModal);
+    $("diff-preview-backdrop").addEventListener("click", closeDiffModal);
+    $("btn-confirm-diff-apply").addEventListener("click", confirmDiffApply);
+
+    // 截图预览弹窗与 Esc 关闭
+    $("lightbox-close").addEventListener("click", closeLightbox);
+    $("lightbox-backdrop").addEventListener("click", closeLightbox);
+    document.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape") return;
+      if (!$("diff-preview-modal").hidden) {
+        closeDiffModal();
+      } else if (!$("add-project-modal").hidden) {
+        closeAddProjectModal();
+      } else if (!$("lightbox").hidden) {
+        closeLightbox();
+      }
+    });
+
+    // 项目切换与刷新
+    $("project-select").addEventListener("change", async (e) => {
+      state.project = e.target.value;
       if (state.project) {
         localStorage.setItem("slopguard.project", state.project);
       } else {
         localStorage.removeItem("slopguard.project");
       }
+      updateTopbarProject();
       await refresh();
     });
     $("refresh-button").addEventListener("click", refresh);
+
+    await Promise.all([loadProjects(), loadServiceStatus()]);
+    await refresh();
   }
 
   document.addEventListener("DOMContentLoaded", start);

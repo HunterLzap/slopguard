@@ -2,7 +2,9 @@ package ui
 
 import (
 	"context"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,17 +12,21 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/HunterLzap/slopguard/internal/adapter"
 	"github.com/HunterLzap/slopguard/internal/contract"
+	"github.com/HunterLzap/slopguard/internal/engine"
 	"github.com/HunterLzap/slopguard/internal/radar"
 	"github.com/HunterLzap/slopguard/internal/store"
+	"gopkg.in/yaml.v3"
 )
 
 //go:embed assets
@@ -34,28 +40,54 @@ type Options struct {
 	NoOpen bool
 }
 
-// Server exposes the read-only dashboard API and embedded single-page app.
+// Server exposes the dashboard API, local action handlers, background guard, and embedded single-page app.
 type Server struct {
-	db     *store.Store
-	runner contract.Runner
-	mux    *http.ServeMux
+	db      *store.Store
+	runner  contract.Runner
+	mux     *http.ServeMux
+	port    int
+	homeDir string
+	guard   *GuardManager
 }
 
 // NewServer creates a dashboard server backed by the given store and runner.
 func NewServer(db *store.Store, runner contract.Runner) *Server {
 	s := &Server{db: db, runner: runner}
+	s.guard = newGuardManager(s)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(mustSubFS(assets, "assets")))))
 	mux.HandleFunc("/api/overview", s.handleOverview)
+	mux.HandleFunc("/api/summary", s.handleSummary)
 	mux.HandleFunc("/api/projects", s.handleProjects)
+	mux.HandleFunc("/api/events", s.handleEvents)
 	mux.HandleFunc("/api/mistakes", s.handleMistakes)
 	mux.HandleFunc("/api/mistakes/", s.handleMistakeAction)
 	mux.HandleFunc("/api/rules", s.handleRules)
 	mux.HandleFunc("/api/radar", s.handleRadar)
+	mux.HandleFunc("/api/project-meta", s.handleProjectMeta)
+	mux.HandleFunc("/api/verify", s.handleVerify)
 	mux.HandleFunc("/api/screenshot", s.handleScreenshot)
+	mux.HandleFunc("/api/service-status", s.handleServiceStatus)
+	s.registerActionRoutes(mux)
 	s.mux = mux
 	return s
+}
+
+func (s *Server) resolveHomeDir() string {
+	if s != nil && strings.TrimSpace(s.homeDir) != "" {
+		return s.homeDir
+	}
+	home, _ := os.UserHomeDir()
+	return home
+}
+
+func (s *Server) backupsDir() string {
+	home := s.resolveHomeDir()
+	if home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".slopguard", "backups")
 }
 
 // Handler returns the dashboard HTTP handler.
@@ -79,6 +111,7 @@ func Run(ctx context.Context, db *store.Store, runner contract.Runner, opts Opti
 		return fmt.Errorf("ui: port out of range: %d", opts.Port)
 	}
 	server := NewServer(db, runner)
+	server.port = opts.Port
 	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", opts.Port))
 	if err != nil {
 		return fmt.Errorf("ui: listen 127.0.0.1:%d: %w", opts.Port, err)
@@ -97,6 +130,10 @@ func Run(ctx context.Context, db *store.Store, runner contract.Runner, opts Opti
 	}
 
 	httpServer := &http.Server{Handler: server.Handler(), ReadHeaderTimeout: 5 * time.Second}
+	if server.guard != nil {
+		server.guard.Start(ctx)
+		defer server.guard.Stop()
+	}
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- httpServer.Serve(listener)
@@ -162,6 +199,66 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, overview)
 }
 
+func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
+	summary := map[string]any{
+		"pending_user":      0,
+		"pending_ai":        0,
+		"total_runs":        int64(0),
+		"has_scans":         false,
+		"last_scan_passed":  true,
+		"last_scan_project": "",
+		"last_scan_at":      "",
+		"guarded_projects":  0,
+	}
+	if s.guard != nil {
+		summary["guarded_projects"] = s.guard.CountEnabled()
+	}
+	if s.db == nil {
+		writeJSON(w, http.StatusOK, summary)
+		return
+	}
+
+	overview, err := s.db.OverviewStats(r.Context(), "", "day")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	mistakes, err := s.db.QueryMistakes(r.Context(), store.MistakeQuery{})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var pendingUser, pendingAI int
+	for _, m := range mistakes {
+		switch m.ReviewStatus {
+		case "pending_user":
+			pendingUser++
+		case "pending_ai":
+			pendingAI++
+		}
+	}
+	summary["pending_user"] = pendingUser
+	summary["pending_ai"] = pendingAI
+	summary["total_runs"] = overview.TotalRuns
+	if len(overview.RecentRuns) > 0 {
+		latest := overview.RecentRuns[0]
+		summary["has_scans"] = true
+		summary["last_scan_passed"] = latest.Passed
+		summary["last_scan_project"] = filepath.Base(latest.ProjectPath)
+		summary["last_scan_at"] = latest.CreatedAt.UTC().Format(time.RFC3339)
+	}
+	writeJSON(w, http.StatusOK, summary)
+}
+
+type projectInfoResponse struct {
+	store.ProjectInfo
+	GuardEnabled bool `json:"guard_enabled"`
+}
+
 func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w, http.MethodGet)
@@ -176,7 +273,48 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"projects": projects})
+	guarded := map[string]bool{}
+	if s.guard != nil {
+		guarded = s.guard.EnabledMap()
+	}
+	out := make([]projectInfoResponse, 0, len(projects))
+	for _, p := range projects {
+		out = append(out, projectInfoResponse{
+			ProjectInfo:  p,
+			GuardEnabled: guarded[filepath.Clean(p.ProjectPath)],
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"projects": out})
+}
+
+func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
+	if s.db == nil {
+		writeError(w, http.StatusInternalServerError, "store is not available")
+		return
+	}
+	q := r.URL.Query()
+	limit := 0
+	if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			writeError(w, http.StatusBadRequest, "limit must be a non-negative integer")
+			return
+		}
+		limit = parsed
+	}
+	events, err := s.db.ListMCPEvents(r.Context(), q.Get("project"), q.Get("tool"), limit)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if events == nil {
+		events = []store.MCPEvent{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"events": events})
 }
 
 func (s *Server) handleMistakes(w http.ResponseWriter, r *http.Request) {
@@ -188,7 +326,15 @@ func (s *Server) handleMistakes(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "store is not available")
 		return
 	}
-	records, err := s.db.ListMistakes(r.Context(), r.URL.Query().Get("status"), r.URL.Query().Get("project"))
+	q := r.URL.Query()
+	records, err := s.db.QueryMistakes(r.Context(), store.MistakeQuery{
+		ProjectPath:  q.Get("project"),
+		Status:       q.Get("status"),
+		ReviewStatus: q.Get("review_status"),
+		Category:     q.Get("category"),
+		Source:       q.Get("source"),
+		Q:            q.Get("q"),
+	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -198,11 +344,23 @@ func (s *Server) handleMistakes(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleMistakeAction(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/mistakes/")
-	if !strings.HasSuffix(path, "/ignore") {
+	var fingerprint, action, targetStatus string
+	switch {
+	case strings.HasSuffix(path, "/approve"):
+		fingerprint = strings.TrimSuffix(path, "/approve")
+		action = "approve"
+	case strings.HasSuffix(path, "/ignore"):
+		fingerprint = strings.TrimSuffix(path, "/ignore")
+		action = "ignore"
+		targetStatus = "ignored"
+	case strings.HasSuffix(path, "/restore"):
+		fingerprint = strings.TrimSuffix(path, "/restore")
+		action = "restore"
+		targetStatus = "pending"
+	default:
 		http.NotFound(w, r)
 		return
 	}
-	fingerprint := strings.TrimSuffix(path, "/ignore")
 	if fingerprint == "" {
 		writeError(w, http.StatusBadRequest, "fingerprint is required")
 		return
@@ -215,7 +373,24 @@ func (s *Server) handleMistakeAction(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "store is not available")
 		return
 	}
-	if err := s.db.UpdateMistakeStatus(r.Context(), fingerprint, "ignored"); err != nil {
+	if action == "approve" {
+		if err := s.db.ApproveMistake(r.Context(), fingerprint); err != nil {
+			if errors.Is(err, store.ErrMistakeNotFound) {
+				writeError(w, http.StatusNotFound, "mistake not found")
+				return
+			}
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":            true,
+			"fingerprint":   fingerprint,
+			"status":        "promoted",
+			"review_status": "approved",
+		})
+		return
+	}
+	if err := s.db.UpdateMistakeStatus(r.Context(), fingerprint, targetStatus); err != nil {
 		if errors.Is(err, store.ErrMistakeNotFound) {
 			writeError(w, http.StatusNotFound, "mistake not found")
 			return
@@ -223,7 +398,12 @@ func (s *Server) handleMistakeAction(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "fingerprint": fingerprint, "status": "ignored"})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "fingerprint": fingerprint, "status": targetStatus})
+}
+
+type ruleResponse struct {
+	store.Rule
+	RuleKey string `json:"rule_key"`
 }
 
 func (s *Server) handleRules(w http.ResponseWriter, r *http.Request) {
@@ -246,7 +426,14 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"rules": rules})
+	out := make([]ruleResponse, 0, len(rules))
+	for _, rule := range rules {
+		out = append(out, ruleResponse{
+			Rule:    rule,
+			RuleKey: rule.RuleID,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"rules": out})
 }
 
 func (s *Server) handleRadar(w http.ResponseWriter, r *http.Request) {
@@ -294,11 +481,24 @@ func (s *Server) handleRadar(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	hotspots := report.Hotspots
+	if hotspots == nil {
+		hotspots = []radar.Hotspot{}
+	}
+	skipped := report.Skipped
+	if skipped == nil {
+		skipped = []radar.Skipped{}
+	}
+	delta := make(map[string]int, len(baseline.Metrics))
+	for _, m := range baseline.Metrics {
+		delta[m.Name] = m.Delta
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"project":     project,
 		"baseline":    baseline,
-		"hotspots":    report.Hotspots,
-		"skipped":     report.Skipped,
+		"delta":       delta,
+		"hotspots":    hotspots,
+		"skipped":     skipped,
 		"screenshots": screenshots,
 	})
 }
@@ -310,7 +510,9 @@ func emptyRadarResponse(project string) map[string]any {
 			"available": false,
 			"metrics":   []any{},
 		},
+		"delta":       map[string]int{},
 		"hotspots":    []radar.Hotspot{},
+		"skipped":     []radar.Skipped{},
 		"screenshots": []adapter.UIScreenshot{},
 	}
 }
@@ -344,6 +546,613 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]any{"error": message})
 }
 
+type projectConfigSummary struct {
+	Exists   bool     `json:"exists"`
+	Path     string   `json:"path,omitempty"`
+	Version  int      `json:"version,omitempty"`
+	Adapters []string `json:"adapters,omitempty"`
+	Verify   struct {
+		Jobs int `json:"jobs,omitempty"`
+	} `json:"verify,omitempty"`
+	Error string `json:"error,omitempty"`
+}
+
+type uiConfigSummary struct {
+	Exists        bool     `json:"exists"`
+	Path          string   `json:"path,omitempty"`
+	BaseURL       string   `json:"base_url,omitempty"`
+	Routes        []string `json:"routes,omitempty"`
+	ScreenshotDir string   `json:"screenshot_dir,omitempty"`
+	TimeoutSec    int      `json:"timeout_sec,omitempty"`
+	Error         string   `json:"error,omitempty"`
+}
+
+type adapterCheckMeta struct {
+	ID         string   `json:"id"`
+	Cmd        []string `json:"cmd"`
+	Optional   bool     `json:"optional"`
+	TimeoutSec int      `json:"timeout_sec"`
+}
+
+type adapterEscapePatternMeta struct {
+	Name  string `json:"name"`
+	Regex string `json:"regex"`
+}
+
+type adapterMeta struct {
+	Name           string                     `json:"name"`
+	Extensions     []string                   `json:"extensions"`
+	Checks         []adapterCheckMeta         `json:"checks"`
+	EscapePatterns []adapterEscapePatternMeta `json:"escape_patterns"`
+}
+
+func (s *Server) handleProjectMeta(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
+	project := strings.TrimSpace(r.URL.Query().Get("project"))
+	if project == "" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"project":   "",
+			"exists":    false,
+			"config":    projectConfigSummary{Exists: false},
+			"ui_config": uiConfigSummary{Exists: false},
+			"adapters":  []adapterMeta{},
+		})
+		return
+	}
+	info, err := os.Stat(project)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"project":   project,
+				"exists":    false,
+				"config":    projectConfigSummary{Exists: false},
+				"ui_config": uiConfigSummary{Exists: false},
+				"adapters":  []adapterMeta{},
+			})
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !info.IsDir() {
+		writeError(w, http.StatusBadRequest, "project path is not a directory")
+		return
+	}
+
+	cfgSummary := loadProjectConfigSummary(project)
+	uiSummary := loadUIConfigSummary(project)
+
+	registry, err := adapter.LoadMergedRegistry(project)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	detected := registry.Detect(project)
+	adaptersOut := make([]adapterMeta, 0, len(detected))
+	for _, a := range detected {
+		checks := a.Checks(project, nil)
+		checkMetas := make([]adapterCheckMeta, 0, len(checks))
+		for _, c := range checks {
+			checkMetas = append(checkMetas, adapterCheckMeta{
+				ID:         c.ID,
+				Cmd:        c.Cmd,
+				Optional:   c.Optional,
+				TimeoutSec: int(c.Timeout.Seconds()),
+			})
+		}
+		patterns := a.EscapePatterns()
+		patternMetas := make([]adapterEscapePatternMeta, 0, len(patterns))
+		for _, p := range patterns {
+			patternMetas = append(patternMetas, adapterEscapePatternMeta{
+				Name:  p.Name,
+				Regex: p.Regex,
+			})
+		}
+		exts := a.Extensions()
+		if exts == nil {
+			exts = []string{}
+		}
+		adaptersOut = append(adaptersOut, adapterMeta{
+			Name:           a.Name(),
+			Extensions:     exts,
+			Checks:         checkMetas,
+			EscapePatterns: patternMetas,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"project":   project,
+		"exists":    true,
+		"config":    cfgSummary,
+		"ui_config": uiSummary,
+		"adapters":  adaptersOut,
+	})
+}
+
+func loadProjectConfigSummary(project string) projectConfigSummary {
+	rel := filepath.FromSlash(".slopguard/config.yaml")
+	full := filepath.Join(project, rel)
+	data, err := os.ReadFile(full)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return projectConfigSummary{Exists: false}
+		}
+		return projectConfigSummary{Exists: true, Path: full, Error: err.Error()}
+	}
+	var raw struct {
+		Version  int      `yaml:"version"`
+		Adapters []string `yaml:"adapters"`
+		Verify   struct {
+			Jobs int `yaml:"jobs"`
+		} `yaml:"verify"`
+	}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return projectConfigSummary{Exists: true, Path: full, Error: err.Error()}
+	}
+	summary := projectConfigSummary{
+		Exists:   true,
+		Path:     full,
+		Version:  raw.Version,
+		Adapters: raw.Adapters,
+	}
+	summary.Verify.Jobs = raw.Verify.Jobs
+	return summary
+}
+
+func loadUIConfigSummary(project string) uiConfigSummary {
+	for _, rel := range []string{filepath.FromSlash(".slopguard/ui.yaml"), filepath.FromSlash(".slopguard/ui.yml")} {
+		full := filepath.Join(project, rel)
+		data, err := os.ReadFile(full)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return uiConfigSummary{Exists: true, Path: full, Error: err.Error()}
+		}
+		var raw struct {
+			BaseURL       string   `yaml:"base_url"`
+			Routes        []string `yaml:"routes"`
+			ScreenshotDir string   `yaml:"screenshot_dir"`
+			TimeoutSec    int      `yaml:"timeout_sec"`
+		}
+		if err := yaml.Unmarshal(data, &raw); err != nil {
+			return uiConfigSummary{Exists: true, Path: full, Error: err.Error()}
+		}
+		return uiConfigSummary{
+			Exists:        true,
+			Path:          full,
+			BaseURL:       raw.BaseURL,
+			Routes:        raw.Routes,
+			ScreenshotDir: raw.ScreenshotDir,
+			TimeoutSec:    raw.TimeoutSec,
+		}
+	}
+	return uiConfigSummary{Exists: false}
+}
+
+type verifyRequest struct {
+	Project    string `json:"project"`
+	All        bool   `json:"all"`
+	LastCommit bool   `json:"last_commit"`
+	UI         bool   `json:"ui"`
+	Record     bool   `json:"record"`
+	Source     string `json:"source"`
+}
+
+func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	var req verifyRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON request body")
+		return
+	}
+	project := strings.TrimSpace(req.Project)
+	if project == "" {
+		writeError(w, http.StatusBadRequest, "project is required")
+		return
+	}
+	absProject, err := filepath.Abs(project)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	info, err := os.Stat(absProject)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeError(w, http.StatusBadRequest, "project directory does not exist")
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !info.IsDir() {
+		writeError(w, http.StatusBadRequest, "project path is not a directory")
+		return
+	}
+
+	runner := s.runner
+	if runner == nil {
+		runner = engine.NewExecRunner()
+	}
+
+	result, err := s.runVerify(r.Context(), runner, absProject, req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) runVerify(ctx context.Context, runner contract.Runner, project string, req verifyRequest) (contract.VerifyResult, error) {
+	started := time.Now()
+	cfg := loadProjectConfigSummary(project)
+	jobs := cfg.Verify.Jobs
+	if jobs <= 0 {
+		jobs = 2
+	}
+
+	registry, err := adapter.LoadMergedRegistry(project)
+	if err != nil {
+		return contract.VerifyResult{}, fmt.Errorf("load adapters: %w", err)
+	}
+	detected := registry.Detect(project)
+	adapters := filterVerifyAdapters(detected, cfg.Adapters)
+	if len(adapters) == 0 {
+		if len(cfg.Adapters) > 0 {
+			return contract.VerifyResult{}, fmt.Errorf("none of the configured adapters %v apply to this project", cfg.Adapters)
+		}
+		result := contract.VerifyResult{
+			Passed:     true,
+			Findings:   []contract.Finding{},
+			Escapes:    map[string]int{},
+			DurationMs: time.Since(started).Milliseconds(),
+		}
+		if req.UI {
+			uiRes, uiErr := adapter.RunUISmoke(ctx, runner, adapter.UIOptions{ProjectRoot: project})
+			if uiErr != nil {
+				return contract.VerifyResult{}, fmt.Errorf("run ui smoke: %w", uiErr)
+			}
+			result.UI = &uiRes
+			if !uiRes.Skipped && !uiRes.Passed {
+				result.Passed = false
+			}
+			result.DurationMs = time.Since(started).Milliseconds()
+		}
+		if req.Record && s.db != nil {
+			_ = s.db.RecordScan(ctx, project, result.DurationMs, 0, result.Passed)
+		}
+		return result, nil
+	}
+
+	var patterns []contract.EscapePattern
+	var extensions []string
+	extSeen := make(map[string]struct{})
+	for _, a := range adapters {
+		patterns = append(patterns, a.EscapePatterns()...)
+		for _, ext := range a.Extensions() {
+			if _, ok := extSeen[ext]; !ok {
+				extSeen[ext] = struct{}{}
+				extensions = append(extensions, ext)
+			}
+		}
+	}
+
+	baseline, err := engine.LoadBaselineOrEmpty(filepath.Join(project, ".slopguard", "baseline.json"))
+	if err != nil {
+		return contract.VerifyResult{}, fmt.Errorf("load baseline: %w", err)
+	}
+
+	var files []string
+	if req.All {
+		files, err = engine.ListFiles(project, extensions)
+	} else {
+		git := engine.NewGit(runner, project)
+		if git.IsRepository(ctx) {
+			if req.LastCommit {
+				files, err = git.LastCommitFiles(ctx)
+				if err == nil && len(files) == 0 {
+					files, err = git.ChangedFiles(ctx)
+				}
+			} else {
+				files, err = git.ChangedFiles(ctx)
+			}
+			if err == nil {
+				files = filterVerifyFilesByExt(files, extensions)
+			}
+		} else {
+			files, err = engine.ListFiles(project, extensions)
+		}
+	}
+	if err != nil {
+		return contract.VerifyResult{}, fmt.Errorf("resolve scan scope: %w", err)
+	}
+
+	files, suppressedChecks := filterVerifySuppressed(files, baseline)
+
+	type plannedTask struct {
+		adapter contract.Adapter
+		check   contract.Check
+	}
+	var tasks []plannedTask
+	var skippedIDs []string
+	var skippedDetails []contract.SkippedDetail
+
+	for _, a := range adapters {
+		subset := filterVerifyFilesByExt(files, a.Extensions())
+		if len(subset) == 0 {
+			continue
+		}
+		plan, err := adapter.PlanChecks(runner, project, a.Checks(project, subset))
+		if err != nil {
+			return contract.VerifyResult{}, err
+		}
+		for _, sk := range plan.Skipped {
+			skippedIDs = append(skippedIDs, sk.ID)
+			skippedDetails = append(skippedDetails, contract.SkippedDetail{
+				ID:     sk.ID,
+				Tool:   sk.Tool,
+				Reason: sk.Reason,
+			})
+		}
+		for _, c := range plan.Runnable {
+			if len(c.Cmd) == 0 {
+				continue
+			}
+			tasks = append(tasks, plannedTask{adapter: a, check: c})
+		}
+	}
+
+	checks := make([]contract.Check, len(tasks))
+	for i, t := range tasks {
+		checks[i] = t.check
+	}
+	outcomes := engine.RunChecksConcurrent(ctx, runner, project, checks, jobs)
+
+	findings := make([]contract.Finding, 0)
+	for i, outcome := range outcomes {
+		res := outcome.Result
+		if res.Err != nil {
+			return contract.VerifyResult{}, fmt.Errorf("check %s: %w", outcome.Check.ID, res.Err)
+		}
+		if res.Skipped {
+			tool := ""
+			if len(outcome.Check.Cmd) > 0 {
+				tool = outcome.Check.Cmd[0]
+			}
+			skippedIDs = append(skippedIDs, outcome.Check.ID)
+			skippedDetails = append(skippedDetails, contract.SkippedDetail{
+				ID:     outcome.Check.ID,
+				Tool:   tool,
+				Reason: "tool missing at execution time",
+			})
+			continue
+		}
+		if res.ExitCode == 0 {
+			continue
+		}
+		findings = append(findings, adapter.ParseFindings(tasks[i].adapter, outcome.Check.ID, res)...)
+	}
+
+	escapes := map[string]int{}
+	escapeFiles := files
+	if !req.All && (len(patterns) > 0 || len(baseline.SuppressedFiles) > 0) {
+		escapeFiles, err = engine.ListFiles(project, extensions)
+		if err != nil {
+			return contract.VerifyResult{}, fmt.Errorf("list files for escape counting: %w", err)
+		}
+	}
+	escapeFiles, suppressedEscapes := filterVerifySuppressed(escapeFiles, baseline)
+	if len(patterns) > 0 && len(escapeFiles) > 0 {
+		escapes, err = engine.CountEscapes(project, escapeFiles, patterns)
+		if err != nil {
+			return contract.VerifyResult{}, fmt.Errorf("count escapes: %w", err)
+		}
+	}
+	if len(patterns) > 0 && len(baseline.Metrics) > 0 {
+		cmp := engine.Compare(escapes, baseline)
+		for _, v := range cmp.Regressions {
+			findings = append(findings, contract.Finding{
+				Rule:     "ratchet:" + v.Name,
+				Message:  fmt.Sprintf("escape hatch %s increased from baseline %d to %d (+%d)", v.Name, v.Baseline, v.Current, v.Delta),
+				Severity: contract.SeverityError,
+			})
+		}
+	}
+
+	suppressedSet := make(map[string]struct{}, len(suppressedChecks)+len(suppressedEscapes))
+	for _, f := range suppressedChecks {
+		suppressedSet[f] = struct{}{}
+	}
+	for _, f := range suppressedEscapes {
+		suppressedSet[f] = struct{}{}
+	}
+
+	result := contract.VerifyResult{
+		Passed:         len(findings) == 0,
+		Findings:       findings,
+		Escapes:        escapes,
+		Baseline:       baseline.Metrics,
+		Suppressed:     len(suppressedSet),
+		DurationMs:     time.Since(started).Milliseconds(),
+		Skipped:        skippedIDs,
+		SkippedDetails: skippedDetails,
+	}
+	if req.UI && result.Passed {
+		uiRes, uiErr := adapter.RunUISmoke(ctx, runner, adapter.UIOptions{ProjectRoot: project})
+		if uiErr != nil {
+			return contract.VerifyResult{}, fmt.Errorf("run ui smoke: %w", uiErr)
+		}
+		result.UI = &uiRes
+		if !uiRes.Skipped && !uiRes.Passed {
+			result.Passed = false
+		}
+		result.DurationMs = time.Since(started).Milliseconds()
+	}
+	if req.Record && s.db != nil {
+		totalEscapes := 0
+		for _, v := range result.Escapes {
+			totalEscapes += v
+		}
+		_ = s.db.RecordScan(ctx, project, result.DurationMs, totalEscapes, result.Passed)
+		if !result.Passed && len(result.Findings) > 0 {
+			autoCaptureVerifyMistakesUI(ctx, s.db, project, result.Findings, req.Source)
+		}
+	}
+	return result, nil
+}
+
+const maxAutoCapturedMistakesUI = 5
+
+func autoCaptureVerifyMistakesUI(ctx context.Context, db *store.Store, root string, findings []contract.Finding, source string) {
+	if db == nil {
+		return
+	}
+	source = strings.TrimSpace(source)
+	if source == "" {
+		source = "auto_verify"
+	}
+	seen := make(map[string]struct{}, len(findings))
+	captured := 0
+	for _, f := range findings {
+		if captured >= maxAutoCapturedMistakesUI {
+			break
+		}
+		category := classifyFindingCategoryUI(f)
+		summary := buildFindingSummaryUI(f)
+		if summary == "" {
+			continue
+		}
+		fp := mistakeFingerprintUI(root, category, summary)
+		if _, dup := seen[fp]; dup {
+			continue
+		}
+		seen[fp] = struct{}{}
+		_, err := db.RecordMistake(ctx, contract.Mistake{
+			ProjectPath: root,
+			Fingerprint: fp,
+			Category:    category,
+			Summary:     summary,
+			BadSnippet:  formatFindingSnippetUI(f),
+			Source:      source,
+			Status:      "pending",
+		})
+		if err != nil {
+			return
+		}
+		captured++
+	}
+}
+
+func mistakeFingerprintUI(project, category, summary string) string {
+	h := sha256.Sum256([]byte(project + "\x00" + strings.TrimSpace(category) + "\x00" + strings.TrimSpace(summary)))
+	return hex.EncodeToString(h[:])
+}
+
+func classifyFindingCategoryUI(f contract.Finding) string {
+	rule := strings.ToLower(strings.TrimSpace(f.Rule))
+	msg := strings.ToLower(strings.TrimSpace(f.Message))
+	switch {
+	case strings.Contains(rule, "ratchet") || strings.Contains(rule, "escape") || strings.Contains(msg, "baseline"):
+		return "escape"
+	case strings.Contains(rule, "import") || strings.Contains(msg, "import"):
+		return "import"
+	case strings.Contains(rule, "type") || rule == "tsc" || strings.Contains(rule, "mypy") || strings.Contains(rule, "pyright"):
+		return "type"
+	case strings.Contains(rule, "syntax") || strings.Contains(msg, "syntax"):
+		return "syntax"
+	default:
+		return "lint"
+	}
+}
+
+func buildFindingSummaryUI(f contract.Finding) string {
+	rule := strings.TrimSpace(f.Rule)
+	msg := strings.TrimSpace(f.Message)
+	if len(msg) > 140 {
+		msg = msg[:140] + "..."
+	}
+	if rule != "" && msg != "" {
+		return fmt.Sprintf("[%s] %s", rule, msg)
+	}
+	if rule != "" {
+		return rule
+	}
+	return msg
+}
+
+func formatFindingSnippetUI(f contract.Finding) string {
+	loc := strings.TrimSpace(f.File)
+	if loc != "" && f.Line > 0 {
+		if f.Column > 0 {
+			loc = fmt.Sprintf("%s:%d:%d", loc, f.Line, f.Column)
+		} else {
+			loc = fmt.Sprintf("%s:%d", loc, f.Line)
+		}
+	}
+	msg := strings.TrimSpace(f.Message)
+	if loc != "" && msg != "" {
+		return loc + " — " + msg
+	}
+	if loc != "" {
+		return loc
+	}
+	return msg
+}
+
+func filterVerifyAdapters(adapters []contract.Adapter, allow []string) []contract.Adapter {
+	if len(allow) == 0 {
+		return adapters
+	}
+	want := make(map[string]struct{}, len(allow))
+	for _, name := range allow {
+		if trimmed := strings.TrimSpace(name); trimmed != "" {
+			want[trimmed] = struct{}{}
+		}
+	}
+	out := make([]contract.Adapter, 0, len(adapters))
+	for _, a := range adapters {
+		if _, ok := want[a.Name()]; ok {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+func filterVerifyFilesByExt(files, extensions []string) []string {
+	if len(extensions) == 0 {
+		return nil
+	}
+	allowed := make(map[string]struct{}, len(extensions))
+	for _, ext := range extensions {
+		allowed[strings.ToLower(ext)] = struct{}{}
+	}
+	out := make([]string, 0, len(files))
+	for _, f := range files {
+		if _, ok := allowed[strings.ToLower(filepath.Ext(f))]; ok {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func filterVerifySuppressed(files []string, baseline *engine.Baseline) (kept, suppressed []string) {
+	kept = make([]string, 0, len(files))
+	for _, f := range files {
+		if baseline != nil && baseline.IsSuppressed(f) {
+			suppressed = append(suppressed, f)
+			continue
+		}
+		kept = append(kept, f)
+	}
+	return kept, suppressed
+}
+
 func methodNotAllowed(w http.ResponseWriter, allowed string) {
 	w.Header().Set("Allow", allowed)
 	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -372,15 +1181,131 @@ func safeProjectFile(project, path string) (string, error) {
 	return abs, nil
 }
 
-func openBrowser(url string) error {
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "windows":
-		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
-	case "darwin":
-		cmd = exec.Command("open", url)
-	default:
-		cmd = exec.Command("xdg-open", url)
+type serviceStatusResponse struct {
+	Platform  string `json:"platform"`
+	Installed bool   `json:"installed"`
+	Port      int    `json:"port"`
+	PIDHint   int    `json:"pid_hint"`
+}
+
+func (s *Server) handleServiceStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
 	}
-	return cmd.Start()
+	port := s.port
+	if port == 0 {
+		port = 7788
+	}
+	homeDir, _ := os.UserHomeDir()
+	writeJSON(w, http.StatusOK, detectServiceStatus(runtime.GOOS, homeDir, port, fileExists))
+}
+
+func detectServiceStatus(goos, homeDir string, port int, exists func(string) bool) serviceStatusResponse {
+	installed := false
+	if goos == "darwin" && homeDir != "" && exists != nil {
+		plistPath := filepath.Join(homeDir, "Library", "LaunchAgents", "com.slopguard.ui.plist")
+		installed = exists(plistPath)
+	}
+	return serviceStatusResponse{
+		Platform:  goos,
+		Installed: installed,
+		Port:      port,
+		PIDHint:   os.Getpid(),
+	}
+}
+
+func openBrowser(url string) error {
+	name, args := openBrowserCommand(runtime.GOOS, url, fileExists, exec.LookPath)
+	return exec.Command(name, args...).Start()
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+func openBrowserCommand(goos, targetURL string, exists func(string) bool, lookPath func(string) (string, error)) (string, []string) {
+	appArgs := []string{"--app=" + targetURL, "--window-size=1180,780"}
+
+	switch goos {
+	case "darwin":
+		if parsed, err := neturl.Parse(targetURL); err == nil && parsed.Port() == "7788" {
+			var appBundles []string
+			appBundles = append(appBundles, "/Applications/SlopGuard.app")
+			if home, err := os.UserHomeDir(); err == nil && home != "" {
+				appBundles = append(appBundles, filepath.Join(home, "Applications", "SlopGuard.app"))
+			}
+			appBundles = append(appBundles, filepath.Join("build", "SlopGuard.app"))
+			for _, bundle := range appBundles {
+				if exists(filepath.Join(bundle, "Contents", "MacOS", "SlopGuard")) {
+					return "open", []string{bundle}
+				}
+			}
+		}
+
+		var candidates []string
+		appRelPaths := []string{
+			"Google Chrome.app/Contents/MacOS/Google Chrome",
+			"Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+			"Brave Browser.app/Contents/MacOS/Brave Browser",
+			"Arc.app/Contents/MacOS/Arc",
+			"Chromium.app/Contents/MacOS/Chromium",
+		}
+		for _, rel := range appRelPaths {
+			candidates = append(candidates, filepath.Join("/Applications", rel))
+		}
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			for _, rel := range appRelPaths {
+				candidates = append(candidates, filepath.Join(home, "Applications", rel))
+			}
+		}
+		for _, candidate := range candidates {
+			if exists(candidate) {
+				return candidate, appArgs
+			}
+		}
+		return "open", []string{targetURL}
+
+	case "windows":
+		for _, bin := range []string{"chrome.exe", "msedge.exe", "brave.exe", "chromium.exe"} {
+			if path, err := lookPath(bin); err == nil && path != "" {
+				return path, appArgs
+			}
+		}
+		relPaths := []string{
+			`Google\Chrome\Application\chrome.exe`,
+			`Microsoft\Edge\Application\msedge.exe`,
+			`BraveSoftware\Brave-Browser\Application\brave.exe`,
+			`Chromium\Application\chrome.exe`,
+		}
+		for _, envKey := range []string{"ProgramFiles", "ProgramFiles(x86)", "LocalAppData"} {
+			if base := os.Getenv(envKey); base != "" {
+				for _, rel := range relPaths {
+					candidate := filepath.Join(base, rel)
+					if exists(candidate) {
+						return candidate, appArgs
+					}
+				}
+			}
+		}
+		return "rundll32", []string{"url.dll,FileProtocolHandler", targetURL}
+
+	default:
+		for _, bin := range []string{
+			"google-chrome",
+			"google-chrome-stable",
+			"chromium",
+			"chromium-browser",
+			"microsoft-edge",
+			"microsoft-edge-stable",
+			"brave-browser",
+			"brave",
+		} {
+			if path, err := lookPath(bin); err == nil && path != "" {
+				return path, appArgs
+			}
+		}
+		return "xdg-open", []string{targetURL}
+	}
 }

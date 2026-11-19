@@ -3,117 +3,658 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SlopGuard Dashboard</title>
+  <title>SlopGuard · 本地代码防线</title>
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">
-      <span class="brand-mark">SG</span>
-      <span class="brand-name">SlopGuard</span>
-      <span class="brand-sub">本地看板</span>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <div class="brand">
+          <span class="brand-mark">SG</span>
+          <div class="brand-text">
+            <span class="brand-name">SlopGuard</span>
+            <span class="brand-sub">本地代码防线</span>
+          </div>
+        </div>
+        <button id="sidebar-close" class="icon-btn mobile-only" type="button" aria-label="关闭导航">✕</button>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="section-row-head">
+          <label class="field-label" for="project-select">工作区</label>
+          <button id="btn-open-add-project" class="mini-action-btn" type="button" title="添加并初始化项目">+ 添加项目</button>
+        </div>
+        <div class="project-switcher">
+          <span id="project-health-dot" class="health-dot neutral" title="工作区状态"></span>
+          <select id="project-select" aria-label="选择项目"></select>
+        </div>
+      </div>
+
+      <nav class="sidebar-nav" aria-label="主导航">
+        <button class="nav-item active" data-tab="overview" type="button">
+          <span class="nav-label">总览</span>
+          <span class="nav-badge" id="badge-overview" hidden>0</span>
+        </button>
+        <button class="nav-item" data-tab="mistakes" type="button">
+          <span class="nav-label">错题栏</span>
+          <span class="nav-badge" id="badge-mistakes" hidden>0</span>
+        </button>
+        <button class="nav-item" data-tab="events" type="button">
+          <span class="nav-label">Agent 活动</span>
+          <span class="nav-badge" id="badge-events" hidden>0</span>
+        </button>
+        <button class="nav-item" data-tab="rules" type="button">
+          <span class="nav-label">规则台账</span>
+          <span class="nav-badge" id="badge-rules" hidden>0</span>
+        </button>
+        <button class="nav-item" data-tab="radar" type="button">
+          <span class="nav-label">坏样本雷达</span>
+          <span class="nav-badge" id="badge-radar" hidden>—</span>
+        </button>
+        <button class="nav-item" data-tab="verify" type="button">
+          <span class="nav-label">配置与体检</span>
+          <span class="nav-badge" id="badge-verify" hidden>—</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="theme-switch" role="group" aria-label="外观主题">
+          <button class="theme-btn" data-theme-choice="light" type="button" title="浅色模式">浅色</button>
+          <button class="theme-btn" data-theme-choice="dark" type="button" title="深色模式">深色</button>
+          <button class="theme-btn" data-theme-choice="system" type="button" title="跟随系统">跟随系统</button>
+        </div>
+        <div class="service-status-row">
+          <div class="service-status-left">
+            <span id="service-status-dot" class="health-dot neutral"></span>
+            <span id="service-status-text" class="muted">按需运行</span>
+          </div>
+          <button id="btn-toggle-service" class="mini-action-btn" type="button" title="切换开机后台静默常驻">开启常驻</button>
+        </div>
+        <div class="sync-status">
+          <span id="last-updated" class="muted mono">已就绪</span>
+        </div>
+      </div>
+    </aside>
+
+    <div class="sidebar-backdrop" id="sidebar-backdrop" hidden></div>
+
+    <div class="workspace">
+      <header class="workspace-topbar">
+        <div class="topbar-left">
+          <button id="sidebar-toggle" class="icon-btn mobile-only" type="button" aria-label="打开导航">☰</button>
+          <div class="project-path-wrap">
+            <span class="path-label">项目</span>
+            <code id="current-project-path" class="project-path" title="全部项目">全部项目</code>
+            <span id="topbar-guard-pill" class="pill pass" hidden>自动守护中</span>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <button id="btn-run-verify" class="btn btn-secondary" type="button">立即体检</button>
+          <button id="btn-run-verify-ui" class="btn btn-primary" type="button">体检 + UI</button>
+          <button id="refresh-button" class="btn btn-ghost" type="button" title="刷新数据">刷新</button>
+        </div>
+      </header>
+
+      <main class="workspace-main">
+        <!-- TAB: 总览 -->
+        <section id="tab-overview" class="tab-panel active">
+          <div class="stats">
+            <article class="stat-card">
+              <span class="stat-label">总扫描次数</span>
+              <strong id="stat-runs" class="stat-value">—</strong>
+              <span id="stat-runs-sub" class="stat-sub">体检运行</span>
+            </article>
+            <article class="stat-card">
+              <span class="stat-label">通过率</span>
+              <strong id="stat-pass-rate" class="stat-value">—</strong>
+              <span id="stat-pass-sub" class="stat-sub">门禁通过占比</span>
+            </article>
+            <article class="stat-card">
+              <span class="stat-label">平均耗时</span>
+              <strong id="stat-duration" class="stat-value">—</strong>
+              <span class="stat-sub">ms / 次</span>
+            </article>
+            <article class="stat-card">
+              <span class="stat-label">当前逃生舱</span>
+              <strong id="stat-escapes" class="stat-value">—</strong>
+              <span id="stat-escapes-sub" class="stat-sub">最近一次扫描</span>
+            </article>
+            <article class="stat-card">
+              <span class="stat-label">待审错题</span>
+              <strong id="stat-candidates" class="stat-value">—</strong>
+              <span id="stat-candidates-sub" class="stat-sub">待我校验 / 候选</span>
+            </article>
+            <article class="stat-card">
+              <span class="stat-label">生效规则</span>
+              <strong id="stat-rules" class="stat-value">—</strong>
+              <span class="stat-sub">已启用规则</span>
+            </article>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <div class="card-title-group">
+                <h2>扫描与逃生舱趋势</h2>
+                <div class="legend">
+                  <span class="legend-item"><i class="swatch swatch-pass"></i>通过</span>
+                  <span class="legend-item"><i class="swatch swatch-fail"></i>未通过</span>
+                  <span class="legend-item"><i class="swatch swatch-escape"></i>逃生舱</span>
+                  <span class="legend-item"><i class="swatch swatch-dur"></i>平均耗时</span>
+                </div>
+              </div>
+              <div class="segmented" role="group" aria-label="趋势粒度">
+                <button class="seg-btn active" data-granularity="day" type="button">按天</button>
+                <button class="seg-btn" data-granularity="week" type="button">按周</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <svg id="trend-chart" class="trend-chart" role="img" aria-label="扫描与逃生舱趋势图"></svg>
+              <p id="trend-empty" class="empty-state" hidden>暂无扫描记录。请运行 <code>slopguard verify --record</code> 或点击上方 <strong>立即体检</strong>。</p>
+            </div>
+          </div>
+
+          <div class="split-grid">
+            <div class="card">
+              <div class="card-header">
+                <h2>最近扫描记录</h2>
+                <span id="recent-runs-count" class="muted">最近 30 次</span>
+              </div>
+              <div class="table-wrap">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>时间</th>
+                      <th>项目</th>
+                      <th>状态</th>
+                      <th class="num">逃生舱</th>
+                      <th class="num">耗时</th>
+                    </tr>
+                  </thead>
+                  <tbody id="recent-runs-body"></tbody>
+                </table>
+                <p id="recent-runs-empty" class="empty-state" hidden>暂无扫描记录。</p>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-header">
+                <h2>项目对比</h2>
+                <span id="projects-count" class="muted">0 个项目</span>
+              </div>
+              <div class="table-wrap">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>项目</th>
+                      <th>最近扫描</th>
+                      <th class="num">次数</th>
+                      <th class="num">通过率</th>
+                      <th class="num">逃生舱</th>
+                      <th class="num">待审</th>
+                      <th>守护</th>
+                    </tr>
+                  </thead>
+                  <tbody id="projects-body"></tbody>
+                </table>
+                <p id="projects-empty" class="empty-state" hidden>暂无项目记录。</p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB: 错题栏 -->
+        <section id="tab-mistakes" class="tab-panel" hidden>
+          <div class="card filter-bar">
+            <div class="review-pills" id="mistakes-review-tabs" role="tablist" aria-label="错题审核状态">
+              <button class="review-pill active" data-review-status="pending_user" type="button">
+                <span>待我校验</span>
+                <span class="pill-count" id="count-pending-user">0</span>
+              </button>
+              <button class="review-pill" data-review-status="pending_ai" type="button">
+                <span>待 Agent 分析</span>
+                <span class="pill-count" id="count-pending-ai">0</span>
+              </button>
+              <button class="review-pill" data-review-status="" type="button">
+                <span>全部</span>
+                <span class="pill-count" id="count-all-mistakes">0</span>
+              </button>
+              <button class="review-pill" data-review-status="approved" type="button">
+                <span>已确认入库</span>
+                <span class="pill-count" id="count-approved">0</span>
+              </button>
+              <button class="review-pill" data-review-status="ignored" type="button">
+                <span>已忽略</span>
+                <span class="pill-count" id="count-ignored">0</span>
+              </button>
+            </div>
+            <div class="filter-group">
+              <label class="filter-field">
+                <span>分类</span>
+                <select id="mistakes-filter-category">
+                  <option value="">全部</option>
+                </select>
+              </label>
+              <label class="filter-field">
+                <span>来源</span>
+                <select id="mistakes-filter-source">
+                  <option value="">全部</option>
+                </select>
+              </label>
+              <label class="filter-field search-field">
+                <span>搜索</span>
+                <input id="mistakes-filter-q" type="search" placeholder="搜索摘要、fingerprint、代码片段...">
+              </label>
+            </div>
+            <div class="filter-group">
+              <button id="btn-scan-sessions" class="btn btn-secondary btn-sm" type="button" title="纯只读扫描本地 Agent 会话与 Git fix 返工记录，零配置修改">嗅探会话与返工</button>
+              <span id="mistakes-summary" class="muted">0 条</span>
+            </div>
+          </div>
+
+          <div id="session-scan-banner" class="banner banner-info" hidden></div>
+
+          <div id="mistakes-list" class="stack-list"></div>
+          <p id="mistakes-empty" class="empty-state card" hidden>当前筛选条件下暂无错题。</p>
+        </section>
+
+        <!-- TAB: AGENT 活动 -->
+        <section id="tab-events" class="tab-panel" hidden>
+          <div class="card filter-bar">
+            <div class="filter-group">
+              <label class="filter-field">
+                <span>工具</span>
+                <select id="events-filter-tool">
+                  <option value="">全部</option>
+                </select>
+              </label>
+              <label class="filter-field search-field">
+                <span>搜索</span>
+                <input id="events-filter-q" type="search" placeholder="搜索参数、项目、工具名...">
+              </label>
+            </div>
+            <span id="events-summary" class="muted">0 条活动</span>
+          </div>
+
+          <div class="card">
+            <div class="table-wrap">
+              <table class="data-table events-table">
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>项目</th>
+                    <th>MCP 工具</th>
+                    <th>参数摘要</th>
+                    <th>结果</th>
+                    <th class="num">发现数</th>
+                    <th class="num">耗时</th>
+                  </tr>
+                </thead>
+                <tbody id="events-body"></tbody>
+              </table>
+              <p id="events-empty" class="empty-state" hidden>暂无 Agent 活动记录。当 Agent 调用 <code>sg_verify</code>、<code>sg_radar</code>、<code>sg_list_inbox</code> 等 MCP 工具时，将在此实时显示。</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB: 规则台账 -->
+        <section id="tab-rules" class="tab-panel" hidden>
+          <div class="card filter-bar">
+            <div class="filter-group">
+              <label class="filter-field">
+                <span>引擎</span>
+                <select id="rules-filter-engine">
+                  <option value="">全部</option>
+                </select>
+              </label>
+              <label class="filter-field">
+                <span>作用域</span>
+                <select id="rules-filter-scope">
+                  <option value="">全部</option>
+                  <option value="project">项目级</option>
+                  <option value="global">全局</option>
+                </select>
+              </label>
+              <label class="filter-field">
+                <span>状态</span>
+                <select id="rules-filter-status">
+                  <option value="">全部</option>
+                </select>
+              </label>
+            </div>
+            <span id="rules-summary" class="muted">0 条规则</span>
+          </div>
+
+          <div class="card">
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>作用域</th>
+                    <th>引擎</th>
+                    <th>Rule Key</th>
+                    <th>规则说明</th>
+                    <th>来源</th>
+                    <th>应用时间</th>
+                    <th class="num">命中次数</th>
+                    <th class="num">规则载荷</th>
+                  </tr>
+                </thead>
+                <tbody id="rules-body"></tbody>
+              </table>
+              <p id="rules-empty" class="empty-state" hidden>暂无符合条件的规则。</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB: 坏样本雷达 -->
+        <section id="tab-radar" class="tab-panel" hidden>
+          <div class="card filter-bar">
+            <div class="filter-group">
+              <span class="section-inline-title">雷达与基线棘轮</span>
+              <span id="radar-project-badge" class="pill">请选择项目</span>
+            </div>
+            <div class="filter-group">
+              <label class="filter-field">
+                <span>热点数量</span>
+                <select id="radar-top-select">
+                  <option value="5">Top 5</option>
+                  <option value="10" selected>Top 10</option>
+                  <option value="20">Top 20</option>
+                </select>
+              </label>
+            </div>
+          </div>
+
+          <div id="radar-skipped-banner" class="banner banner-warn" hidden></div>
+
+          <div class="radar-layout">
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <h2>基线棘轮</h2>
+                  <span id="baseline-updated" class="muted mono">更新时间：—</span>
+                </div>
+                <div class="card-header-actions">
+                  <button id="btn-baseline-tighten" class="btn btn-sm btn-secondary" type="button" title="将基线收紧到当前逃生舱数量">收紧基线</button>
+                  <button id="btn-baseline-reset" class="btn btn-sm btn-ghost" type="button" title="重置基线为当前状态">重置</button>
+                  <span id="baseline-state" class="pill">—</span>
+                </div>
+              </div>
+              <div class="card-body">
+                <div id="baseline-list" class="metric-list"></div>
+                <div id="suppressed-wrap" class="suppressed-wrap" hidden>
+                  <div class="sub-header">
+                    <span>已豁免文件</span>
+                    <span id="suppressed-count" class="pill">0</span>
+                  </div>
+                  <ul id="suppressed-list" class="suppressed-list"></ul>
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-header">
+                <h2>坏样本热点（6 维风险）</h2>
+                <span id="hotspots-count" class="muted">0 个文件</span>
+              </div>
+              <div class="table-wrap">
+                <table class="data-table hotspot-table">
+                  <thead>
+                    <tr>
+                      <th>文件</th>
+                      <th class="num" title="综合传染风险分">传染风险分</th>
+                      <th class="num" title="被引用次数">被引用</th>
+                      <th class="num" title="圈复杂度">复杂度</th>
+                      <th class="num" title="逃生舱数量">逃生舱</th>
+                      <th class="num" title="返工次数">返工次数</th>
+                      <th class="num" title="死代码">死代码</th>
+                      <th class="num" title="重复度">重复度</th>
+                    </tr>
+                  </thead>
+                  <tbody id="hotspot-body"></tbody>
+                </table>
+                <p id="hotspot-empty" class="empty-state" hidden>暂无热点数据。</p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB: 配置与体检 -->
+        <section id="tab-verify" class="tab-panel" hidden>
+          <div class="card filter-bar">
+            <div class="filter-group">
+              <button id="verify-tab-run" class="btn btn-secondary" type="button">立即体检</button>
+              <button id="verify-tab-run-ui" class="btn btn-primary" type="button">体检 + UI</button>
+              <label class="checkbox-field">
+                <input id="verify-opt-all" type="checkbox">
+                <span><code>--all</code>（全量扫描）</span>
+              </label>
+              <label class="checkbox-field">
+                <input id="verify-opt-record" type="checkbox" checked>
+                <span><code>--record</code>（写入 SQLite）</span>
+              </label>
+            </div>
+            <div id="verify-status-pill" class="pill">空闲</div>
+          </div>
+
+          <div id="verify-result-wrap" hidden>
+            <div class="stats stats-4">
+              <article class="stat-card">
+                <span class="stat-label">体检结果</span>
+                <strong id="verify-res-passed" class="stat-value">—</strong>
+                <span class="stat-sub">门禁状态</span>
+              </article>
+              <article class="stat-card">
+                <span class="stat-label">发现问题</span>
+                <strong id="verify-res-findings" class="stat-value">0</strong>
+                <span class="stat-sub">规则与检查项</span>
+              </article>
+              <article class="stat-card">
+                <span class="stat-label">逃生舱</span>
+                <strong id="verify-res-escapes" class="stat-value">0</strong>
+                <span class="stat-sub">检出模式数</span>
+              </article>
+              <article class="stat-card">
+                <span class="stat-label">耗时</span>
+                <strong id="verify-res-duration" class="stat-value">—</strong>
+                <span class="stat-sub">ms</span>
+              </article>
+            </div>
+
+            <div id="verify-skipped-banner" class="banner banner-warn" hidden></div>
+
+            <div class="card">
+              <div class="card-header">
+                <h2>检查发现</h2>
+                <span id="verify-findings-count" class="muted">0 项</span>
+              </div>
+              <div class="table-wrap">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>严重程度</th>
+                      <th>规则 / 检查项</th>
+                      <th>位置</th>
+                      <th>详情</th>
+                    </tr>
+                  </thead>
+                  <tbody id="verify-findings-body"></tbody>
+                </table>
+                <p id="verify-findings-empty" class="empty-state" hidden>未发现问题。</p>
+              </div>
+            </div>
+
+            <div id="verify-ui-card" class="card" hidden>
+              <div class="card-header">
+                <h2>UI 冒烟测试结果</h2>
+                <span id="verify-ui-pill" class="pill">—</span>
+              </div>
+              <div id="verify-ui-body" class="card-body"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h2>UI 截图</h2>
+              <span id="screenshots-count" class="muted">verify --ui</span>
+            </div>
+            <div class="card-body">
+              <div id="screenshot-grid" class="screenshot-grid"></div>
+              <p id="screenshot-empty" class="empty-state" hidden>暂无 UI 截图。可点击 <strong>体检 + UI</strong> 或运行 <code>slopguard verify --ui</code>。</p>
+            </div>
+          </div>
+
+          <div class="card" id="auto-guard-card">
+            <div class="card-header">
+              <div>
+                <h2>后台无感自动守护</h2>
+                <span class="muted">代码变更或 Git 提交时后台静默运行 verify，自动捕获错题至「错题栏」，平时零打扰</span>
+              </div>
+              <span id="guard-project-badge" class="pill">请选择项目</span>
+            </div>
+            <div class="card-body stack-list">
+              <p id="guard-empty-project" class="empty-state">请在左侧工作区选择一个具体项目后开启自动守护。</p>
+              <div id="guard-controls" class="stack-list" hidden>
+                <div class="guard-row">
+                  <div class="mcp-client-info">
+                    <div class="mcp-client-title">
+                      <span>文件变更防抖监听（5 秒）</span>
+                      <span id="guard-watch-pill" class="pill">未开启</span>
+                    </div>
+                    <div id="guard-watch-detail" class="mcp-client-path muted">检测到项目文件变更并稳定 5 秒后自动后台局部体检</div>
+                  </div>
+                  <button id="btn-toggle-guard-watch" class="btn btn-sm btn-primary" type="button">开启守护</button>
+                </div>
+                <div class="guard-row">
+                  <div class="mcp-client-info">
+                    <div class="mcp-client-title">
+                      <span>Git 提交后静默钩子（post-commit）</span>
+                      <span id="guard-hook-pill" class="pill">未安装</span>
+                    </div>
+                    <div id="guard-hook-detail" class="mcp-client-path muted">提交后后台静默记录错题，绝不阻塞 git commit（写入前自动备份原钩子）</div>
+                  </div>
+                  <button id="btn-toggle-guard-hook" class="btn btn-sm btn-secondary" type="button">安装钩子</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h2>AI Agent 安全接入（MCP &amp; Skill）</h2>
+                <span class="muted">优先推荐接入当前项目；写入前先预览完整 Diff 并自动备份至 <code>~/.slopguard/backups/</code>，支持一键还原</span>
+              </div>
+              <button id="btn-refresh-mcp" class="btn btn-sm btn-ghost" type="button">重新探测</button>
+            </div>
+            <div class="card-body stack-list">
+              <div class="section-subhead">MCP 服务配置</div>
+              <div id="mcp-clients-list" class="stack-list"></div>
+              <div class="section-subhead" style="margin-top: 6px;">Agent 规则文件（SKILL.md / Cursor Rule）</div>
+              <div id="skill-targets-list" class="stack-list"></div>
+            </div>
+          </div>
+
+          <div id="adapters-empty-project" class="empty-state card" hidden>
+            请在左侧工作区选择一个具体项目（或点击左上角 <strong>+ 添加项目</strong>），以查看已检测的语言适配器及 <code>.slopguard/config.yaml</code> 配置。
+          </div>
+
+          <div id="adapters-content" class="adapters-layout">
+            <div class="card">
+              <div class="card-header">
+                <h2>已检测适配器</h2>
+                <span id="adapters-count" class="muted">0 个适配器</span>
+              </div>
+              <div id="adapters-list" class="card-body stack-list"></div>
+            </div>
+
+            <div class="stack-list">
+              <div class="card">
+                <div class="card-header">
+                  <h2>.slopguard/config.yaml</h2>
+                  <span id="config-status" class="pill">—</span>
+                </div>
+                <div id="config-kv" class="card-body kv"></div>
+              </div>
+
+              <div class="card">
+                <div class="card-header">
+                  <h2>.slopguard/ui.yaml</h2>
+                  <span id="ui-config-status" class="pill">—</span>
+                </div>
+                <div id="ui-config-kv" class="card-body kv"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
     </div>
-    <div class="toolbar">
-      <label class="project-picker">
-        <span>项目</span>
-        <select id="project-select" aria-label="选择项目"></select>
-      </label>
-      <button id="refresh-button" class="button button-ghost" type="button">刷新</button>
+  </div>
+
+  <!-- 添加项目弹窗 -->
+  <div id="add-project-modal" class="lightbox" hidden role="dialog" aria-modal="true" aria-label="添加项目">
+    <div class="lightbox-backdrop" id="add-project-backdrop"></div>
+    <div class="modal-dialog">
+      <div class="lightbox-header">
+        <strong>添加本地项目</strong>
+        <button id="add-project-close" class="icon-btn" type="button" aria-label="关闭">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="muted">选择要守护的代码仓库目录，SlopGuard 将自动完成初始化与首次全量体检。</p>
+        <div class="folder-picker-row">
+          <input id="add-project-path" type="text" class="text-input mono" placeholder="/Users/.../your-project">
+          <button id="btn-pick-folder" class="btn btn-secondary" type="button">选择文件夹…</button>
+        </div>
+        <p id="add-project-feedback" class="modal-feedback muted" hidden></p>
+        <div class="modal-actions">
+          <button id="add-project-cancel" class="btn btn-ghost" type="button">取消</button>
+          <button id="btn-submit-add-project" class="btn btn-primary" type="button">初始化并首次体检</button>
+        </div>
+      </div>
     </div>
-  </header>
+  </div>
 
-  <main class="page">
-    <section class="hero">
-      <div>
-        <p class="eyebrow">DETERMINISTIC QUALITY GUARDRAILS</p>
-        <h1>代码质量护栏，<span>一眼看清。</span></h1>
-        <p class="hero-copy">运行记录、错题沉淀、规则生效与项目热点，全部来自本地 SQLite 与项目配置。</p>
+  <!-- Diff 预览与安全写入弹窗 -->
+  <div id="diff-preview-modal" class="lightbox" hidden role="dialog" aria-modal="true" aria-label="配置变更 Diff 预览">
+    <div class="lightbox-backdrop" id="diff-preview-backdrop"></div>
+    <div class="modal-dialog modal-wide">
+      <div class="lightbox-header">
+        <strong id="diff-preview-title">预览配置变更</strong>
+        <button id="diff-preview-close" class="icon-btn" type="button" aria-label="关闭">✕</button>
       </div>
-      <div class="hero-stamp">ZERO CGO<br><span>ZERO LLM</span></div>
-    </section>
+      <div class="modal-body">
+        <div class="diff-meta-row">
+          <span id="diff-scope-pill" class="pill">项目级</span>
+          <code id="diff-preview-path" class="mcp-client-path mono"></code>
+        </div>
+        <div id="diff-global-warning" class="banner banner-warn" hidden>
+          <span><strong>全局配置提醒：</strong>即将修改本机全局 AI 客户端配置。SlopGuard 写入前会自动保存原文件备份至 <code>~/.slopguard/backups/</code>，可随时在面板一键还原。</span>
+        </div>
+        <pre id="diff-preview-content" class="diff-view"></pre>
+        <p id="diff-preview-feedback" class="modal-feedback muted" hidden></p>
+        <div class="modal-actions">
+          <button id="diff-preview-cancel" class="btn btn-ghost" type="button">取消</button>
+          <button id="btn-confirm-diff-apply" class="btn btn-primary" type="button">确认写入</button>
+        </div>
+      </div>
+    </div>
+  </div>
 
-    <section class="section">
-      <div class="section-heading">
-        <div>
-          <p class="eyebrow">01 · EFFECT</p>
-          <h2>效果总览</h2>
-        </div>
-        <span id="overview-scope" class="muted">全部项目</span>
+  <!-- 截图预览弹窗 -->
+  <div id="lightbox" class="lightbox" hidden role="dialog" aria-modal="true" aria-label="截图预览">
+    <div class="lightbox-backdrop" id="lightbox-backdrop"></div>
+    <div class="lightbox-dialog">
+      <div class="lightbox-header">
+        <code id="lightbox-caption" class="mono"></code>
+        <button id="lightbox-close" class="icon-btn" type="button" aria-label="关闭预览">✕</button>
       </div>
-      <div id="overview-cards" class="stat-grid">
-        <article class="stat-card"><span class="stat-label">累计运行</span><strong id="stat-runs">—</strong><span class="stat-note">verify 次数</span></article>
-        <article class="stat-card"><span class="stat-label">拦截失败</span><strong id="stat-failed">—</strong><span class="stat-note">未通过门禁</span></article>
-        <article class="stat-card"><span class="stat-label">已沉淀规则</span><strong id="stat-rules">—</strong><span class="stat-note">active rules</span></article>
-        <article class="stat-card"><span class="stat-label">平均耗时</span><strong id="stat-duration">—</strong><span class="stat-note">ms / run</span></article>
+      <div class="lightbox-body">
+        <img id="lightbox-img" src="" alt="截图预览">
       </div>
-      <div class="panel chart-panel">
-        <div class="panel-heading">
-          <h3>逃生舱总量趋势</h3>
-          <span class="legend"><i class="dot dot-escapes"></i>escapes <i class="dot dot-runs"></i>runs</span>
-        </div>
-        <svg id="trend-chart" class="trend-chart" role="img" aria-label="逃生舱趋势图"></svg>
-        <p id="trend-empty" class="empty" hidden>暂无扫描记录。先运行一次 <code>slopguard verify --record</code>。</p>
-      </div>
-    </section>
+    </div>
+  </div>
 
-    <section class="section">
-      <div class="section-heading">
-        <div>
-          <p class="eyebrow">02 · LEARN</p>
-          <h2>错题本与规则进化</h2>
-        </div>
-        <span class="muted">按累计次数排序</span>
-      </div>
-      <div id="mistakes-list" class="mistake-list"></div>
-      <p id="mistakes-empty" class="empty" hidden>还没有错题记录。Agent 可通过 <code>sg_record_mistake</code> 录入。</p>
-    </section>
-
-    <section class="section">
-      <div class="section-heading">
-        <div>
-          <p class="eyebrow">03 · LEDGER</p>
-          <h2>规则台账</h2>
-        </div>
-        <span class="muted">规则起了什么作用</span>
-      </div>
-      <div class="panel table-panel">
-        <table class="data-table">
-          <thead><tr><th>作用域</th><th>引擎</th><th>规则</th><th>理由</th><th>创建时间</th><th class="num">命中</th></tr></thead>
-          <tbody id="rules-body"></tbody>
-        </table>
-        <p id="rules-empty" class="empty" hidden>暂无已生效规则。完成 dry-run 与用户确认后，规则会出现在这里。</p>
-      </div>
-    </section>
-
-    <section class="section">
-      <div class="section-heading">
-        <div>
-          <p class="eyebrow">04 · RADAR</p>
-          <h2>项目雷达与 UI 截图</h2>
-        </div>
-        <span id="radar-project" class="muted">选择项目查看</span>
-      </div>
-      <div class="radar-grid">
-        <div class="panel">
-          <div class="panel-heading"><h3>Baseline 棘轮水位</h3><span id="baseline-state" class="pill">—</span></div>
-          <div id="baseline-list" class="metric-list"></div>
-        </div>
-        <div class="panel">
-          <div class="panel-heading"><h3>Radar 热点</h3><span class="muted">Top 5</span></div>
-          <div id="hotspot-list" class="hotspot-list"></div>
-        </div>
-        <div class="panel screenshot-panel">
-          <div class="panel-heading"><h3>最近 UI 截图</h3><span class="muted">verify --ui</span></div>
-          <div id="screenshot-grid" class="screenshot-grid"></div>
-        </div>
-      </div>
-    </section>
-  </main>
-
-  <footer class="footer">
-    <span>SlopGuard · local-first dashboard</span>
-    <span id="last-updated"></span>
-  </footer>
   <script src="/static/app.js"></script>
 </body>
 </html>

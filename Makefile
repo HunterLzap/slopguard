@@ -5,7 +5,7 @@ BINARY  := slopguard
 PKG     := github.com/HunterLzap/slopguard
 LDFLAGS := -s -w
 
-.PHONY: all build build-all test lint clean
+.PHONY: all build build-all macos-app test lint clean
 
 all: build
 
@@ -18,6 +18,10 @@ build-all:
 	CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY)-darwin-amd64  ./cmd/slopguard
 	CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY)-darwin-arm64  ./cmd/slopguard
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY)-windows-amd64.exe ./cmd/slopguard
+	CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY)-windows-arm64.exe ./cmd/slopguard
+
+macos-app: build
+	./scripts/build-macos-app.sh
 
 test:
 	CGO_ENABLED=0 go test ./...

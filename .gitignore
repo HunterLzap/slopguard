@@ -1,6 +1,7 @@
 # Build artifacts
 dist/
 bin/
+build/
 *.exe
 *.test
 *.out

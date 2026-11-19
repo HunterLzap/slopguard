@@ -2304,6 +2304,40 @@ body.macos-frameless .workspace-topbar {
   border-color: var(--accent);
 }
 
+.inline-switch-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 29px;
+  padding: 0 9px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  font-size: 12px;
+  color: var(--fg);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.agent-diag {
+  font-size: 11px;
+  color: var(--fg-dim);
+  margin-top: 2px;
+}
+
+.agent-diag.ok {
+  color: var(--pass);
+}
+
+.agent-diag.warn {
+  color: var(--warning);
+}
+
+.agent-diag.fail {
+  color: var(--fail);
+}
+
 @media (max-width: 860px) {
   .onboarding-grid {
     grid-template-columns: 1fr;

@@ -52,6 +52,7 @@ type sessionScanResponse struct {
 	Scanned  sessionScanCounts      `json:"scanned"`
 	Found    int                    `json:"found"`
 	Imported int                    `json:"imported"`
+	AIQueued bool                   `json:"ai_queued"`
 	Items    []sessionScanCandidate `json:"items"`
 }
 
@@ -95,6 +96,13 @@ func (s *Server) handleScanSessions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := s.scanLocalSessionsAndRework(r.Context(), project, days, req.DryRun, req.Sources)
+	if !resp.DryRun && resp.Imported > 0 && s.ai != nil {
+		st := s.ai.Status()
+		if st.AutoAnalyze && st.ActiveRunner != "" {
+			resp.AIQueued = true
+			s.ai.TriggerAsync(project)
+		}
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 

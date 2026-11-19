@@ -31,6 +31,8 @@ func (s *Server) registerActionRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/agents", s.handleAgents)
 	mux.HandleFunc("/api/agents/preview", s.handlePreviewAgent)
 	mux.HandleFunc("/api/agents/toggle", s.handleToggleAgent)
+	mux.HandleFunc("/api/agents/verify", s.handleVerifyAgents)
+	mux.HandleFunc("/api/ai/config", s.handleAIConfig)
 	mux.HandleFunc("/api/guard/status", s.handleGuardStatus)
 	mux.HandleFunc("/api/guard/toggle", s.handleGuardToggle)
 	mux.HandleFunc("/api/sessions/scan", s.handleScanSessions)
@@ -445,6 +447,9 @@ func (s *Server) applyMCPTarget(target mcpClientStatus, project, action string) 
 				}
 			}
 		}
+		if target.ID == "antigravity" && strings.TrimSpace(s.homeDir) == "" {
+			syncAgyMCPRegistry(s.resolveHomeDir(), "", false)
+		}
 		return map[string]any{
 			"ok":                   true,
 			"client_id":            target.ID,
@@ -469,6 +474,9 @@ func (s *Server) applyMCPTarget(target mcpClientStatus, project, action string) 
 	}
 	if err := writeFileAtomic(target.ConfigPath, []byte(newText), 0o644); err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("写入 MCP 配置失败: %v", err)
+	}
+	if target.ID == "antigravity" && strings.TrimSpace(s.homeDir) == "" {
+		syncAgyMCPRegistry(s.resolveHomeDir(), exe, true)
 	}
 	return map[string]any{
 		"ok":          true,
@@ -804,11 +812,42 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 	if exeErr != nil {
 		exe = "slopguard"
 	}
+	profiles := discoverAgentProfiles(home, project)
+	var lastEventAt string
+	if s.db != nil {
+		if events, err := s.db.ListMCPEvents(r.Context(), project, "", 1); err == nil && len(events) > 0 {
+			lastEventAt = events[0].CreatedAt.UTC().Format(time.RFC3339)
+		}
+	}
+	agyCLIRegistered := false
+	if strings.TrimSpace(s.homeDir) == "" {
+		agyCLIRegistered = isSlopGuardInAgyMCPList(home)
+	}
+	for i := range profiles {
+		p := &profiles[i]
+		if p.HealthStatus != "pending_activation" {
+			continue
+		}
+		if p.ID == "antigravity" && agyCLIRegistered {
+			p.HealthStatus = "active"
+			p.HealthDetail = "MCP 配置完好 · Antigravity CLI 已注册（可点自检实时握手验证）"
+		} else if lastEventAt != "" {
+			p.LastEventAt = lastEventAt
+			p.HealthStatus = "active"
+			p.HealthDetail = "配置完好 · 已检测到真实 MCP 调用记录"
+		}
+	}
+
 	content, isCustom, updatedAt := loadSharedSkill(home)
+	var aiStatus any
+	if s.ai != nil {
+		aiStatus = s.ai.Status()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":          true,
 		"binary_path": exe,
-		"agents":      discoverAgentProfiles(home, project),
+		"agents":      profiles,
+		"ai_status":   aiStatus,
 		"shared_skill": map[string]any{
 			"path":            sharedSkillPath(home),
 			"content":         content,
@@ -817,6 +856,80 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 			"updated_at":      updatedAt,
 		},
 	})
+}
+
+func (s *Server) handleVerifyAgents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	var req struct {
+		AgentID string `json:"agent_id"`
+		Project string `json:"project"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	home := s.resolveHomeDir()
+	project := strings.TrimSpace(req.Project)
+	agentID := strings.TrimSpace(req.AgentID)
+	checkRealCLI := strings.TrimSpace(s.homeDir) == ""
+
+	profiles := discoverAgentProfiles(home, project)
+	reports := make([]AgentVerifyReport, 0, len(profiles))
+	for _, p := range profiles {
+		if agentID != "" && agentID != "all" && p.ID != agentID {
+			continue
+		}
+		if agentID == "" || agentID == "all" {
+			if !p.Enabled && !p.Partial && !p.Detected {
+				continue
+			}
+		}
+		reports = append(reports, verifyAgentProfile(r.Context(), home, project, p, s.db, checkRealCLI))
+	}
+	if len(reports) == 0 && agentID != "" && agentID != "all" {
+		writeError(w, http.StatusBadRequest, "未知的 Agent 标识")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"reports": reports,
+	})
+}
+
+func (s *Server) handleAIConfig(w http.ResponseWriter, r *http.Request) {
+	if s.ai == nil {
+		writeError(w, http.StatusInternalServerError, "AI manager is not initialized")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":     true,
+			"status": s.ai.Status(),
+		})
+	case http.MethodPost:
+		var req struct {
+			AutoAnalyze *bool   `json:"auto_analyze"`
+			RunnerID    *string `json:"runner_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON payload")
+			return
+		}
+		st, err := s.ai.SetConfig(req.AutoAnalyze, req.RunnerID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":     true,
+			"status": st,
+		})
+	default:
+		methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
+	}
 }
 
 func normalizeAgentAction(raw string) string {
@@ -993,7 +1106,7 @@ func (s *Server) handleAnalyzeAllMistakes(w http.ResponseWriter, r *http.Request
 		methodNotAllowed(w, http.MethodPost)
 		return
 	}
-	if s.db == nil {
+	if s.db == nil || s.ai == nil {
 		writeError(w, http.StatusInternalServerError, "store is not available")
 		return
 	}
@@ -1005,29 +1118,16 @@ func (s *Server) handleAnalyzeAllMistakes(w http.ResponseWriter, r *http.Request
 	}
 	project := strings.TrimSpace(req.Project)
 
-	pending, err := s.db.ListInboxMistakes(r.Context(), project, "pending_ai")
+	analyzed, recommended, skipped, err := s.ai.AnalyzePending(r.Context(), project)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
-	analyzed, recommended, skipped := 0, 0, 0
-	for _, m := range pending {
-		decision, reason, ruleDraft := analyzeMistakeDeterministic(m)
-		if err := s.db.SubmitMistakeAnalysis(r.Context(), m.Fingerprint, decision, reason, ruleDraft); err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("写入分析结果失败: %v", err))
-			return
-		}
-		analyzed++
-		if decision == "recommend" {
-			recommended++
-		} else {
-			skipped++
-		}
-	}
-
+	st := s.ai.Status()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":          true,
+		"runner":      st.ActiveRunner,
+		"duration_ms": st.LastDurationMS,
 		"analyzed":    analyzed,
 		"recommended": recommended,
 		"skipped":     skipped,

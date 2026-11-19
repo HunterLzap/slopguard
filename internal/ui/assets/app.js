@@ -19,6 +19,9 @@
     verifying: false,
     guardStatus: null,
     agentsData: null,
+    aiStatus: null,
+    agentReports: {},
+    aiPollTimer: null,
     diffPreview: null,
     userPickedReviewTab: false,
     recBannerDismissed: false,
@@ -721,12 +724,21 @@
 
     const analyzeBtn = $("btn-analyze-all");
     if (analyzeBtn) {
-      analyzeBtn.hidden = counts.pending_ai === 0;
-      analyzeBtn.textContent = `一键分析 (${counts.pending_ai})`;
+      const runningAI = Boolean(state.aiStatus?.running);
+      analyzeBtn.hidden = counts.pending_ai === 0 && !runningAI;
+      analyzeBtn.disabled = runningAI;
+      analyzeBtn.textContent = runningAI
+        ? `AI 分析中 (${state.aiStatus?.active_runner || "CLI"})…`
+        : `AI 分析 (${counts.pending_ai})`;
     }
 
     const banner = $("session-scan-banner");
-    if (banner && !state.recBannerDismissed && (recApprove > 0 || recSkip > 0)) {
+    if (state.aiStatus?.running) {
+      showInboxBanner(
+        `<strong>正在调用 ${escapeHTML(state.aiStatus.active_runner || "Agent")} 模型深入分析：</strong>完成后将自动刷新错题与建议…`
+      );
+      scheduleAIPoll();
+    } else if (banner && !state.recBannerDismissed && (recApprove > 0 || recSkip > 0)) {
       const parts = [];
       if (recApprove > 0) parts.push(`建议入库 <strong>${recApprove}</strong> 条`);
       if (recSkip > 0) parts.push(`建议忽略 <strong>${recSkip}</strong> 条`);
@@ -1540,6 +1552,88 @@
     $("shared-skill-modal").hidden = true;
   }
 
+  function renderAIStatus(aiStatus) {
+    state.aiStatus = aiStatus || null;
+    const autoSw = $("ai-auto-switch");
+    const sel = $("ai-runner-select");
+    const runners = Array.isArray(aiStatus?.runners) ? aiStatus.runners : [];
+    const hasAvailable = runners.some((r) => r.available);
+
+    if (autoSw) {
+      autoSw.checked = Boolean(aiStatus?.auto_analyze && hasAvailable);
+      autoSw.disabled = !hasAvailable;
+      if (!hasAvailable) {
+        autoSw.parentElement.dataset.tip = "未探测到本机 Agent CLI（如 agy / claude），暂时无法后台自动调用模型";
+      }
+    }
+    if (sel) {
+      sel.innerHTML = "";
+      const autoOpt = document.createElement("option");
+      autoOpt.value = "";
+      autoOpt.textContent = aiStatus?.active_runner
+        ? `模型：自动 (${aiStatus.active_runner})`
+        : "模型：未检测到 CLI";
+      sel.appendChild(autoOpt);
+      for (const r of runners) {
+        const opt = document.createElement("option");
+        opt.value = r.id;
+        opt.textContent = r.available ? r.name : `${r.name} (未安装)`;
+        opt.disabled = !r.available;
+        sel.appendChild(opt);
+      }
+      sel.value = aiStatus?.runner_id || "";
+    }
+  }
+
+  function scheduleAIPoll() {
+    if (state.aiPollTimer) return;
+    state.aiPollTimer = setTimeout(async () => {
+      state.aiPollTimer = null;
+      try {
+        const res = await api("/api/ai/config");
+        renderAIStatus(res.status || null);
+        if (res.status?.running) {
+          scheduleAIPoll();
+        } else {
+          await refresh();
+        }
+      } catch {
+        // Ignore transient poll errors.
+      }
+    }, 3000);
+  }
+
+  async function updateAIConfig(patch) {
+    try {
+      const res = await api("/api/ai/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      renderAIStatus(res.status || null);
+    } catch (error) {
+      alert(`AI 设置更新失败：${error.message}`);
+    }
+  }
+
+  function formatAgentHealthPill(item, report) {
+    const hs = report?.health_status || item.health_status || (item.enabled ? "pending_activation" : "not_configured");
+    const detail = report?.diagnosis || item.health_detail || "";
+    if (hs === "active") {
+      return `<span class="pill pass" data-tip="${escapeHTML(detail)}">已激活 · 可用</span>`;
+    }
+    if (hs === "broken") {
+      return `<span class="pill fail" data-tip="${escapeHTML(detail)}">配置失效</span>`;
+    }
+    if (hs === "pending_activation") {
+      return `<span class="pill warn" data-tip="${escapeHTML(detail)}">待激活</span>`;
+    }
+    if (item.detected) {
+      return '<span class="pill" data-tip="本机已安装此客户端，打开右侧开关即可接入">已检测</span>';
+    }
+    return "";
+  }
+
   function renderAgentList(container, agents) {
     if (!container) return;
     container.innerHTML = "";
@@ -1552,12 +1646,18 @@
       const row = document.createElement("div");
       row.className = "agent-row";
 
-      const statusPill = item.enabled
-        ? '<span class="pill pass">已接入</span>'
-        : (item.partial ? '<span class="pill warn">部分接入</span>' : '');
+      const report = state.agentReports[item.id] || null;
+      const statusPill = formatAgentHealthPill(item, report);
       const recPill = item.recommended ? '<span class="pill accent">推荐</span>' : "";
       const backupPill = item.has_backup ? '<span class="pill">已备份</span>' : "";
       const pathText = shortPathDisplay(item.primary_path || "");
+      let diagHTML = "";
+      if (report?.diagnosis) {
+        const dCls = report.health_status === "active"
+          ? "ok"
+          : (report.health_status === "broken" ? "fail" : "warn");
+        diagHTML = `<div class="agent-diag ${dCls}">${escapeHTML(report.diagnosis)}</div>`;
+      }
 
       row.innerHTML = `
         <div class="agent-row-main">
@@ -1570,15 +1670,20 @@
               ${backupPill}
             </div>
             <div class="agent-path mono" title="${escapeHTML(item.primary_path || "")}">${escapeHTML(pathText)}</div>
+            ${diagHTML}
           </div>
         </div>
         <div class="agent-row-controls">
-          <label class="switch" title="${item.needs_project ? "请先在左侧选择项目" : (item.enabled ? "关闭 / 还原配置" : "接入 SlopGuard")}">
+          <button class="btn btn-sm btn-ghost js-verify-agent" type="button" ${item.needs_project ? "disabled" : ""} data-tip="实际运行一次 stdio MCP 握手并校验客户端接入状态">自检</button>
+          <label class="switch" title="${item.needs_project ? "请先在顶部下拉框选择项目" : (item.enabled ? "关闭 / 还原配置" : "接入 SlopGuard")}">
             <input type="checkbox" ${item.enabled ? "checked" : ""} ${item.needs_project ? "disabled" : ""} aria-label="接入 ${escapeHTML(item.name)}">
             <span class="switch-slider"></span>
           </label>
           <button class="chevron-btn" type="button" title="预览 Diff 与还原" ${item.needs_project ? "disabled" : ""} aria-label="查看 ${escapeHTML(item.name)} 详情">›</button>
         </div>`;
+
+      const verifyBtn = row.querySelector(".js-verify-agent");
+      verifyBtn.addEventListener("click", () => verifyAgents(item.id, verifyBtn));
 
       const checkbox = row.querySelector('input[type="checkbox"]');
       checkbox.addEventListener("change", async () => {
@@ -1608,6 +1713,39 @@
     }
   }
 
+  async function verifyAgents(agentID, triggerBtn) {
+    const origText = triggerBtn ? triggerBtn.textContent : "";
+    if (triggerBtn) {
+      triggerBtn.disabled = true;
+      triggerBtn.textContent = "自检中…";
+    }
+    try {
+      const res = await api("/api/agents/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ agent_id: agentID, project: state.project || "" }),
+      });
+      const reports = Array.isArray(res.reports) ? res.reports : [];
+      for (const rep of reports) {
+        if (rep.agent_id) {
+          state.agentReports[rep.agent_id] = rep;
+        }
+      }
+      if (state.agentsData?.agents) {
+        renderAgentList($("agents-list"), state.agentsData.agents);
+      } else {
+        await loadAgents();
+      }
+    } catch (error) {
+      alert(`自检失败：${error.message}`);
+    } finally {
+      if (triggerBtn) {
+        triggerBtn.disabled = false;
+        triggerBtn.textContent = origText || "自检";
+      }
+    }
+  }
+
   async function loadAgents() {
     const listEl = $("agents-list");
     const hintEl = $("mcp-project-hint");
@@ -1624,6 +1762,9 @@
           hintEl.hidden = true;
           hintEl.innerHTML = "";
         }
+      }
+      if (data.ai_status) {
+        renderAIStatus(data.ai_status);
       }
       renderSharedSkillBox(data.shared_skill || null);
       renderAgentList(listEl, agents);
@@ -1887,18 +2028,21 @@
     const btn = $("btn-analyze-all");
     if (!btn) return;
     btn.disabled = true;
-    btn.textContent = "分析中…";
+    const runnerLabel = state.aiStatus?.active_runner || "Agent";
+    btn.textContent = `AI 分析中 (${runnerLabel})…`;
     state.recBannerDismissed = false;
+    showInboxBanner(`<strong>正在调用本机 ${escapeHTML(runnerLabel)} 模型深入分析：</strong>请稍候（约 15~40 秒）…`);
     try {
       const res = await api("/api/mistakes/analyze-all", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ project: state.project || "" }),
       });
-      showInboxBanner(`<strong>一键分析完成：</strong>共评估 <strong>${res.analyzed || 0}</strong> 条（建议入库 <strong>${res.recommended || 0}</strong> 条 · 建议忽略 <strong>${res.skipped || 0}</strong> 条）。`);
+      const sec = res.duration_ms ? `${(Number(res.duration_ms) / 1000).toFixed(1)}s` : "";
+      showInboxBanner(`<strong>AI 模型分析完成 (${escapeHTML(res.runner || runnerLabel)}${sec ? ` · ${sec}` : ""})：</strong>共评估 <strong>${res.analyzed || 0}</strong> 条（建议入库 <strong>${res.recommended || 0}</strong> 条 · 建议忽略 <strong>${res.skipped || 0}</strong> 条）。`);
       await refresh();
     } catch (error) {
-      showInboxBanner(`分析失败：${escapeHTML(error.message)}`);
+      showInboxBanner(`<strong>AI 分析未完成：</strong>${escapeHTML(error.message)}`);
     } finally {
       btn.disabled = false;
     }
@@ -1939,12 +2083,16 @@
         body: JSON.stringify({ project: state.project || "", days: 14 }),
       });
       const sc = res.scanned || {};
+      const aiNote = res.ai_queued ? " · <strong>已后台自动拉起本机 AI 模型分析中…</strong>" : "";
       showInboxBanner(
         `<strong>嗅探完成（近 ${res.days || 14} 天）：</strong>` +
         `Git ${sc.git_commits || 0} 提交 · Claude ${sc.claude_files || 0} · Codex ${sc.codex_files || 0} · Antigravity ${sc.antigravity_files || 0}；` +
-        `提取 <strong>${res.found || 0}</strong> 条，入库 <strong>${res.imported || 0}</strong> 条。`
+        `提取 <strong>${res.found || 0}</strong> 条，入库 <strong>${res.imported || 0}</strong> 条${aiNote}`
       );
       await refresh();
+      if (res.ai_queued) {
+        scheduleAIPoll();
+      }
     } catch (error) {
       showInboxBanner(`嗅探失败：${escapeHTML(error.message)}`);
     } finally {
@@ -2111,6 +2259,8 @@
     });
     $("btn-analyze-all")?.addEventListener("click", analyzeAllMistakes);
     $("btn-scan-sessions").addEventListener("click", scanLocalSessions);
+    $("ai-auto-switch")?.addEventListener("change", (e) => updateAIConfig({ auto_analyze: e.currentTarget.checked }));
+    $("ai-runner-select")?.addEventListener("change", (e) => updateAIConfig({ runner_id: e.currentTarget.value }));
 
     // 总览 KPI 卡片跳转
     $("stat-card-escapes")?.addEventListener("click", (e) => {
@@ -2175,6 +2325,7 @@
     $("service-switch")?.addEventListener("change", (e) => toggleService(e.currentTarget.checked));
     $("btn-baseline-tighten").addEventListener("click", () => runBaselineAction("tighten"));
     $("btn-baseline-reset").addEventListener("click", () => runBaselineAction("reset"));
+    $("btn-verify-all-agents")?.addEventListener("click", (e) => verifyAgents("all", e.currentTarget));
     $("btn-refresh-mcp").addEventListener("click", loadAgents);
     $("btn-open-shared-skill")?.addEventListener("click", openSharedSkillModal);
     $("shared-skill-close")?.addEventListener("click", closeSharedSkillModal);

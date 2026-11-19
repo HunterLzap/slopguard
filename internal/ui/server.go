@@ -48,12 +48,14 @@ type Server struct {
 	port    int
 	homeDir string
 	guard   *GuardManager
+	ai      *AIManager
 }
 
 // NewServer creates a dashboard server backed by the given store and runner.
 func NewServer(db *store.Store, runner contract.Runner) *Server {
 	s := &Server{db: db, runner: runner}
 	s.guard = newGuardManager(s)
+	s.ai = newAIManager(s)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(mustSubFS(assets, "assets")))))
@@ -362,22 +364,6 @@ func buildLocalMistakeHint(m store.MistakeRecord) string {
 	}
 }
 
-func isThirdPartyNoisePath(m store.MistakeRecord) bool {
-	hay := strings.ToLower(m.Summary + "\n" + m.BadSnippet)
-	noiseMarkers := []string{
-		"/.cache/", "\\.cache\\", ".cache/uv/",
-		"/node_modules/", "\\node_modules\\",
-		"/.venv/", "\\.venv\\", "/site-packages/",
-		"/__pycache__/", "/.pytest_cache/", "/.ruff_cache/", "/.mypy_cache/",
-	}
-	for _, marker := range noiseMarkers {
-		if strings.Contains(hay, marker) {
-			return true
-		}
-	}
-	return false
-}
-
 func extractRuleTokenAfterColon(summary, prefix string) string {
 	lower := strings.ToLower(summary)
 	idx := strings.Index(lower, prefix)
@@ -468,42 +454,6 @@ func deriveRuleFromMistake(m store.MistakeRecord) (engineName, ruleID, payload s
 		}
 	}
 	return engineName, ruleID, payload
-}
-
-// analyzeMistakeDeterministic runs a zero-LLM deterministic assessment on a captured mistake,
-// classifying third-party noise vs repeatable issues and producing a concise Chinese rationale.
-func analyzeMistakeDeterministic(m store.MistakeRecord) (decision, reason, ruleDraft string) {
-	if isThirdPartyNoisePath(m) {
-		return "skip", "命中第三方缓存或虚拟环境目录（如 .cache / node_modules），属于环境噪音误报，建议忽略。", ""
-	}
-
-	_, _, draft := deriveRuleFromMistake(m)
-	hay := strings.ToLower(m.Summary + "\n" + m.BadSnippet)
-	cat := strings.ToLower(strings.TrimSpace(m.Category))
-
-	shouldRecommend := m.Count >= 2 ||
-		cat == "type" ||
-		cat == "escape" ||
-		strings.Contains(hay, "ratchet:") ||
-		strings.Contains(hay, "reportoptional") ||
-		strings.Contains(hay, "no-explicit-any") ||
-		strings.Contains(hay, "ts2322") ||
-		strings.Contains(hay, "ts2345") ||
-		strings.Contains(hay, "importerror") ||
-		strings.Contains(hay, "modulenotfounderror") ||
-		strings.Contains(hay, "f401") ||
-		strings.Contains(hay, "f841") ||
-		strings.Contains(hay, "no-unused-vars")
-
-	hint := buildLocalMistakeHint(m)
-	if shouldRecommend {
-		prefix := ""
-		if m.Count >= 2 {
-			prefix = fmt.Sprintf("该问题已累计触发 %d 次，", m.Count)
-		}
-		return "recommend", prefix + hint + " 建议转为项目防线规则长期拦截。", draft
-	}
-	return "skip", hint + " 当前仅偶发 1 次，建议先观察是否复发后再决定是否入库。", ""
 }
 
 func ensureRuleForApprovedMistake(ctx context.Context, db *store.Store, m store.MistakeRecord) error {
@@ -1255,6 +1205,9 @@ func (s *Server) runVerify(ctx context.Context, runner contract.Runner, project 
 		_ = s.db.RecordScan(ctx, project, result.DurationMs, totalEscapes, result.Passed)
 		if !result.Passed && len(result.Findings) > 0 {
 			autoCaptureVerifyMistakesUI(ctx, s.db, project, result.Findings, req.Source)
+			if s.ai != nil {
+				s.ai.TriggerAsync(project)
+			}
 		}
 	}
 	return result, nil

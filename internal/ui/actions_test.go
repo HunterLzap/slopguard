@@ -728,9 +728,39 @@ func TestAnalyzeAllAndApproveCreatesRule(t *testing.T) {
 
 	s := NewServer(db, nil)
 	s.homeDir = home
+	s.ai.analyzeFn = func(_ context.Context, _ AgentCLIRunner, _ string, mistakes []store.MistakeRecord) ([]AIAnalysisItem, error) {
+		out := make([]AIAnalysisItem, 0, len(mistakes))
+		for _, m := range mistakes {
+			if strings.Contains(m.Summary, ".cache") || strings.Contains(m.Summary, ".venv") {
+				out = append(out, AIAnalysisItem{
+					Fingerprint: m.Fingerprint,
+					Decision:    "skip",
+					Reason:      "属于缓存目录噪音，建议忽略。",
+				})
+			} else {
+				out = append(out, AIAnalysisItem{
+					Fingerprint: m.Fingerprint,
+					Decision:    "recommend",
+					Reason:      "模型判断属于真实类型安全风险，建议入库拦截。",
+					RuleDraft:   m.Summary,
+				})
+			}
+		}
+		return out, nil
+	}
 	handler := s.Handler()
 
-	// 1. Batch deterministic analysis classifies cache noise as skip and optional member access as recommend.
+	// Verify AI config toggle persists cleanly.
+	aiOn := false
+	cfgCode, cfgBody := postDashboardJSON(t, handler, "/api/ai/config", map[string]any{
+		"auto_analyze": aiOn,
+		"runner_id":    "agy",
+	})
+	if cfgCode != http.StatusOK {
+		t.Fatalf("POST /api/ai/config = %d: %s", cfgCode, cfgBody)
+	}
+
+	// 1. Real Agent CLI pipeline classifies cache noise as skip and optional member access as recommend.
 	aCode, aBody := postDashboardJSON(t, handler, "/api/mistakes/analyze-all", map[string]any{
 		"project": project,
 	})
@@ -805,5 +835,77 @@ func TestAnalyzeAllAndApproveCreatesRule(t *testing.T) {
 	allRulesAfter, _ := db.ListRuleLedger(context.Background(), store.RuleLedgerQuery{ProjectPath: project})
 	if len(allRulesAfter) != 2 {
 		t.Fatalf("expected 2 rules after apply-recommendations, got %d", len(allRulesAfter))
+	}
+}
+
+func TestParseAgentAnalysisOutputAndCodexTOMLVerify(t *testing.T) {
+	// 1. Parse agy structured_output JSON envelope cleanly.
+	raw := []byte(`{"status":"SUCCESS","structured_output":{"items":[{"fingerprint":"fp-1","decision":"recommend","reason":"空值风险","rule_draft":"{\"reportOptionalMemberAccess\":\"error\"}"}]}}`)
+	items, err := parseAgentAnalysisOutput(raw)
+	if err != nil || len(items) != 1 || items[0].Fingerprint != "fp-1" || items[0].Decision != "recommend" {
+		t.Fatalf("parseAgentAnalysisOutput = %+v, err=%v", items, err)
+	}
+
+	// 2. Codex TOML upsert/restore preserves existing MCP servers + verify detects broken path.
+	home := t.TempDir()
+	db := openDashboardStore(t)
+	codexTOMLPath := filepath.Join(home, ".codex", "config.toml")
+	codexSkillPath := filepath.Join(home, ".codex", "skills", "slopguard", "SKILL.md")
+	origTOML := "model = \"gpt-5\"\n\n[mcp_servers.computer-use]\ncommand = \"echo\"\nargs = [\"mcp\"]\n"
+	writeDashboardFile(t, codexTOMLPath, origTOML)
+
+	// Broken cursor config pointing to missing binary.
+	writeDashboardFile(t, filepath.Join(home, ".cursor", "mcp.json"), `{"mcpServers":{"slopguard":{"command":"/nonexistent/slopguard-bin","args":["mcp"]}}}`)
+
+	s := NewServer(db, nil)
+	s.homeDir = home
+	handler := s.Handler()
+
+	// Enable Codex (MCP TOML + Skill).
+	cCode, cBody := postDashboardJSON(t, handler, "/api/agents/toggle", map[string]any{
+		"agent_id":  "codex",
+		"enable":    true,
+		"confirmed": true,
+	})
+	if cCode != http.StatusOK {
+		t.Fatalf("toggle codex on = %d: %s", cCode, cBody)
+	}
+	tomlData, _ := os.ReadFile(codexTOMLPath)
+	if !strings.Contains(string(tomlData), "[mcp_servers.computer-use]") || !strings.Contains(string(tomlData), "[mcp_servers.slopguard]") {
+		t.Fatalf("codex toml unexpected:\n%s", string(tomlData))
+	}
+	if !isSkillConfigured(codexSkillPath) {
+		t.Fatalf("expected codex SKILL.md created")
+	}
+
+	// Verify cursor reports broken binary & diagnosis.
+	vCode, vBody := postDashboardJSON(t, handler, "/api/agents/verify", map[string]any{
+		"agent_id": "cursor",
+	})
+	if vCode != http.StatusOK {
+		t.Fatalf("POST /api/agents/verify = %d: %s", vCode, vBody)
+	}
+	vJSON := decodeDashboardJSON(t, vBody)
+	reports, _ := vJSON["reports"].([]any)
+	if len(reports) != 1 {
+		t.Fatalf("expected 1 verify report, got %v", vJSON)
+	}
+	repMap, _ := reports[0].(map[string]any)
+	if repMap["health_status"] != "broken" || repMap["binary_ok"] != false {
+		t.Fatalf("expected broken status for missing binary, got %v", repMap)
+	}
+
+	// Restore Codex reverts TOML cleanly.
+	rCode, rBody := postDashboardJSON(t, handler, "/api/agents/toggle", map[string]any{
+		"agent_id":  "codex",
+		"enable":    false,
+		"confirmed": true,
+	})
+	if rCode != http.StatusOK {
+		t.Fatalf("toggle codex off = %d: %s", rCode, rBody)
+	}
+	restoredTOML, _ := os.ReadFile(codexTOMLPath)
+	if string(restoredTOML) != origTOML {
+		t.Fatalf("expected restored TOML:\n%q\ngot:\n%q", origTOML, string(restoredTOML))
 	}
 }

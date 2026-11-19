@@ -428,6 +428,7 @@
                 <button type="button" class="help-tip" data-tip="勾选下方任意 Agent 即可自动接入 MCP 与共享护栏规则；修改全局配置前会先预览 Diff 并自动备份至 ~/.slopguard/backups/" aria-label="Agent 接入说明">?</button>
               </div>
               <div class="card-header-actions">
+                <button id="btn-verify-all-agents" class="btn btn-sm btn-secondary" type="button" data-tip="实测所有已配置 Agent 的真实 stdio MCP 握手、可执行文件有效性及客户端激活状态">自检全部</button>
                 <button id="btn-open-shared-skill" class="btn btn-sm btn-secondary" type="button">共享护栏指令</button>
                 <button id="btn-generic-mcp" class="btn btn-sm btn-secondary" type="button">通用配置</button>
                 <button id="btn-refresh-mcp" class="btn btn-sm btn-ghost" type="button">刷新</button>
@@ -518,7 +519,7 @@
                 </button>
               </div>
               <div class="card-header-actions">
-                <button id="btn-analyze-all" class="btn btn-primary btn-sm" type="button" hidden data-tip="按本地确定性规则一键批量分析待处理错题，自动给出「建议入库 / 建议忽略」和规则草案">一键分析</button>
+                <button id="btn-analyze-all" class="btn btn-primary btn-sm" type="button" hidden data-tip="调用本机已登录 Agent 大模型批量评估待处理错题，输出真实 AI 建议与规则草案">AI 分析</button>
                 <button id="btn-scan-sessions" class="btn btn-secondary btn-sm" type="button">嗅探会话</button>
                 <button type="button" class="help-tip" data-tip="纯只读扫描近 14 天本地 Agent 会话与 Git fix 提交，补充潜在错题" aria-label="嗅探说明">?</button>
               </div>
@@ -533,6 +534,11 @@
                 <select id="mistakes-filter-source" class="compact-select" aria-label="按来源筛选">
                   <option value="">全部来源</option>
                 </select>
+                <label class="inline-switch-chip" data-tip="开启后，每次嗅探会话、立即体检或后台守护抓到新错题时，自动调用本机已登录 Agent 模型进行深度分析">
+                  <input id="ai-auto-switch" type="checkbox">
+                  <span>自动调 AI</span>
+                </label>
+                <select id="ai-runner-select" class="compact-select" aria-label="选择本机 AI 模型引擎" data-tip="指定用于后台与一键分析的本机 Agent CLI"></select>
                 <span id="mistakes-summary" class="muted" style="margin-left:auto; font-size:12px;">0 条</span>
               </div>
 

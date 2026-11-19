@@ -1,17 +1,24 @@
 package ui
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/HunterLzap/slopguard/internal/store"
 	"github.com/HunterLzap/slopguard/skills"
 )
 
@@ -211,8 +218,15 @@ func discoverMCPClients(home, project string) []mcpClientStatus {
 			return
 		}
 		_, err := os.Stat(path)
-		_, parentErr := os.Stat(filepath.Dir(path))
-		detected := alwaysDetect || err == nil || parentErr == nil
+		detected := alwaysDetect || err == nil
+		if !detected && filepath.Dir(path) != home {
+			_, parentErr := os.Stat(filepath.Dir(path))
+			detected = parentErr == nil
+		}
+		if id == "claude_code" && !detected && home != "" {
+			_, claudeDirErr := os.Stat(filepath.Join(home, ".claude"))
+			detected = claudeDirErr == nil || lookupAgentCLIBinary(home, "claude") != ""
+		}
 		_, rec, hasBackup := lookupBackup(backupsDir, "mcp", id, path)
 		list = append(list, mcpClientStatus{
 			ID:          id,
@@ -236,6 +250,7 @@ func discoverMCPClients(home, project string) []mcpClientStatus {
 		add("antigravity", "Antigravity (全局)", filepath.Join(home, ".gemini", "antigravity", "mcp_config.json"), "global", false, false)
 		add("claude_code", "Claude Code (全局)", filepath.Join(home, ".claude.json"), "global", false, false)
 		add("cursor", "Cursor (全局)", filepath.Join(home, ".cursor", "mcp.json"), "global", false, false)
+		add("codex", "Codex (全局)", filepath.Join(home, ".codex", "config.toml"), "global", false, false)
 	}
 	return list
 }
@@ -247,24 +262,160 @@ func mcpArgsForClient(clientID, project string) []string {
 	return []string{"mcp"}
 }
 
-func isSlopGuardConfigured(path string) bool {
+func isTOMLPath(path string) bool {
+	return strings.EqualFold(filepath.Ext(strings.TrimSpace(path)), ".toml")
+}
+
+func parseCodexSlopGuardBlock(text string) (cmd string, args []string, found bool) {
+	lines := strings.Split(text, "\n")
+	inSection := false
+	for _, raw := range lines {
+		trimmed := strings.TrimSpace(raw)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			sec := strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+			if sec == "mcp_servers.slopguard" {
+				inSection = true
+				found = true
+				continue
+			}
+			if inSection {
+				break
+			}
+			continue
+		}
+		if !inSection || trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if eq := strings.IndexByte(trimmed, '='); eq > 0 {
+			key := strings.TrimSpace(trimmed[:eq])
+			val := strings.TrimSpace(trimmed[eq+1:])
+			switch key {
+			case "command":
+				if unq, err := strconv.Unquote(val); err == nil {
+					cmd = unq
+				} else {
+					cmd = strings.Trim(val, `"'`)
+				}
+			case "args":
+				var parsed []string
+				if err := json.Unmarshal([]byte(val), &parsed); err == nil {
+					args = parsed
+				}
+			}
+		}
+	}
+	return cmd, args, found
+}
+
+func readConfiguredMCPCommand(path string) (command string, args []string, configured bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return false
+		return "", nil, false
+	}
+	if isTOMLPath(path) {
+		cmd, parsedArgs, found := parseCodexSlopGuardBlock(string(data))
+		return cmd, parsedArgs, found && cmd != ""
 	}
 	var raw map[string]any
 	if err := json.Unmarshal(data, &raw); err != nil {
-		return false
+		return "", nil, false
 	}
 	servers, ok := raw["mcpServers"].(map[string]any)
 	if !ok {
+		return "", nil, false
+	}
+	entry, exists := servers["slopguard"].(map[string]any)
+	if !exists {
+		return "", nil, false
+	}
+	cmd, _ := entry["command"].(string)
+	if rawArgs, ok := entry["args"].([]any); ok {
+		for _, a := range rawArgs {
+			if s, ok := a.(string); ok {
+				args = append(args, s)
+			}
+		}
+	}
+	return strings.TrimSpace(cmd), args, strings.TrimSpace(cmd) != ""
+}
+
+func isExecutableFile(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
 		return false
 	}
-	_, exists := servers["slopguard"]
-	return exists
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o111 == 0 {
+		return false
+	}
+	return true
+}
+
+func isSlopGuardConfigured(path string) bool {
+	_, _, configured := readConfiguredMCPCommand(path)
+	return configured
+}
+
+func formatCodexSlopGuardSection(binaryPath string, args []string) string {
+	argsJSON, _ := json.Marshal(args)
+	return fmt.Sprintf("[mcp_servers.slopguard]\ncommand = %s\nargs = %s\n", strconv.Quote(binaryPath), string(argsJSON))
+}
+
+func replaceOrRemoveCodexSection(oldText, replacement string, remove bool) string {
+	normalized := strings.ReplaceAll(oldText, "\r\n", "\n")
+	lines := strings.Split(normalized, "\n")
+	var out []string
+	inSection := false
+	replaced := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			sec := strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+			if sec == "mcp_servers.slopguard" {
+				inSection = true
+				if !remove && !replaced {
+					out = append(out, strings.TrimRight(replacement, "\n"))
+					replaced = true
+				}
+				continue
+			}
+			inSection = false
+		}
+		if inSection {
+			continue
+		}
+		out = append(out, line)
+	}
+	if !remove && !replaced {
+		joined := strings.TrimRight(strings.Join(out, "\n"), "\n")
+		if joined == "" {
+			return replacement
+		}
+		return joined + "\n\n" + replacement
+	}
+	res := strings.TrimRight(strings.Join(out, "\n"), "\n")
+	if res == "" {
+		return ""
+	}
+	return res + "\n"
 }
 
 func renderMCPUpsert(path, binaryPath string, args []string) (oldText, newText string, existed bool, err error) {
+	if isTOMLPath(path) {
+		if data, readErr := os.ReadFile(path); readErr == nil {
+			existed = true
+			oldText = string(data)
+		} else if !os.IsNotExist(readErr) {
+			return "", "", false, readErr
+		}
+		section := formatCodexSlopGuardSection(binaryPath, args)
+		return oldText, replaceOrRemoveCodexSection(oldText, section, false), existed, nil
+	}
+
 	root := map[string]any{}
 	if data, readErr := os.ReadFile(path); readErr == nil {
 		existed = true
@@ -305,6 +456,10 @@ func renderMCPRemove(path string) (oldText, newText string, removeFile bool, err
 		return "", "", false, readErr
 	}
 	oldText = string(data)
+	if isTOMLPath(path) {
+		newText = replaceOrRemoveCodexSection(oldText, "", true)
+		return oldText, newText, strings.TrimSpace(newText) == "", nil
+	}
 	if len(strings.TrimSpace(oldText)) == 0 {
 		return oldText, "", true, nil
 	}
@@ -480,10 +635,94 @@ type agentProfile struct {
 	Partial      bool               `json:"partial"`
 	HasBackup    bool               `json:"has_backup"`
 	NeedsProject bool               `json:"needs_project"`
+	BinaryOK     bool               `json:"binary_ok"`
+	HealthStatus string             `json:"health_status"` // not_configured | broken | pending_activation | active
+	HealthDetail string             `json:"health_detail,omitempty"`
+	LastEventAt  string             `json:"last_event_at,omitempty"`
 	PrimaryPath  string             `json:"primary_path"`
 	Note         string             `json:"note,omitempty"`
 	MCPTarget    *mcpClientStatus   `json:"mcp_target,omitempty"`
 	SkillTarget  *skillTargetStatus `json:"skill_target,omitempty"`
+}
+
+func detectClientInstalled(home, agentID string) bool {
+	switch agentID {
+	case "project":
+		return true
+	case "antigravity":
+		if _, err := os.Stat("/Applications/Antigravity.app"); err == nil {
+			return true
+		}
+		if lookupAgentCLIBinary(home, "agy") != "" {
+			return true
+		}
+		_, err := os.Stat(filepath.Join(home, ".gemini", "antigravity"))
+		return err == nil
+	case "claude_code":
+		if lookupAgentCLIBinary(home, "claude") != "" {
+			return true
+		}
+		if _, err := os.Stat(filepath.Join(home, ".claude")); err == nil {
+			return true
+		}
+		_, err := os.Stat(filepath.Join(home, ".claude.json"))
+		return err == nil
+	case "cursor":
+		if _, err := os.Stat("/Applications/Cursor.app"); err == nil {
+			return true
+		}
+		_, err := os.Stat(filepath.Join(home, ".cursor"))
+		return err == nil
+	case "codex":
+		if lookupAgentCLIBinary(home, "codex") != "" {
+			return true
+		}
+		_, err := os.Stat(filepath.Join(home, ".codex"))
+		return err == nil
+	default:
+		return false
+	}
+}
+
+func isSlopGuardInAgyMCPList(home string) bool {
+	agyBin := lookupAgentCLIBinary(home, "agy")
+	if agyBin == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, agyBin, "mcp", "list")
+	cmd.Env = augmentedCLIEnv(home)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 3 && fields[0] == "slopguard" && strings.EqualFold(fields[2], "enabled") {
+			return true
+		}
+	}
+	return false
+}
+
+func syncAgyMCPRegistry(home, exe string, enable bool) {
+	agyBin := lookupAgentCLIBinary(home, "agy")
+	if agyBin == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// Remove first so re-adding updates path cleanly when SlopGuard.app moves.
+	rmCmd := exec.CommandContext(ctx, agyBin, "mcp", "remove", "slopguard")
+	rmCmd.Env = augmentedCLIEnv(home)
+	_ = rmCmd.Run()
+	if !enable || strings.TrimSpace(exe) == "" {
+		return
+	}
+	addCmd := exec.CommandContext(ctx, agyBin, "mcp", "add", "slopguard", exe, "mcp")
+	addCmd.Env = augmentedCLIEnv(home)
+	_ = addCmd.Run()
 }
 
 func discoverAgentProfiles(home, project string) []agentProfile {
@@ -506,6 +745,7 @@ func discoverAgentProfiles(home, project string) []agentProfile {
 			Badge:       badge,
 			Scope:       scope,
 			Recommended: recommended,
+			Detected:    detectClientInstalled(home, id),
 			Note:        note,
 		}
 		var total, configured int
@@ -516,6 +756,8 @@ func discoverAgentProfiles(home, project string) []agentProfile {
 				total++
 				if m.Configured {
 					configured++
+					cmd, _, _ := readConfiguredMCPCommand(m.ConfigPath)
+					prof.BinaryOK = isExecutableFile(cmd)
 				}
 				prof.Detected = prof.Detected || m.Detected
 				prof.HasBackup = prof.HasBackup || m.HasBackup
@@ -541,10 +783,24 @@ func discoverAgentProfiles(home, project string) []agentProfile {
 		}
 		if scope == "project" && strings.TrimSpace(project) == "" {
 			prof.NeedsProject = true
-			prof.PrimaryPath = "请先在左侧选择或添加项目"
+			prof.PrimaryPath = "请先在顶部下拉框选择或添加项目"
 		}
 		prof.Enabled = total > 0 && configured == total
 		prof.Partial = configured > 0 && configured < total
+		switch {
+		case !prof.Enabled && !prof.Partial:
+			prof.HealthStatus = "not_configured"
+			prof.HealthDetail = "尚未写入 MCP 与护栏规则"
+		case prof.Partial:
+			prof.HealthStatus = "broken"
+			prof.HealthDetail = "仅配置了部分文件（缺 MCP 或缺 Skill），建议重新开关补全"
+		case prof.MCPTarget != nil && !prof.BinaryOK:
+			prof.HealthStatus = "broken"
+			prof.HealthDetail = "配置指向的 slopguard 可执行文件不存在或无执行权限，请重新开关修复"
+		default:
+			prof.HealthStatus = "pending_activation"
+			prof.HealthDetail = "配置已就绪，点击「自检」验证 MCP 握手与客户端激活状态"
+		}
 		return prof
 	}
 
@@ -552,9 +808,183 @@ func discoverAgentProfiles(home, project string) []agentProfile {
 		build("project", "当前项目", "PR", "project", true, "project_mcp", "project_claude_skill", "推荐 · 仅作用于当前仓库（.mcp.json + Skill）"),
 		build("antigravity", "Antigravity", "AG", "global", false, "antigravity", "global_antigravity_skill", "全局 MCP + Skill 护栏规则"),
 		build("claude_code", "Claude Code", "CC", "global", false, "claude_code", "global_claude_skill", "全局 MCP + Skill 护栏规则"),
-		build("cursor", "Cursor", "CU", "global", false, "cursor", "", "全局 MCP 服务（规则可在项目内单独管理）"),
-		build("codex", "Codex", "CX", "global", false, "", "global_codex_skill", "全局 Skill 护栏规则"),
+		build("cursor", "Cursor", "CU", "global", false, "cursor", "", "全局 MCP 服务"),
+		build("codex", "Codex", "CX", "global", false, "codex", "global_codex_skill", "全局 MCP (config.toml) + Skill"),
 	}
+}
+
+type AgentVerifyReport struct {
+	AgentID       string   `json:"agent_id"`
+	Name          string   `json:"name"`
+	Installed     bool     `json:"installed"`
+	Configured    bool     `json:"configured"`
+	BinaryPath    string   `json:"binary_path,omitempty"`
+	BinaryOK      bool     `json:"binary_ok"`
+	SkillOK       bool     `json:"skill_ok"`
+	HandshakeOK   bool     `json:"handshake_ok"`
+	LatencyMS     int64    `json:"latency_ms,omitempty"`
+	Tools         []string `json:"tools,omitempty"`
+	CLIRegistered *bool    `json:"cli_registered,omitempty"`
+	EventCount    int      `json:"event_count"`
+	LastEventAt   string   `json:"last_event_at,omitempty"`
+	HealthStatus  string   `json:"health_status"`
+	Diagnosis     string   `json:"diagnosis"`
+}
+
+func runStdioMCPHandshake(ctx context.Context, binaryPath string, args []string) (tools []string, latencyMS int64, err error) {
+	if !isExecutableFile(binaryPath) {
+		return nil, 0, errors.New("MCP 可执行文件不存在或不可执行")
+	}
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(callCtx, binaryPath, args...)
+	var stdinBuf bytes.Buffer
+	stdinBuf.WriteString(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"slopguard-selfcheck","version":"1.0"}}}` + "\n")
+	stdinBuf.WriteString(`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}` + "\n")
+	cmd.Stdin = &stdinBuf
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	started := time.Now()
+	if runErr := cmd.Run(); runErr != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = runErr.Error()
+		}
+		return nil, time.Since(started).Milliseconds(), fmt.Errorf("MCP 进程启动失败: %s", msg)
+	}
+	latencyMS = time.Since(started).Milliseconds()
+
+	scanner := bufio.NewScanner(&stdout)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var resp struct {
+			ID     int             `json:"id"`
+			Result json.RawMessage `json:"result"`
+			Error  *struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal([]byte(line), &resp) != nil {
+			continue
+		}
+		if resp.Error != nil && resp.Error.Message != "" {
+			return nil, latencyMS, errors.New(resp.Error.Message)
+		}
+		if resp.ID == 2 && len(resp.Result) > 0 {
+			var listRes struct {
+				Tools []struct {
+					Name string `json:"name"`
+				} `json:"tools"`
+			}
+			if json.Unmarshal(resp.Result, &listRes) == nil {
+				for _, t := range listRes.Tools {
+					if t.Name != "" {
+						tools = append(tools, t.Name)
+					}
+				}
+			}
+		}
+	}
+	if len(tools) == 0 {
+		return nil, latencyMS, errors.New("MCP 握手未返回任何工具列表")
+	}
+	return tools, latencyMS, nil
+}
+
+func verifyAgentProfile(ctx context.Context, home, project string, prof agentProfile, db *store.Store, checkRealCLI bool) AgentVerifyReport {
+	rep := AgentVerifyReport{
+		AgentID:   prof.ID,
+		Name:      prof.Name,
+		Installed: prof.Detected,
+		SkillOK:   prof.SkillTarget == nil || prof.SkillTarget.Configured,
+	}
+
+	if db != nil {
+		queryProj := ""
+		if prof.Scope == "project" {
+			queryProj = project
+		}
+		if events, err := db.ListMCPEvents(ctx, queryProj, "", 50); err == nil && len(events) > 0 {
+			rep.EventCount = len(events)
+			rep.LastEventAt = events[0].CreatedAt.UTC().Format(time.RFC3339)
+		}
+	}
+
+	if prof.NeedsProject {
+		rep.HealthStatus = "not_configured"
+		rep.Diagnosis = "请先在顶部下拉框选择或添加项目"
+		return rep
+	}
+	if prof.MCPTarget == nil {
+		if rep.SkillOK {
+			rep.Configured = true
+			rep.HealthStatus = "active"
+			rep.Diagnosis = "规则文件已部署就绪"
+		} else {
+			rep.HealthStatus = "not_configured"
+			rep.Diagnosis = "尚未部署规则文件"
+		}
+		return rep
+	}
+
+	cmd, args, configured := readConfiguredMCPCommand(prof.MCPTarget.ConfigPath)
+	rep.Configured = configured
+	rep.BinaryPath = cmd
+	rep.BinaryOK = configured && isExecutableFile(cmd)
+
+	if !configured {
+		rep.HealthStatus = "not_configured"
+		rep.Diagnosis = "尚未开启接入"
+		return rep
+	}
+	if !rep.BinaryOK {
+		rep.HealthStatus = "broken"
+		rep.Diagnosis = fmt.Sprintf("配置里的命令不可用 (%s)，请关闭后重新开启接入修复路径", cmd)
+		return rep
+	}
+	if !rep.SkillOK {
+		rep.HealthStatus = "broken"
+		rep.Diagnosis = "MCP 已写但缺少 SKILL 规则文件，建议重新开关补全"
+		return rep
+	}
+
+	tools, latencyMS, hsErr := runStdioMCPHandshake(ctx, cmd, args)
+	rep.LatencyMS = latencyMS
+	rep.Tools = tools
+	rep.HandshakeOK = hsErr == nil
+	if hsErr != nil {
+		rep.HealthStatus = "broken"
+		rep.Diagnosis = hsErr.Error()
+		return rep
+	}
+
+	cliRegistered := false
+	if prof.ID == "antigravity" && checkRealCLI {
+		reg := isSlopGuardInAgyMCPList(home)
+		rep.CLIRegistered = &reg
+		cliRegistered = reg
+	}
+
+	if rep.EventCount > 0 || cliRegistered {
+		rep.HealthStatus = "active"
+		if rep.EventCount > 0 {
+			rep.Diagnosis = fmt.Sprintf("MCP 握手通过 (%dms, %d个工具) · 已记录 %d 次真实调用", latencyMS, len(tools), rep.EventCount)
+		} else {
+			rep.Diagnosis = fmt.Sprintf("MCP 握手通过 (%dms, %d个工具) · 客户端 CLI 已注册", latencyMS, len(tools))
+		}
+		return rep
+	}
+
+	rep.HealthStatus = "pending_activation"
+	rep.Diagnosis = fmt.Sprintf("MCP 握手通过 (%dms, %d个工具) · 请重启「%s」并运行一次任务完成激活", latencyMS, len(tools), prof.Name)
+	return rep
 }
 
 type diffOpKind int

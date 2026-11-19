@@ -35,6 +35,7 @@ func (s *Server) registerActionRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/guard/toggle", s.handleGuardToggle)
 	mux.HandleFunc("/api/sessions/scan", s.handleScanSessions)
 	mux.HandleFunc("/api/mistakes/analyze-all", s.handleAnalyzeAllMistakes)
+	mux.HandleFunc("/api/mistakes/apply-recommendations", s.handleApplyAIRecommendations)
 }
 
 func resolveSelfBinary() (string, error) {
@@ -1030,5 +1031,59 @@ func (s *Server) handleAnalyzeAllMistakes(w http.ResponseWriter, r *http.Request
 		"analyzed":    analyzed,
 		"recommended": recommended,
 		"skipped":     skipped,
+	})
+}
+
+func (s *Server) handleApplyAIRecommendations(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	if s.db == nil {
+		writeError(w, http.StatusInternalServerError, "store is not available")
+		return
+	}
+	var req struct {
+		Project string `json:"project"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	project := strings.TrimSpace(req.Project)
+
+	pendingUser, err := s.db.ListInboxMistakes(r.Context(), project, "pending_user")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	appliedRules, ignoredCount := 0, 0
+	for _, m := range pendingUser {
+		decision := strings.ToLower(strings.TrimSpace(m.AIDecision))
+		switch decision {
+		case "recommend", "approve", "promote", "recommend_approve":
+			if err := s.db.ApproveMistake(r.Context(), m.Fingerprint); err != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("确认入库失败: %v", err))
+				return
+			}
+			if err := ensureRuleForApprovedMistake(r.Context(), s.db, m); err != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("写入规则失败: %v", err))
+				return
+			}
+			appliedRules++
+		case "skip", "ignore":
+			if err := s.db.UpdateMistakeStatus(r.Context(), m.Fingerprint, "ignored"); err != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("忽略失败: %v", err))
+				return
+			}
+			ignoredCount++
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":            true,
+		"applied_rules": appliedRules,
+		"ignored":       ignoredCount,
+		"total":         appliedRules + ignoredCount,
 	})
 }

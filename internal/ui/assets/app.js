@@ -695,12 +695,18 @@
       approved: 0,
       ignored: 0,
     };
-    let candidateCount = 0;
+    let recApprove = 0;
+    let recSkip = 0;
     for (const m of mistakes) {
       const rs = normalizeReviewStatus(m);
       if (counts[rs] !== undefined) counts[rs]++;
-      if ((rs === "pending_user" || rs === "pending_ai") && (m.is_candidate || Number(m.count || 0) >= 2)) {
-        candidateCount++;
+      if (rs === "pending_user") {
+        const dec = String(m.ai_decision || "").toLowerCase();
+        if (dec === "recommend" || dec === "approve" || dec === "promote" || dec === "recommend_approve") {
+          recApprove++;
+        } else if (dec === "skip" || dec === "ignore") {
+          recSkip++;
+        }
       }
     }
 
@@ -716,6 +722,23 @@
     if (analyzeBtn) {
       analyzeBtn.hidden = counts.pending_ai === 0;
       analyzeBtn.textContent = `一键分析 (${counts.pending_ai})`;
+    }
+
+    const banner = $("session-scan-banner");
+    if (banner && (recApprove > 0 || recSkip > 0)) {
+      banner.hidden = false;
+      const parts = [];
+      if (recApprove > 0) parts.push(`建议入库 <strong>${recApprove}</strong> 条`);
+      if (recSkip > 0) parts.push(`建议忽略 <strong>${recSkip}</strong> 条`);
+      const actionParts = [];
+      if (recApprove > 0) actionParts.push(`${recApprove} 转规则`);
+      if (recSkip > 0) actionParts.push(`${recSkip} 忽略`);
+      banner.innerHTML = `<span class="banner-text"><strong>一键分析已就绪：</strong>共 ${recApprove + recSkip} 条待处理（${parts.join(" · ")}）。</span>` +
+        `<button class="btn btn-primary btn-sm js-apply-ai-rec" type="button">一键采纳建议（${actionParts.join(" · ")}）</button>`;
+      const applyBtn = banner.querySelector(".js-apply-ai-rec");
+      if (applyBtn) {
+        applyBtn.addEventListener("click", () => applyAIRecommendations(applyBtn));
+      }
     }
 
     $("stat-candidates").textContent = pendingTotal.toLocaleString();
@@ -1861,6 +1884,34 @@
     }
   }
 
+  async function applyAIRecommendations(triggerBtn) {
+    const banner = $("session-scan-banner");
+    const btn = triggerBtn || banner?.querySelector(".js-apply-ai-rec");
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "处理中…";
+    }
+    try {
+      const res = await api("/api/mistakes/apply-recommendations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project: state.project || "" }),
+      });
+      if (banner) {
+        banner.hidden = false;
+        banner.innerHTML = `<span class="banner-text"><strong>已一键采纳建议：</strong><strong>${res.applied_rules || 0}</strong> 条已转为生效规则，<strong>${res.ignored || 0}</strong> 条已移入已忽略。</span>`;
+      }
+      await refresh();
+    } catch (error) {
+      if (banner) {
+        banner.hidden = false;
+        banner.innerHTML = `<span class="banner-text">采纳失败：${escapeHTML(error.message)}</span>`;
+      }
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
   async function scanLocalSessions() {
     const btn = $("btn-scan-sessions");
     const banner = $("session-scan-banner");
@@ -1876,15 +1927,15 @@
       const sc = res.scanned || {};
       if (banner) {
         banner.hidden = false;
-        banner.innerHTML = `<strong>嗅探完成（近 ${res.days || 14} 天）：</strong>` +
+        banner.innerHTML = `<span class="banner-text"><strong>嗅探完成（近 ${res.days || 14} 天）：</strong>` +
           `Git ${sc.git_commits || 0} 提交 · Claude ${sc.claude_files || 0} · Codex ${sc.codex_files || 0} · Antigravity ${sc.antigravity_files || 0}；` +
-          `提取 <strong>${res.found || 0}</strong> 条，入库 <strong>${res.imported || 0}</strong> 条。`;
+          `提取 <strong>${res.found || 0}</strong> 条，入库 <strong>${res.imported || 0}</strong> 条。</span>`;
       }
       await refresh();
     } catch (error) {
       if (banner) {
         banner.hidden = false;
-        banner.textContent = `嗅探失败：${error.message}`;
+        banner.innerHTML = `<span class="banner-text">嗅探失败：${escapeHTML(error.message)}</span>`;
       }
     } finally {
       btn.disabled = false;
@@ -2001,6 +2052,9 @@
   window.slopguardSwitchTab = (tab) => switchTab(tab);
 
   async function start() {
+    if (navigator.userAgent.includes("SlopGuardApp")) {
+      document.body.classList.add("macos-frameless");
+    }
     initFloatingTooltips();
     applyTheme(state.theme);
     const hashMatch = (window.location.hash || "").match(/tab=([a-z]+)/i);

@@ -55,7 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
     private func setupWindow() {
         let contentRect = NSRect(x: 0, y: 0, width: 1120, height: 760)
-        let styleMask: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable]
+        let styleMask: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
         let win = NSWindow(
             contentRect: contentRect,
             styleMask: styleMask,
@@ -63,12 +63,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             defer: false
         )
         win.title = "SlopGuard"
+        win.titleVisibility = .hidden
+        win.titlebarAppearsTransparent = true
+        win.isMovableByWindowBackground = true
+        let toolbar = NSToolbar(identifier: "SlopGuardMainToolbar")
+        toolbar.showsBaselineSeparator = false
+        win.toolbar = toolbar
+        win.toolbarStyle = .unifiedCompact
         win.minSize = NSSize(width: 860, height: 580)
         win.isReleasedWhenClosed = false
         win.center()
         win.delegate = self
 
         let config = WKWebViewConfiguration()
+        config.applicationNameForUserAgent = "SlopGuardApp/1.0"
         config.preferences.setValue(true, forKey: "developerExtrasEnabled")
 
         let wv = WKWebView(frame: contentRect, configuration: config)

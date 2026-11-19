@@ -770,4 +770,40 @@ func TestAnalyzeAllAndApproveCreatesRule(t *testing.T) {
 	if len(rules) != 1 || rules[0].Engine != "pyright" || rules[0].RuleID != "reportOptionalMemberAccess" {
 		t.Fatalf("rules ledger = %+v, want 1 pyright reportOptionalMemberAccess rule", rules)
 	}
+
+	// 3. One-click apply recommendations after resetting fp-pyright-none back, or add a fresh pair and apply all.
+	if _, err := db.RecordMistake(context.Background(), contract.Mistake{
+		ProjectPath: project,
+		Fingerprint: "fp-rec-eslint",
+		Category:    "type",
+		Summary:     `[eslint] @typescript-eslint/no-explicit-any`,
+		Source:      "auto_verify",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecordMistake(context.Background(), contract.Mistake{
+		ProjectPath: project,
+		Fingerprint: "fp-skip-cache2",
+		Category:    "lint",
+		Summary:     `warning in /.venv/lib/python3.12/foo.py`,
+		Source:      "auto_verify",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = postDashboardJSON(t, handler, "/api/mistakes/analyze-all", map[string]any{"project": project})
+
+	apAllCode, apAllBody := postDashboardJSON(t, handler, "/api/mistakes/apply-recommendations", map[string]any{
+		"project": project,
+	})
+	if apAllCode != http.StatusOK {
+		t.Fatalf("apply-recommendations = %d: %s", apAllCode, apAllBody)
+	}
+	apAllJSON := decodeDashboardJSON(t, apAllBody)
+	if apAllJSON["applied_rules"] != float64(1) || apAllJSON["ignored"] != float64(2) {
+		t.Fatalf("apply-recommendations = %v, want applied_rules=1 ignored=2", apAllJSON)
+	}
+	allRulesAfter, _ := db.ListRuleLedger(context.Background(), store.RuleLedgerQuery{ProjectPath: project})
+	if len(allRulesAfter) != 2 {
+		t.Fatalf("expected 2 rules after apply-recommendations, got %d", len(allRulesAfter))
+	}
 }

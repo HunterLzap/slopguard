@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -651,59 +652,101 @@ func uninstallGitPostCommitHook(backupsDir, project string) (string, error) {
 	return hookPath, nil
 }
 
+// applyVerifiedGitHook 用预览校验过的最终字节执行 Git Hook 变更。
+// hookEnabled == true 表示写入该字节内容（空字节表示写入空文件）；
+// hookEnabled == false 表示按可证明的恢复计划执行，由计划区分删除文件与恢复空文件。
+func applyVerifiedGitHook(backupsDir, project string, hookEnabled bool, content string) error {
+	hookPath, isGit := resolveGitHookPath(project)
+	if !isGit || hookPath == "" {
+		return errors.New("当前目录不是 Git 仓库，无法修改 post-commit 钩子")
+	}
+	if hookEnabled {
+		if _, _, err := ensureBackup(backupsDir, "hook", "post-commit", hookPath); err != nil {
+			return err
+		}
+		mode := existingFileModeOrDefault(hookPath, 0o755)
+		if err := writeFileAtomic(hookPath, []byte(content), mode); err != nil {
+			return fmt.Errorf("写入 post-commit 钩子失败: %w", err)
+		}
+		if err := recordBackupInstalled(backupsDir, backupTarget{Kind: "hook", ID: "post-commit", Scope: "project", Path: hookPath}, []byte(content), mode); err != nil {
+			return fmt.Errorf("记录 post-commit 钩子快照失败: %w", err)
+		}
+		return nil
+	}
+
+	// 恢复路径：重新计算计划仅用于判断 delete_file / restore_original 语义，
+	// 实际写入的字节必须与已验证的 content 完全一致。
+	target := backupTarget{Kind: "hook", ID: "post-commit", Scope: "project", Path: hookPath}
+	_, rec, hasBackup, checkErr := lookupBackupChecked(backupsDir, "hook", "post-commit", hookPath)
+	if checkErr != nil {
+		return checkErr
+	}
+	if hasBackup {
+		plan, planErr := planManagedUninstall(backupsDir, target, rec)
+		if planErr != nil {
+			return planErr
+		}
+		if plan.Action == uninstallNoop {
+			return removeBackupRecord(backupsDir, target)
+		}
+		if !bytes.Equal(plan.NewData, []byte(content)) {
+			return fmt.Errorf("Git Hook 恢复内容与预览记录不一致")
+		}
+		return applyManagedUninstall(backupsDir, target, plan)
+	}
+	if content == "" {
+		data, readErr := os.ReadFile(hookPath)
+		if readErr != nil {
+			if os.IsNotExist(readErr) {
+				return nil
+			}
+			return readErr
+		}
+		// 当前文件本身为空：三态中的“写入空文件”，保留文件而不是删除。
+		if strings.TrimSpace(string(data)) == "" {
+			return nil
+		}
+		// 只有当前文件仅由受管块（及 shebang）构成时，才允许按预览删除；
+		// 否则空 content 与用户内容冲突，安全停止。
+		stripped := stripHookMarkerBlock(string(data))
+		trimmed := strings.TrimSpace(stripped)
+		if extractHookManagedBlock(string(data)) == "" ||
+			(trimmed != "" && trimmed != "#!/bin/sh" && trimmed != "#!/usr/bin/env sh") {
+			return fmt.Errorf("Git Hook 删除预览与当前文件内容不一致")
+		}
+		if err := os.Remove(hookPath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	mode := existingFileModeOrDefault(hookPath, 0o755)
+	return writeFileAtomic(hookPath, []byte(content), mode)
+}
+
 func upsertHookMarkerBlock(existing, block string) string {
-	normalized := strings.ReplaceAll(existing, "\r\n", "\n")
+	stripped := stripHookMarkerBlock(existing)
+	normalized := strings.ReplaceAll(stripped, "\r\n", "\n")
 	if strings.TrimSpace(normalized) == "" {
 		return "#!/bin/sh\n\n" + block + "\n"
 	}
-	startIdx := strings.Index(normalized, gitHookStartMarker)
-	endIdx := strings.Index(normalized, gitHookEndMarker)
-	if startIdx >= 0 && endIdx > startIdx {
-		afterEnd := endIdx + len(gitHookEndMarker)
-		prefix := strings.TrimRight(normalized[:startIdx], "\n")
-		suffix := strings.TrimLeft(normalized[afterEnd:], "\n")
-		var out strings.Builder
-		if prefix != "" {
-			out.WriteString(prefix)
-			out.WriteString("\n\n")
-		}
-		out.WriteString(block)
-		out.WriteByte('\n')
-		if suffix != "" {
-			out.WriteByte('\n')
-			out.WriteString(suffix)
-			if !strings.HasSuffix(suffix, "\n") {
-				out.WriteByte('\n')
-			}
-		}
-		return out.String()
-	}
-	if !strings.HasSuffix(normalized, "\n") {
-		normalized += "\n"
-	}
-	return normalized + "\n" + block + "\n"
+	normalized = strings.TrimRight(normalized, "\n")
+	return normalized + "\n\n" + block + "\n"
 }
 
 func stripHookMarkerBlock(existing string) string {
 	normalized := strings.ReplaceAll(existing, "\r\n", "\n")
-	startIdx := strings.Index(normalized, gitHookStartMarker)
-	endIdx := strings.Index(normalized, gitHookEndMarker)
-	if startIdx < 0 || endIdx < startIdx {
+	blocks := extractAllHookManagedBlocks(normalized)
+	if len(blocks) == 0 {
 		return existing
 	}
-	afterEnd := endIdx + len(gitHookEndMarker)
-	prefix := strings.TrimRight(normalized[:startIdx], "\n")
-	suffix := strings.TrimLeft(normalized[afterEnd:], "\n")
-	switch {
-	case prefix == "" && suffix == "":
-		return ""
-	case prefix == "":
-		return suffix
-	case suffix == "":
-		return prefix + "\n"
-	default:
-		return prefix + "\n\n" + suffix
+	for _, block := range blocks {
+		normalized = strings.Replace(normalized, block, "", 1)
 	}
+	normalized = strings.TrimRight(normalized, "\n")
+	if normalized == "" {
+		return ""
+	}
+	return normalized + "\n"
 }
 
 func (s *Server) handleGuardStatus(w http.ResponseWriter, r *http.Request) {
@@ -747,7 +790,31 @@ var errGuardInvalidProject = errors.New("项目目录不存在")
 
 // SetProjectConfig validates a project directory, applies optional Git hook
 // changes and watch debounce settings, persists them, and returns live status.
+// 非 UI 内部调用使用；UI 的 Hook 修改必须走 SetProjectConfigVerified。
 func (g *GuardManager) SetProjectConfig(project string, enabled *bool, hookEnabled *bool, debounceSec int) (GuardProjectStatus, error) {
+	return g.setProjectConfig(project, enabled, hookEnabled, debounceSec, nil)
+}
+
+// SetProjectConfigVerified 是 UI 配置变更的入口：Git Hook 的最终内容必须由
+// preview lease 校验后原样传入，禁止本函数重新生成内容。
+// 三态语义：
+//   - hookEnabled == nil：不修改 Hook，verifiedHookContent 必须为 nil；
+//   - hookEnabled != nil 且 verifiedHookContent 非 nil：
+//   - hookEnabled == true 时按 verifiedHookContent 写入（空字符串表示写入空文件）；
+//   - hookEnabled == false 时按已验证的恢复计划执行（计划为 delete 则删除文件，
+//     计划为 restore_original 则允许恢复为空文件）。
+func (g *GuardManager) SetProjectConfigVerified(project string, enabled *bool, hookEnabled *bool, debounceSec int, verifiedHookContent *string) (GuardProjectStatus, error) {
+	if hookEnabled == nil {
+		if verifiedHookContent != nil {
+			return GuardProjectStatus{}, errors.New("hookEnabled 为 nil 时 verifiedHookContent 必须为 nil")
+		}
+	} else if verifiedHookContent == nil {
+		return GuardProjectStatus{}, errors.New("Git Hook 修改缺少经过预览校验的最终内容")
+	}
+	return g.setProjectConfig(project, enabled, hookEnabled, debounceSec, verifiedHookContent)
+}
+
+func (g *GuardManager) setProjectConfig(project string, enabled *bool, hookEnabled *bool, debounceSec int, verifiedHookContent *string) (GuardProjectStatus, error) {
 	rawProject := strings.TrimSpace(project)
 	if rawProject == "" {
 		return GuardProjectStatus{}, errors.New("请先选择一个项目")
@@ -766,7 +833,11 @@ func (g *GuardManager) SetProjectConfig(project string, enabled *bool, hookEnabl
 		if g.server != nil {
 			backupsDir = g.server.backupsDir()
 		}
-		if *hookEnabled {
+		if verifiedHookContent != nil {
+			if err := applyVerifiedGitHook(backupsDir, absProject, *hookEnabled, *verifiedHookContent); err != nil {
+				return GuardProjectStatus{}, err
+			}
+		} else if *hookEnabled {
 			exe, exeErr := resolveSelfBinary()
 			if exeErr != nil {
 				exe = "slopguard"

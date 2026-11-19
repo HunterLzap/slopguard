@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -100,10 +102,28 @@ func runUI(args []string, stdout, stderr io.Writer) int {
 // and obtains a short-lived, one-time browser bootstrap URL. The long-term token
 // is never appended to a URL or passed to a browser process.
 func requestDashboardTicket(baseURL string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || parsed.Scheme != "http" || parsed.User != nil {
+		return "", errors.New("dashboard URL must be a local HTTP endpoint")
+	}
+	switch strings.ToLower(parsed.Hostname()) {
+	case "127.0.0.1", "localhost", "::1":
+	default:
+		return "", errors.New("dashboard URL must target loopback")
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil || port < 1 || port > 65535 {
+		return "", errors.New("dashboard URL must include a valid port")
+	}
 	home, err := os.UserHomeDir()
 	if err != nil || strings.TrimSpace(home) == "" {
 		return "", errors.New("locate user home")
 	}
+	trusted, ok := ui.ProbeTrustedDashboard(home, port)
+	if !ok {
+		return "", errors.New("dashboard identity verification failed")
+	}
+
 	raw, err := os.ReadFile(filepath.Join(home, ".slopguard", "ui-token"))
 	if err != nil {
 		return "", err
@@ -112,7 +132,8 @@ func requestDashboardTicket(baseURL string) (string, error) {
 	if token == "" {
 		return "", errors.New("empty local UI token")
 	}
-	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(baseURL, "/")+"/api/auth/ticket", nil)
+	endpoint := strings.TrimRight(trusted.URL, "/") + "/api/auth/ticket"
+	req, err := http.NewRequest(http.MethodPost, endpoint, nil)
 	if err != nil {
 		return "", err
 	}
@@ -140,9 +161,9 @@ func requestDashboardTicket(baseURL string) (string, error) {
 		if strings.HasPrefix(payload.URL, "http://") || strings.HasPrefix(payload.URL, "https://") {
 			return payload.URL, nil
 		}
-		return strings.TrimRight(baseURL, "/") + "/" + strings.TrimLeft(payload.URL, "/"), nil
+		return strings.TrimRight(trusted.URL, "/") + "/" + strings.TrimLeft(payload.URL, "/"), nil
 	}
-	return strings.TrimRight(baseURL, "/") + "/?ticket=" + payload.Ticket, nil
+	return strings.TrimRight(trusted.URL, "/") + "/?ticket=" + payload.Ticket, nil
 }
 
 func defaultOpenDashboardWindow(targetURL string) error {

@@ -43,33 +43,35 @@ type Options struct {
 
 // Server exposes the dashboard API, local action handlers, background guard, and embedded single-page app.
 type Server struct {
-	db           *store.Store
-	runner       contract.Runner
-	mux          *http.ServeMux
-	port         int
-	homeDir      string
-	instanceID   string
-	startedAt    time.Time
-	guard        *GuardManager
-	ai           *AIManager
-	authMu       sync.RWMutex
-	authToken    string
-	authTickets  map[string]authTicket
-	authSessions map[string]authSession
-	mutationMu   sync.Mutex
-	previewMu    sync.Mutex
-	previews     map[string]*previewRecord
+	db               *store.Store
+	runner           contract.Runner
+	mux              *http.ServeMux
+	port             int
+	homeDir          string
+	skipRealAgentCLI bool
+	instanceID       string
+	startedAt        time.Time
+	guard            *GuardManager
+	ai               *AIManager
+	authMu           sync.RWMutex
+	authToken        string
+	authTickets      map[string]authTicket
+	authSessions     map[string]authSession
+	mutationMu       sync.Mutex
+	previewMu        sync.Mutex
+	previews         map[string]*previewRecord
 }
 
 // NewServer creates a dashboard server backed by the given store and runner.
 func NewServer(db *store.Store, runner contract.Runner) *Server {
 	s := &Server{
-		db:           db,
-		runner:       runner,
-		authToken:    generateRandomToken(),
-		authTickets:  make(map[string]authTicket),
-		authSessions: make(map[string]authSession),
-		previews:     make(map[string]*previewRecord),
+		db:               db,
+		runner:           runner,
+		skipRealAgentCLI: true,
+		authToken:        generateRandomToken(),
+		authTickets:      make(map[string]authTicket),
+		authSessions:     make(map[string]authSession),
+		previews:         make(map[string]*previewRecord),
 	}
 	s.guard = newGuardManager(s)
 	s.ai = newAIManager(s)
@@ -137,6 +139,9 @@ func Run(ctx context.Context, db *store.Store, runner contract.Runner, opts Opti
 		return errors.New("ui: cannot locate user home directory")
 	}
 	server.homeDir = home
+	// Real agent CLI registration and probes are enabled only for the actual
+	// dashboard process, never by direct NewServer construction in tests.
+	server.skipRealAgentCLI = false
 
 	// Take ownership before touching the persistent token. A failed start must
 	// never rotate the token of an already-running dashboard.

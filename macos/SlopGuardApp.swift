@@ -328,12 +328,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         let lockURL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".slopguard", isDirectory: true)
             .appendingPathComponent("ui.lock", isDirectory: false)
-        guard let data = try? Data(contentsOf: lockURL) else { return nil }
-        return (try? JSONDecoder().decode(UILockRecord.self, from: data))?.instance_id
+        guard let data = try? Data(contentsOf: lockURL),
+              let record = try? JSONDecoder().decode(UILockRecord.self, from: data),
+              record.port == defaultPort,
+              let instanceID = record.instance_id?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !instanceID.isEmpty else {
+            return nil
+        }
+        return instanceID
     }
 
     nonisolated private static func requestDashboardTicket() async -> String? {
-        guard let token = readUIToken(),
+        guard await isServerReachable(),
+              let token = readUIToken(),
               let endpoint = URL(string: "\(dashboardURLString)/api/auth/ticket") else {
             return nil
         }
@@ -433,12 +440,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     nonisolated private static func fetchStatusSummary() async -> StatusSummary? {
-        guard let url = URL(string: summaryURLString) else { return nil }
+        guard await isServerReachable(),
+              let url = URL(string: summaryURLString) else { return nil }
         var request = URLRequest(url: url)
         request.timeoutInterval = 1.5
-        if let tok = readUIToken() {
-            request.setValue(tok, forHTTPHeaderField: "X-SlopGuard-Token")
-        }
+        guard let tok = readUIToken() else { return nil }
+        request.setValue(tok, forHTTPHeaderField: "X-SlopGuard-Token")
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
@@ -503,10 +510,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             guard identity.service == "slopguard" else { return false }
             // A running service is trusted only when its instance id matches the
             // local ui.lock record written by the same SlopGuard process.
-            if let expected = readUIInstanceID(), !expected.isEmpty {
-                return identity.instance_id == expected
+            guard let expected = readUIInstanceID(), !expected.isEmpty,
+                  let liveID = identity.instance_id?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !liveID.isEmpty else {
+                return false
             }
-            return true
+            return liveID == expected
         } catch {
             return false
         }

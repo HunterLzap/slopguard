@@ -2,6 +2,7 @@ package ui
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -20,6 +21,7 @@ import (
 	"github.com/HunterLzap/slopguard/internal/engine"
 	"github.com/HunterLzap/slopguard/internal/store"
 	"github.com/HunterLzap/slopguard/skills"
+	"github.com/pelletier/go-toml/v2"
 )
 
 type mcpClientStatus struct {
@@ -147,6 +149,34 @@ func currentFileSHA256(path string) (hash string, existed bool, err error) {
 	return fileSHA256Hex(data), true, nil
 }
 
+// validateBackupRecordDigests 校验备份记录内嵌内容与摘要一致，防止损坏或
+// 被篡改的备份被用于恢复/卸载。v2 记录必须同时具备内容与摘要。
+func validateBackupRecordDigests(rec configBackupRecord) error {
+	if !rec.Existed && len(rec.OriginalBytes) > 0 {
+		return fmt.Errorf("%w: 备份标记原文件不存在但包含原始内容", ErrBackupMetadataMismatch)
+	}
+	if strings.TrimSpace(rec.OriginalSHA256) != "" {
+		if got := fileSHA256Hex(rec.OriginalBytes); got != rec.OriginalSHA256 {
+			return fmt.Errorf("%w: 原始内容摘要与备份内容不一致", ErrBackupMetadataMismatch)
+		}
+	} else if len(rec.OriginalBytes) > 0 && rec.SchemaVersion >= backupRecordSchemaVersion {
+		return fmt.Errorf("%w: 备份缺少原始内容摘要", ErrBackupMetadataMismatch)
+	}
+	if strings.TrimSpace(rec.InstalledSHA256) != "" {
+		if len(rec.InstalledBytes) == 0 {
+			// 合法空文件安装快照：摘要应为空内容摘要；其余“有摘要无内容”视为损坏。
+			if rec.SchemaVersion >= backupRecordSchemaVersion && rec.InstalledSHA256 != fileSHA256Hex(nil) {
+				return fmt.Errorf("%w: 安装快照缺少内容", ErrBackupMetadataMismatch)
+			}
+		} else if got := fileSHA256Hex(rec.InstalledBytes); got != rec.InstalledSHA256 {
+			return fmt.Errorf("%w: 安装快照摘要与备份内容不一致", ErrBackupMetadataMismatch)
+		}
+	} else if len(rec.InstalledBytes) > 0 && rec.SchemaVersion >= backupRecordSchemaVersion {
+		return fmt.Errorf("%w: 安装快照缺少摘要", ErrBackupMetadataMismatch)
+	}
+	return nil
+}
+
 func existingFileModeOrDefault(path string, fallback os.FileMode) os.FileMode {
 	if info, err := os.Stat(path); err == nil && !info.IsDir() {
 		if perm := info.Mode().Perm(); perm != 0 {
@@ -182,6 +212,9 @@ func lookupBackupChecked(backupsDir, kind, id, targetPath string) (string, confi
 	if err := json.Unmarshal(data, &rec); err != nil {
 		return path, configBackupRecord{}, false, fmt.Errorf("备份记录已损坏 (%s)，已阻止盲目还原或删除: %w", path, err)
 	}
+	if err := validateBackupRecordDigests(rec); err != nil {
+		return path, configBackupRecord{}, false, fmt.Errorf("备份记录完整性校验失败 (%s): %w", path, err)
+	}
 	if rec.Kind != "" && !strings.EqualFold(rec.Kind, kind) {
 		return path, configBackupRecord{}, false, fmt.Errorf("%w: 备份 kind=%q，请求 kind=%q", ErrBackupMetadataMismatch, rec.Kind, kind)
 	}
@@ -211,8 +244,8 @@ func lookupBackup(backupsDir, kind, id, targetPath string) (string, configBackup
 }
 
 // ensureBackup creates a backup of targetPath before SlopGuard modifies it.
-// If a backup already exists for this target, it is preserved untouched so
-// repeated updates never overwrite the pre-SlopGuard original state.
+// 首次备份保留安装前原始状态；同一目标重复接入时，如果目标在上次安装后被
+// 外部修改，则刷新“去掉受管内容后的基线”，避免后续卸载回滚用户新增配置。
 func ensureBackup(backupsDir, kind, id, targetPath string) (string, configBackupRecord, error) {
 	if strings.TrimSpace(backupsDir) == "" {
 		return "", configBackupRecord{}, errors.New("无法定位备份目录")
@@ -228,6 +261,16 @@ func ensureBackup(backupsDir, kind, id, targetPath string) (string, configBackup
 		return "", configBackupRecord{}, checkErr
 	} else if ok {
 		_ = os.Chmod(existingPath, 0o600)
+		refreshed, changed, refreshErr := refreshBackupBaselineForReinstall(backupTarget{Kind: kind, ID: id, Scope: inferBackupScope(targetPath), Path: targetPath}, existingRec)
+		if refreshErr != nil {
+			return "", configBackupRecord{}, refreshErr
+		}
+		if changed {
+			if err := writeBackupRecord(backupsDir, backupTarget{Kind: kind, ID: id, Scope: refreshed.Scope, Path: targetPath}, refreshed); err != nil {
+				return "", configBackupRecord{}, fmt.Errorf("更新重复接入基线失败: %w", err)
+			}
+			return existingPath, refreshed, nil
+		}
 		return existingPath, existingRec, nil
 	}
 	rec := configBackupRecord{
@@ -276,16 +319,197 @@ func recordBackupInstalledHash(backupsDir, kind, id, targetPath string, installe
 	return recordBackupInstalled(backupsDir, backupTarget{Kind: kind, ID: id, Path: targetPath}, installedBytes, 0)
 }
 
+// refreshBackupBaselineForReinstall 处理同一目标重复接入：若用户在上次安装后
+// 修改过目标文件，则把“当前内容去掉受管内容”后的结果作为新的安装前基线，
+// 避免以后卸载时把两次安装之间用户新增的配置回滚掉。
+func refreshBackupBaselineForReinstall(target backupTarget, rec configBackupRecord) (configBackupRecord, bool, error) {
+	if strings.TrimSpace(rec.InstalledSHA256) == "" || len(rec.InstalledBytes) == 0 {
+		return rec, false, nil
+	}
+	current, err := readTargetSnapshot(target.Path)
+	if err != nil {
+		return rec, false, err
+	}
+	if !current.Existed {
+		return rec, false, nil
+	}
+	currentHash := fileSHA256Hex(current.Data)
+	if currentHash == rec.InstalledSHA256 {
+		return rec, false, nil
+	}
+	if rec.OriginalSHA256 != "" && currentHash == rec.OriginalSHA256 {
+		return rec, false, nil
+	}
+	baseline, err := stripManagedForReinstallBaseline(target, rec, current.Data)
+	if err != nil {
+		return rec, false, err
+	}
+	rec.Existed = rec.Existed || len(baseline) > 0
+	rec.OriginalMode = uint32(current.Mode.Perm())
+	rec.OriginalBytes = append([]byte(nil), baseline...)
+	rec.OriginalSHA256 = fileSHA256Hex(baseline)
+	return rec, true, nil
+}
+
+func stripManagedForReinstallBaseline(target backupTarget, rec configBackupRecord, current []byte) ([]byte, error) {
+	switch target.Kind {
+	case "mcp":
+		if isTOMLPath(target.Path) {
+			return stripTOMLForReinstallBaseline(rec, current)
+		}
+		return stripMCPJSONForReinstallBaseline(rec, current)
+	case "hook":
+		return []byte(stripHookMarkerBlock(string(current))), nil
+	case "skill":
+		blocks := extractAllSkillManagedBlocks(string(current))
+		if len(blocks) == 0 {
+			return append([]byte(nil), current...), nil
+		}
+		installedBlock := extractSkillManagedBlock(string(rec.InstalledBytes))
+		for _, block := range blocks {
+			if block != installedBlock {
+				return nil, fmt.Errorf("%w: Skill 受管块已被用户修改", ErrManagedConfigModified)
+			}
+		}
+		leftover := removeSkillManagedBlock(string(current))
+		if rec.Existed {
+			return mergeOriginalWithSkillLeftover(rec.OriginalBytes, []byte(leftover)), nil
+		}
+		if strings.TrimSpace(leftover) == "" {
+			return nil, nil
+		}
+		return []byte(leftover), nil
+	default:
+		return nil, fmt.Errorf("不支持的受管类型 %q", target.Kind)
+	}
+}
+
+func mcpSlopGuardEntryBytes(data []byte) (any, bool) {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, false
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return nil, false
+	}
+	return mcpSlopGuardEntry(root)
+}
+
+func stripMCPJSONForReinstallBaseline(rec configBackupRecord, current []byte) ([]byte, error) {
+	if len(bytes.TrimSpace(current)) == 0 {
+		return nil, nil
+	}
+	var currentRoot map[string]any
+	if err := json.Unmarshal(current, &currentRoot); err != nil {
+		return nil, fmt.Errorf("解析 MCP 配置失败: %w", err)
+	}
+	if currentEntry, currentHas := mcpSlopGuardEntry(currentRoot); currentHas {
+		installedEntry, installedHas := mcpSlopGuardEntryBytes(rec.InstalledBytes)
+		if !installedHas || !jsonValueEqual(currentEntry, installedEntry) {
+			return nil, fmt.Errorf("%w: mcpServers.slopguard 条目已被用户修改", ErrManagedConfigModified)
+		}
+		servers, ok := currentRoot["mcpServers"].(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("配置文件 mcpServers 字段不是 JSON 对象（已拒绝修改）")
+		}
+		delete(servers, "slopguard")
+		if len(servers) == 0 {
+			delete(currentRoot, "mcpServers")
+		} else {
+			currentRoot["mcpServers"] = servers
+		}
+	}
+	if len(rec.OriginalBytes) > 0 {
+		var originalRoot map[string]any
+		if err := json.Unmarshal(rec.OriginalBytes, &originalRoot); err == nil {
+			if originalEntry, has := mcpSlopGuardEntry(originalRoot); has {
+				servers, _ := currentRoot["mcpServers"].(map[string]any)
+				if servers == nil {
+					servers = map[string]any{}
+				}
+				servers["slopguard"] = originalEntry
+				currentRoot["mcpServers"] = servers
+			}
+		}
+	}
+	if len(currentRoot) == 0 {
+		return nil, nil
+	}
+	encoded, err := json.MarshalIndent(currentRoot, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	encoded = append(encoded, '\n')
+	return encoded, nil
+}
+
+func stripTOMLForReinstallBaseline(rec configBackupRecord, current []byte) ([]byte, error) {
+	var doc map[string]any
+	if err := toml.Unmarshal(current, &doc); err != nil {
+		return nil, fmt.Errorf("当前 Codex 配置不是合法 TOML: %w", err)
+	}
+	currentEntry, currentHas, err := tomlSlopGuardEntry(current)
+	if err != nil {
+		return nil, err
+	}
+	if currentHas {
+		installedEntry, installedHas, instErr := tomlSlopGuardEntry(rec.InstalledBytes)
+		if instErr != nil {
+			return nil, ErrLegacyBackupNeedsReview
+		}
+		if !installedHas || !tomlEntryEqual(currentEntry, installedEntry) {
+			return nil, fmt.Errorf("%w: Codex mcp_servers.slopguard 段已被用户修改", ErrManagedConfigModified)
+		}
+	}
+	stripped := replaceOrRemoveCodexSection(string(current), "", true)
+	var strippedDoc map[string]any
+	if err := toml.Unmarshal([]byte(stripped), &strippedDoc); err != nil {
+		return nil, fmt.Errorf("移除 Codex slopguard 段后的 TOML 非法: %w", err)
+	}
+	if _, stillThere := strippedDoc["mcp_servers"]; stillThere {
+		if entry, has, _ := tomlSlopGuardEntry([]byte(stripped)); has && currentHas && tomlEntryEqual(entry, currentEntry) {
+			return nil, fmt.Errorf("%w: Codex 配置使用内联 mcp_servers.slopguard，无法安全文本合并", ErrManagedConfigModified)
+		}
+	}
+	if rec.Existed {
+		if origEntry, has, _ := tomlSlopGuardEntry(rec.OriginalBytes); has {
+			section, marshalErr := renderTOMLSlopGuardSection(origEntry)
+			if marshalErr != nil {
+				return nil, marshalErr
+			}
+			stripped = strings.TrimRight(stripped, "\n")
+			if stripped != "" {
+				stripped += "\n\n"
+			}
+			stripped += section
+		}
+	}
+	return []byte(stripped), nil
+}
+
 // recordBackupInstalled 记录安装后的完整快照。它同时把旧版备份升级为 v2：
 // 旧记录只保留 OriginalBytes 时，下一次成功安装后即可建立可信的 InstalledBytes/Hash。
 func recordBackupInstalled(backupsDir string, target backupTarget, installedBytes []byte, mode os.FileMode) error {
+	actual, readErr := os.ReadFile(target.Path)
+	if readErr != nil {
+		return fmt.Errorf("读取安装后的目标文件失败: %w", readErr)
+	}
+	if !bytes.Equal(actual, installedBytes) {
+		return fmt.Errorf("目标文件内容与待记录的安装快照不一致，已拒绝写入备份摘要")
+	}
 	backupPath, rec, ok, err := lookupBackupChecked(backupsDir, target.Kind, target.ID, target.Path)
-	if err != nil || !ok {
+	if err != nil {
 		return err
+	}
+	if !ok {
+		return fmt.Errorf("找不到待记录的备份元数据: %s", target.Path)
 	}
 	rec.SchemaVersion = backupRecordSchemaVersion
 	rec.Kind = target.Kind
 	rec.ID = target.ID
+	if strings.TrimSpace(rec.OriginalSHA256) == "" && (rec.Existed || len(rec.OriginalBytes) > 0) {
+		rec.OriginalSHA256 = fileSHA256Hex(rec.OriginalBytes)
+	}
 	if strings.TrimSpace(target.Scope) != "" {
 		rec.Scope = target.Scope
 	}
@@ -752,6 +976,14 @@ func replaceOrRemoveCodexSection(oldText, replacement string, remove bool) strin
 			multiDelim = `'''`
 		}
 
+		if multiDelim == "" && isInlineSlopGuardAssignment(line) {
+			if !remove && !replaced {
+				out = append(out, strings.TrimRight(replacement, "\n"))
+				replaced = true
+			}
+			continue
+		}
+
 		if sec, isHeader := parseTOMLHeaderName(line); isHeader {
 			if isSlopGuardTOMLSection(sec) {
 				inSection = true
@@ -782,6 +1014,19 @@ func replaceOrRemoveCodexSection(oldText, replacement string, remove bool) strin
 	return res + "\n"
 }
 
+func isInlineSlopGuardAssignment(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "[") {
+		return false
+	}
+	eq := strings.IndexByte(trimmed, '=')
+	if eq <= 0 {
+		return false
+	}
+	key := strings.ReplaceAll(strings.TrimSpace(trimmed[:eq]), " ", "")
+	return key == "mcp_servers.slopguard"
+}
+
 func renderMCPUpsert(path, binaryPath string, args []string) (oldText, newText string, existed bool, err error) {
 	if isTOMLPath(path) {
 		if data, readErr := os.ReadFile(path); readErr == nil {
@@ -797,6 +1042,10 @@ func renderMCPUpsert(path, binaryPath string, args []string) (oldText, newText s
 		newText = replaceOrRemoveCodexSection(oldText, section, false)
 		if err := validateTOMLBasic(newText); err != nil {
 			return "", "", existed, fmt.Errorf("生成 Codex 配置校验失败: %w", err)
+		}
+		var parsed map[string]any
+		if err := toml.Unmarshal([]byte(newText), &parsed); err != nil {
+			return "", "", existed, fmt.Errorf("生成 Codex 配置不是合法 TOML（可能已存在同名内联表）: %w", err)
 		}
 		return oldText, newText, existed, nil
 	}
@@ -1019,6 +1268,25 @@ func renderSkillContent(home, targetID string) string {
 		return wrapSkillManagedBlock(doc + "\n")
 	}
 	return wrapSkillManagedBlock("---\nname: slopguard\ndescription: SlopGuard deterministic code-quality guardrail MCP workflow and mistake inbox analysis guide.\n---\n\n" + doc + "\n")
+}
+
+// mergeSkillInstallContent 计算 Skill 安装的最终内容：
+//   - 文件不存在或为空：直接写入完整渲染内容；
+//   - 已有 SlopGuard 受管块：只替换受管块，保留文件其余用户内容与 frontmatter；
+//   - 已存在非空且没有受管块的同名文件：无法证明归属，安全停止，绝不覆盖。
+func mergeSkillInstallContent(existing, rendered string) (string, error) {
+	if strings.TrimSpace(existing) == "" {
+		return rendered, nil
+	}
+	blocks := extractAllSkillManagedBlocks(existing)
+	if len(blocks) == 0 {
+		return "", fmt.Errorf("%w: 目标已存在非 SlopGuard 管理的同名文件，已安全停止", ErrManagedConfigModified)
+	}
+	replacement := extractSkillManagedBlock(rendered)
+	if replacement == "" {
+		return "", errors.New("渲染的 Skill 内容缺少受管块")
+	}
+	return replaceAllSkillManagedBlocks(existing, replacement), nil
 }
 
 // wrapSkillManagedBlock 把 SlopGuard 生成内容放进受管块；YAML frontmatter 必须留在文件最开头。

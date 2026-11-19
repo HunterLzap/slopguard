@@ -288,10 +288,39 @@ func (l *applyLease) checkNewContent(path string, data []byte) error {
 	}
 	clean := normalizePreviewPath(path)
 	expected, ok := l.record.NewHashes[clean]
-	if !ok || expected == "" {
-		return nil
+	if !ok {
+		if _, known := l.record.Paths[clean]; known {
+			return fmt.Errorf("%w: %s", ErrPreviewContentChanged, clean)
+		}
+		return fmt.Errorf("%w: 未知目标路径 %s", ErrPreviewScopeMismatch, clean)
+	}
+	if strings.TrimSpace(expected) == "" {
+		return fmt.Errorf("%w: %s", ErrPreviewContentChanged, clean)
 	}
 	if fileSHA256Hex(data) != expected {
+		return fmt.Errorf("%w: %s", ErrPreviewContentChanged, clean)
+	}
+	return nil
+}
+
+// checkNewHash verifies a precomputed final-content hash for a target before
+// performing multi-target writes. It never allows a path outside the preview.
+func (l *applyLease) checkNewHash(path, hash string) error {
+	if l == nil || l.record == nil {
+		return errors.New("ui: missing preview lease")
+	}
+	clean := normalizePreviewPath(path)
+	expected, ok := l.record.NewHashes[clean]
+	if !ok {
+		if _, known := l.record.Paths[clean]; known {
+			return fmt.Errorf("%w: %s", ErrPreviewContentChanged, clean)
+		}
+		return fmt.Errorf("%w: 未知目标路径 %s", ErrPreviewScopeMismatch, clean)
+	}
+	if strings.TrimSpace(expected) == "" || strings.TrimSpace(hash) == "" {
+		return fmt.Errorf("%w: %s", ErrPreviewContentChanged, clean)
+	}
+	if hash != expected {
 		return fmt.Errorf("%w: %s", ErrPreviewContentChanged, clean)
 	}
 	return nil
@@ -302,8 +331,14 @@ func (l *applyLease) checkDeletion(path string) error {
 		return errors.New("ui: missing preview lease")
 	}
 	clean := normalizePreviewPath(path)
+	if _, known := l.record.Paths[clean]; !known {
+		return fmt.Errorf("%w: 未知目标路径 %s", ErrPreviewScopeMismatch, clean)
+	}
 	expected, ok := l.record.NewHashes[clean]
-	if ok && expected != "" {
+	if !ok {
+		return fmt.Errorf("%w: missing deletion preview for %s", ErrPreviewScopeMismatch, clean)
+	}
+	if strings.TrimSpace(expected) != "" {
 		return fmt.Errorf("%w: %s", ErrPreviewContentChanged, clean)
 	}
 	return nil

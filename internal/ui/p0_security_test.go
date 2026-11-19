@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -199,6 +201,22 @@ func TestP0SingleInstanceAndTokenSafety(t *testing.T) {
 		t.Fatalf("dashboard output leaked token: %q", output.String())
 	}
 
+	lockPath := instanceLockPath(home)
+	lockRaw, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("read ui.lock: %v", err)
+	}
+	var lockRecord instanceLockRecord
+	if err := json.Unmarshal(lockRaw, &lockRecord); err != nil || strings.TrimSpace(lockRecord.InstanceID) == "" {
+		t.Fatalf("ui.lock record = %s err=%v", lockRaw, err)
+	}
+	// An active lock must not be reclaimed merely because its metadata is old.
+	lockRecord.StartedAt = time.Now().Add(-24 * time.Hour).UTC().Format(time.RFC3339)
+	oldLockRaw, _ := json.Marshal(lockRecord)
+	if err := os.WriteFile(lockPath, oldLockRaw, 0o600); err != nil {
+		t.Logf("could not age lock metadata while held (lock semantics may prohibit writes): %v", err)
+	}
+
 	var secondOutput bytes.Buffer
 	secondErr := Run(context.Background(), db, nil, Options{Port: secondPort, NoOpen: true}, &secondOutput)
 	var already *AlreadyRunningError
@@ -219,8 +237,9 @@ func TestP0SingleInstanceAndTokenSafety(t *testing.T) {
 	case <-time.After(8 * time.Second):
 		t.Fatal("first Run did not stop")
 	}
-	if _, err := os.Stat(instanceLockPath(home)); !os.IsNotExist(err) {
-		t.Fatalf("ui.lock not cleaned up: %v", err)
+	// ui.lock is persistent metadata; release only drops the OS lock.
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Fatalf("ui.lock should remain after release: %v", err)
 	}
 }
 
@@ -254,41 +273,84 @@ func TestP0StartupFailureDoesNotRotateToken(t *testing.T) {
 	if err != nil || string(after) != token {
 		t.Fatalf("failed startup changed ui-token: %q err=%v", after, err)
 	}
-	if _, err := os.Stat(instanceLockPath(home)); !os.IsNotExist(err) {
-		t.Fatalf("failed startup left ui.lock: %v", err)
+	// The lock file is persistent metadata; a failed startup must leave it in
+	// place but must release the OS-level lock for future starts.
+	if _, err := os.Stat(instanceLockPath(home)); err != nil {
+		t.Fatalf("failed startup should leave ui.lock metadata: %v", err)
 	}
 }
 
 func TestP0StaleLockRecovery(t *testing.T) {
+	if os.Getenv("SLOPG_SG_LOCK_CHILD") == "1" {
+		home := os.Getenv("SLOPG_SG_LOCK_HOME")
+		lock, err := acquireInstanceLock(home, 0)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		fmt.Println("LOCKED")
+		for {
+			time.Sleep(time.Hour)
+			_ = lock
+		}
+	}
+
 	home := t.TempDir()
-	lockPath := instanceLockPath(home)
-	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	stale := instanceLockRecord{
-		Version:    1,
-		PID:        99999999,
-		Port:       p0FreePort(t),
-		InstanceID: "stale-instance",
-		StartedAt:  time.Now().Add(-3 * time.Minute).UTC().Format(time.RFC3339),
-	}
-	raw, err := json.Marshal(stale)
+	cmd := exec.Command(os.Args[0], "-test.run=TestP0StaleLockRecovery")
+	cmd.Env = append(os.Environ(),
+		"SLOPG_SG_LOCK_CHILD=1",
+		"SLOPG_SG_LOCK_HOME="+home,
+	)
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(lockPath, raw, 0o600); err != nil {
-		t.Fatal(err)
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start lock child: %v", err)
 	}
+	locked := make(chan struct{})
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			if strings.TrimSpace(scanner.Text()) == "LOCKED" {
+				close(locked)
+				return
+			}
+		}
+	}()
+	select {
+	case <-locked:
+	case <-time.After(8 * time.Second):
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatal("lock child did not acquire lock")
+	}
+	lockPath := instanceLockPath(home)
+	if raw, err := os.ReadFile(lockPath); err != nil || !strings.Contains(string(raw), `"instance_id"`) {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("lock metadata not readable while held: %v (%s)", err, raw)
+	}
+	if second, err := acquireInstanceLock(home, p0FreePort(t)); err == nil {
+		second.release()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatal("acquired lock while child process held it")
+	}
+
+	// Kill the child; the OS must release its lock so a new instance can acquire it.
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill lock child: %v", err)
+	}
+	_ = cmd.Wait()
 	lock, err := acquireInstanceLock(home, p0FreePort(t))
 	if err != nil {
-		t.Fatalf("stale lock not recovered: %v", err)
-	}
-	if lock.record.InstanceID == stale.InstanceID {
-		t.Fatal("acquired the stale lock record")
+		t.Fatalf("lock not released after child exit: %v", err)
 	}
 	lock.release()
-	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
-		t.Fatalf("lock release failed: %v", err)
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Fatalf("ui.lock metadata should remain after release: %v", err)
 	}
 }
 
@@ -507,6 +569,217 @@ func TestP0TOMLUninstallPreservesOtherSections(t *testing.T) {
 	got, err := os.ReadFile(target)
 	if err != nil || string(got) != original {
 		t.Fatalf("TOML restore = %q err=%v, want %q", got, err, original)
+	}
+}
+
+func TestP0BackupDigestTamperingRejected(t *testing.T) {
+	backupsDir := filepath.Join(t.TempDir(), "backups")
+	target := filepath.Join(t.TempDir(), "claude.json")
+	original := []byte("{\"mcpServers\":{\"other\":{\"command\":\"echo\"}}}\n")
+	if err := os.WriteFile(target, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, rec, err := ensureBackup(backupsDir, "mcp", "tamper", target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tamperedOriginal := rec
+	tamperedOriginal.OriginalBytes = []byte("tampered-original")
+	if err := writeBackupRecord(backupsDir, backupTarget{Kind: "mcp", ID: "tamper", Path: target}, tamperedOriginal); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := lookupBackupChecked(backupsDir, "mcp", "tamper", target); !errors.Is(err, ErrBackupMetadataMismatch) {
+		t.Fatalf("tampered original digest err = %v, want ErrBackupMetadataMismatch", err)
+	}
+	if _, err := planManagedUninstall(backupsDir, backupTarget{Kind: "mcp", ID: "tamper", Path: target}, tamperedOriginal); !errors.Is(err, ErrBackupMetadataMismatch) {
+		t.Fatalf("tampered plan err = %v, want ErrBackupMetadataMismatch", err)
+	}
+	if _, _, err := restoreFromBackup(backupsDir, "mcp", "tamper", target); err == nil {
+		t.Fatal("tampered backup must not restore")
+	}
+
+	installedTarget := filepath.Join(t.TempDir(), "claude.json")
+	if err := os.WriteFile(installedTarget, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = ensureBackup(backupsDir, "mcp", "tamper-installed", installedTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installed := []byte("{\"mcpServers\":{\"other\":{\"command\":\"echo\"},\"slopguard\":{\"command\":\"slopguard\",\"args\":[\"mcp\"]}}}\n")
+	if err := os.WriteFile(installedTarget, installed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordBackupInstalled(backupsDir, backupTarget{Kind: "mcp", ID: "tamper-installed", Path: installedTarget}, installed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, loadedRec, ok, err := lookupBackupChecked(backupsDir, "mcp", "tamper-installed", installedTarget)
+	if err != nil || !ok {
+		t.Fatalf("load installed backup: ok=%v err=%v", ok, err)
+	}
+	loadedRec.InstalledBytes = []byte("tampered-installed")
+	if err := writeBackupRecord(backupsDir, backupTarget{Kind: "mcp", ID: "tamper-installed", Path: installedTarget}, loadedRec); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := lookupBackupChecked(backupsDir, "mcp", "tamper-installed", installedTarget); !errors.Is(err, ErrBackupMetadataMismatch) {
+		t.Fatalf("tampered installed digest err = %v, want ErrBackupMetadataMismatch", err)
+	}
+}
+
+func TestP0OriginalSameNameAndReinstallBaseline(t *testing.T) {
+	backupsDir := filepath.Join(t.TempDir(), "backups")
+	original := []byte("{\"mcpServers\":{\"slopguard\":{\"command\":\"user-original\",\"args\":[\"x\"]}}}\n")
+	installed := []byte("{\"mcpServers\":{\"slopguard\":{\"command\":\"slopguard\",\"args\":[\"mcp\"]}}}\n")
+	target := filepath.Join(t.TempDir(), "claude.json")
+	if err := os.WriteFile(target, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ensureBackup(backupsDir, "mcp", "same-name", target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, installed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordBackupInstalled(backupsDir, backupTarget{Kind: "mcp", ID: "same-name", Path: target}, installed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := planManagedUninstall(backupsDir, backupTarget{Kind: "mcp", ID: "same-name", Path: target}, mustBackupRecord(t, backupsDir, "mcp", "same-name", target))
+	if err != nil {
+		t.Fatalf("plan same-name restore: %v", err)
+	}
+	if plan.Action != uninstallRestoreOriginal {
+		t.Fatalf("same-name plan action = %q, want restore_original", plan.Action)
+	}
+	if err := applyManagedUninstall(backupsDir, backupTarget{Kind: "mcp", ID: "same-name", Path: target}, plan); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(target); string(got) != string(original) {
+		t.Fatalf("same-name restore = %q, want %q", got, original)
+	}
+
+	original2 := []byte("{\"mcpServers\":{\"other\":{\"command\":\"echo\"}}}\n")
+	installed2 := []byte("{\"mcpServers\":{\"other\":{\"command\":\"echo\"},\"slopguard\":{\"command\":\"slopguard\",\"args\":[\"mcp\"]}}}\n")
+	target2 := filepath.Join(t.TempDir(), "claude.json")
+	if err := os.WriteFile(target2, original2, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ensureBackup(backupsDir, "mcp", "repeat", target2); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target2, installed2, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordBackupInstalled(backupsDir, backupTarget{Kind: "mcp", ID: "repeat", Path: target2}, installed2, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withPostgres := []byte("{\"mcpServers\":{\"other\":{\"command\":\"echo\"},\"slopguard\":{\"command\":\"slopguard\",\"args\":[\"mcp\"]},\"postgres\":{\"command\":\"pg-mcp\"}}}\n")
+	if err := os.WriteFile(target2, withPostgres, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, refreshed, err := ensureBackup(backupsDir, "mcp", "repeat", target2)
+	if err != nil {
+		t.Fatalf("repeat ensureBackup: %v", err)
+	}
+	if !strings.Contains(string(refreshed.OriginalBytes), `"postgres"`) || strings.Contains(string(refreshed.OriginalBytes), `"slopguard"`) {
+		t.Fatalf("reinstall baseline = %q", refreshed.OriginalBytes)
+	}
+	if err := recordBackupInstalled(backupsDir, backupTarget{Kind: "mcp", ID: "repeat", Path: target2}, withPostgres, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plan2, err := planManagedUninstall(backupsDir, backupTarget{Kind: "mcp", ID: "repeat", Path: target2}, mustBackupRecord(t, backupsDir, "mcp", "repeat", target2))
+	if err != nil {
+		t.Fatalf("plan repeat uninstall: %v", err)
+	}
+	if err := applyManagedUninstall(backupsDir, backupTarget{Kind: "mcp", ID: "repeat", Path: target2}, plan2); err != nil {
+		t.Fatal(err)
+	}
+	got2, _ := os.ReadFile(target2)
+	if !strings.Contains(string(got2), `"postgres"`) || strings.Contains(string(got2), `"slopguard"`) {
+		t.Fatalf("repeat uninstall = %q", got2)
+	}
+}
+
+func TestP0GitHookThreeStates(t *testing.T) {
+	backupsDir := filepath.Join(t.TempDir(), "backups")
+	makeProject := func(hookContent string) (string, string) {
+		t.Helper()
+		project := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(project, ".git", "hooks"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(project, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		hookPath := filepath.Join(project, ".git", "hooks", "post-commit")
+		if err := os.WriteFile(hookPath, []byte(hookContent), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return project, hookPath
+	}
+
+	// write empty file: empty content is a valid final byte sequence.
+	projectEmpty, hookEmpty := makeProject("#!/bin/sh\necho old\n")
+	if err := applyVerifiedGitHook(backupsDir, projectEmpty, true, ""); err != nil {
+		t.Fatalf("write empty hook: %v", err)
+	}
+	if data, err := os.ReadFile(hookEmpty); err != nil || len(data) != 0 {
+		t.Fatalf("empty hook file = %q err=%v", data, err)
+	}
+
+	// delete file: only a managed block (plus shebang) may be removed.
+	projectDelete, hookDelete := makeProject("#!/bin/sh\n" + buildGitHookBlock("/usr/local/bin/slopguard") + "\n")
+	if err := applyVerifiedGitHook(backupsDir, projectDelete, false, ""); err != nil {
+		t.Fatalf("delete managed hook: %v", err)
+	}
+	if _, err := os.Stat(hookDelete); !os.IsNotExist(err) {
+		t.Fatalf("managed hook should be deleted, stat err=%v", err)
+	}
+
+	// no modification: an already-empty hook stays an empty file.
+	projectNoop, hookNoop := makeProject("")
+	if err := applyVerifiedGitHook(backupsDir, projectNoop, false, ""); err != nil {
+		t.Fatalf("noop empty hook: %v", err)
+	}
+	if data, err := os.ReadFile(hookNoop); err != nil || len(data) != 0 {
+		t.Fatalf("noop hook changed: %q err=%v", data, err)
+	}
+
+	// unknown user content must fail closed, never be deleted.
+	projectUser, hookUser := makeProject("#!/bin/sh\necho user\n")
+	if err := applyVerifiedGitHook(backupsDir, projectUser, false, ""); err == nil {
+		t.Fatal("unmanaged user hook must fail closed")
+	}
+	if data, _ := os.ReadFile(hookUser); string(data) != "#!/bin/sh\necho user\n" {
+		t.Fatalf("user hook changed: %q", data)
+	}
+
+	s := NewServer(nil, nil)
+	enabled := true
+	hookEnabled := true
+	content := "x"
+	if _, err := s.guard.SetProjectConfigVerified(t.TempDir(), &enabled, nil, 0, &content); err == nil {
+		t.Fatal("SetProjectConfigVerified must reject content when hookEnabled is nil")
+	}
+	if _, err := s.guard.SetProjectConfigVerified(t.TempDir(), &enabled, &hookEnabled, 0, nil); err == nil {
+		t.Fatal("SetProjectConfigVerified must reject missing verified content")
+	}
+}
+
+func TestP0SkillInstallMerge(t *testing.T) {
+	existing := wrapSkillManagedBlock("---\nname: slopguard\n---\n\nold body\n") + "\nuser tail\n"
+	rendered := wrapSkillManagedBlock("---\nname: slopguard\n---\n\nnew body\n")
+	merged, err := mergeSkillInstallContent(existing, rendered)
+	if err != nil {
+		t.Fatalf("mergeSkillInstallContent: %v", err)
+	}
+	if !strings.Contains(merged, "new body") || strings.Contains(merged, "old body") || !strings.Contains(merged, "user tail") {
+		t.Fatalf("merged skill = %q", merged)
+	}
+	if !strings.HasPrefix(merged, "---\nname: slopguard\n---\n") {
+		t.Fatalf("frontmatter lost: %q", merged)
+	}
+	if _, err := mergeSkillInstallContent("user-owned\n", rendered); !errors.Is(err, ErrManagedConfigModified) {
+		t.Fatalf("unmanaged skill err = %v, want ErrManagedConfigModified", err)
 	}
 }
 

@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/HunterLzap/slopguard/internal/ui"
 )
 
 const launchAgentLabel = "com.slopguard.ui"
@@ -239,17 +241,6 @@ func isTrustedDashboardResponding(port int) bool {
 	if err != nil || strings.TrimSpace(home) == "" {
 		return false
 	}
-	raw, err := os.ReadFile(filepath.Join(home, ".slopguard", "ui.lock"))
-	if err != nil {
-		return false
-	}
-	var lock struct {
-		Port       int    `json:"port"`
-		InstanceID string `json:"instance_id"`
-	}
-	if err := json.Unmarshal(raw, &lock); err != nil || lock.Port != port || strings.TrimSpace(lock.InstanceID) == "" {
-		return false
-	}
-	identity, ok := readDashboardIdentity(port)
-	return ok && identity.InstanceID == lock.InstanceID
+	_, ok := ui.ProbeTrustedDashboard(home, port)
+	return ok
 }

@@ -27,29 +27,51 @@ func TestP0RequestDashboardTicketUsesHeaderNotURL(t *testing.T) {
 	}
 
 	var sawTokenHeader bool
+	instanceID := "ticket-instance"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/api/auth/ticket" {
-			http.Error(w, "unexpected request", http.StatusBadRequest)
+		switch r.URL.Path {
+		case "/api/identity":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"service":     "slopguard",
+				"instance_id": instanceID,
+			})
 			return
-		}
-		if strings.Contains(r.URL.String(), token) {
-			t.Errorf("long-term token leaked into ticket request URL: %s", r.URL.String())
-		}
-		for _, values := range r.Header {
-			for _, value := range values {
-				if value == token {
-					sawTokenHeader = true
+		case "/api/auth/ticket":
+			if r.Method != http.MethodPost {
+				http.Error(w, "unexpected method", http.StatusBadRequest)
+				return
+			}
+			if strings.Contains(r.URL.String(), token) {
+				t.Errorf("long-term token leaked into ticket request URL: %s", r.URL.String())
+			}
+			for _, values := range r.Header {
+				for _, value := range values {
+					if value == token {
+						sawTokenHeader = true
+					}
 				}
 			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"ok":     "true",
+				"ticket": "ticket-p0",
+				"url":    "/?ticket=ticket-p0",
+			})
+			return
+		default:
+			http.Error(w, "unexpected request", http.StatusBadRequest)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"ok":     "true",
-			"ticket": "ticket-p0",
-			"url":    "/?ticket=ticket-p0",
-		})
 	}))
 	defer server.Close()
+	port := server.Listener.Addr().(*net.TCPAddr).Port
+	lockRaw, err := json.Marshal(map[string]any{"port": port, "instance_id": instanceID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".slopguard", "ui.lock"), lockRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	ticketURL, err := requestDashboardTicket(server.URL)
 	if err != nil {

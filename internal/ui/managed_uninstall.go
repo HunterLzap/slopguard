@@ -3,6 +3,7 @@ package ui
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -187,6 +188,9 @@ func migrateLegacyBackup(target backupTarget, rec configBackupRecord) (configBac
 	}
 	rec.SchemaVersion = backupRecordSchemaVersion
 	rec.Kind = target.Kind
+	if rec.OriginalSHA256 == "" && (rec.Existed || len(rec.OriginalBytes) > 0) {
+		rec.OriginalSHA256 = fileSHA256Hex(rec.OriginalBytes)
+	}
 	if rec.ID == "" {
 		rec.ID = target.ID
 	}
@@ -319,6 +323,9 @@ func stripMCPJSONSlopGuard(data []byte) ([]byte, error) {
 // planManagedUninstall 计算三方合并卸载计划，不修改任何文件。
 func planManagedUninstall(backupsDir string, target backupTarget, rec configBackupRecord) (uninstallPlan, error) {
 	plan := uninstallPlan{Action: uninstallNoop}
+	if err := validateBackupRecordDigests(rec); err != nil {
+		return plan, err
+	}
 	current, err := readTargetSnapshot(target.Path)
 	if err != nil {
 		return plan, err
@@ -396,22 +403,90 @@ func planTOMLUninstall(target backupTarget, rec configBackupRecord, current targ
 		return uninstallPlan{}, ErrLegacyBackupNeedsReview
 	}
 	if !currentHas {
+		if rec.Existed && len(rec.OriginalBytes) > 0 {
+			if originalEntry, has, _ := tomlSlopGuardEntry(rec.OriginalBytes); has {
+				merged := strings.TrimRight(string(current.Data), "\n")
+				section, marshalErr := renderTOMLSlopGuardSection(originalEntry)
+				if marshalErr != nil {
+					return uninstallPlan{}, marshalErr
+				}
+				if merged != "" {
+					merged += "\n\n"
+				}
+				merged += section + "\n"
+				if tomlDocumentsEqual([]byte(merged), rec.OriginalBytes) {
+					return restoreOriginalPlan(target, rec, current.Mode)
+				}
+				return uninstallPlan{Action: uninstallWriteMerged, NewData: []byte(merged), NewMode: current.Mode, Reason: "恢复安装前用户同名 Codex 段"}, nil
+			}
+		}
 		return uninstallPlan{Action: uninstallNoop, Reason: "当前 Codex 配置已无 SlopGuard 段"}, nil
 	}
 	if !installedHas {
 		return uninstallPlan{}, ErrLegacyBackupNeedsReview
 	}
-	if !reflect.DeepEqual(currentEntry, installedEntry) {
+	if !tomlEntryEqual(currentEntry, installedEntry) {
 		return uninstallPlan{}, fmt.Errorf("%w: Codex mcp_servers.slopguard 段已被用户修改", ErrManagedConfigModified)
 	}
 	stripped := replaceOrRemoveCodexSection(string(current.Data), "", true)
-	if rec.Existed && normalizeConfigText([]byte(stripped)) == normalizeConfigText(rec.OriginalBytes) {
+	if entry, stillThere, _ := tomlSlopGuardEntry([]byte(stripped)); stillThere && tomlEntryEqual(entry, currentEntry) {
+		return uninstallPlan{}, fmt.Errorf("%w: Codex 配置使用内联 mcp_servers.slopguard，无法安全文本合并", ErrManagedConfigModified)
+	}
+	// 恢复安装前用户自己的同名 [mcp_servers.slopguard] 段。
+	if rec.Existed {
+		if originalEntry, has, _ := tomlSlopGuardEntry(rec.OriginalBytes); has {
+			section, marshalErr := renderTOMLSlopGuardSection(originalEntry)
+			if marshalErr != nil {
+				return uninstallPlan{}, marshalErr
+			}
+			stripped = strings.TrimRight(stripped, "\n")
+			if stripped != "" {
+				stripped += "\n\n"
+			}
+			stripped += section + "\n"
+		}
+	}
+	if rec.Existed && tomlDocumentsEqual([]byte(stripped), rec.OriginalBytes) {
 		return restoreOriginalPlan(target, rec, current.Mode)
 	}
 	if strings.TrimSpace(stripped) == "" {
 		return uninstallPlan{Action: uninstallDeleteFile, Reason: "移除 SlopGuard Codex 段后配置为空"}, nil
 	}
 	return uninstallPlan{Action: uninstallWriteMerged, NewData: []byte(stripped), NewMode: current.Mode, Reason: "仅移除 Codex 的 SlopGuard 段"}, nil
+}
+
+func tomlEntryEqual(left, right any) bool {
+	return reflect.DeepEqual(left, right)
+}
+
+func tomlDocumentsEqual(left, right []byte) bool {
+	if len(bytes.TrimSpace(left)) == 0 || len(bytes.TrimSpace(right)) == 0 {
+		return len(bytes.TrimSpace(left)) == len(bytes.TrimSpace(right))
+	}
+	var a, b map[string]any
+	if err := toml.Unmarshal(left, &a); err != nil {
+		return false
+	}
+	if err := toml.Unmarshal(right, &b); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(a, b)
+}
+
+func renderTOMLSlopGuardSection(entry map[string]any) (string, error) {
+	doc := map[string]any{"mcp_servers": map[string]any{"slopguard": entry}}
+	encoded, err := toml.Marshal(doc)
+	if err != nil {
+		return "", fmt.Errorf("重建 Codex slopguard 段失败: %w", err)
+	}
+	var out []string
+	for _, line := range strings.Split(strings.TrimRight(string(encoded), "\n"), "\n") {
+		if strings.TrimSpace(line) == "[mcp_servers]" {
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n"), nil
 }
 
 func tomlSlopGuardEntry(data []byte) (map[string]any, bool, error) {
@@ -441,6 +516,30 @@ func planMCPUninstall(target backupTarget, rec configBackupRecord, current targe
 	currentEntry, currentHas := mcpSlopGuardEntry(currentRoot)
 	installedEntry, installedHas := mcpSlopGuardEntry(installedRoot)
 	if !currentHas {
+		// 用户可能只删除了受管条目；若安装前本来有用户自己的同名条目，
+		// 仍需把它恢复回来，不能简单 noop。
+		if rec.Existed && len(rec.OriginalBytes) > 0 {
+			var originalRoot map[string]any
+			if err := json.Unmarshal(rec.OriginalBytes, &originalRoot); err == nil {
+				if originalEntry, has := mcpSlopGuardEntry(originalRoot); has {
+					servers, _ := currentRoot["mcpServers"].(map[string]any)
+					if servers == nil {
+						servers = map[string]any{}
+					}
+					servers["slopguard"] = originalEntry
+					currentRoot["mcpServers"] = servers
+					newData, marshalErr := json.MarshalIndent(currentRoot, "", "  ")
+					if marshalErr != nil {
+						return uninstallPlan{}, marshalErr
+					}
+					newData = append(newData, '\n')
+					if jsonDocumentsEqual(newData, rec.OriginalBytes) {
+						return restoreOriginalPlan(target, rec, current.Mode)
+					}
+					return uninstallPlan{Action: uninstallWriteMerged, NewData: newData, NewMode: current.Mode, Reason: "恢复安装前用户同名 slopguard 条目"}, nil
+				}
+			}
+		}
 		return uninstallPlan{Action: uninstallNoop, Reason: "当前配置已无 SlopGuard 条目"}, nil
 	}
 	if !installedHas {
@@ -451,6 +550,19 @@ func planMCPUninstall(target backupTarget, rec configBackupRecord, current targe
 	}
 	servers, _ := currentRoot["mcpServers"].(map[string]any)
 	delete(servers, "slopguard")
+	// 原文件本来就有用户自己的同名 slopguard 条目时，删除受管条目后必须恢复它，
+	// 而不是把用户原有配置一起删掉。
+	if len(rec.OriginalBytes) > 0 {
+		var originalRoot map[string]any
+		if err := json.Unmarshal(rec.OriginalBytes, &originalRoot); err == nil {
+			if originalEntry, has := mcpSlopGuardEntry(originalRoot); has {
+				if servers == nil {
+					servers = map[string]any{}
+				}
+				servers["slopguard"] = originalEntry
+			}
+		}
+	}
 	if len(servers) == 0 {
 		delete(currentRoot, "mcpServers")
 	} else {
@@ -484,10 +596,12 @@ func jsonValueEqual(left, right any) bool {
 }
 
 func planHookUninstall(target backupTarget, rec configBackupRecord, current targetSnapshot) (uninstallPlan, error) {
-	currentBlock := extractHookManagedBlock(string(current.Data))
+	currentBlocks := extractAllHookManagedBlocks(string(current.Data))
 	installedBlock := extractHookManagedBlock(string(rec.InstalledBytes))
-	if currentBlock != "" && currentBlock != installedBlock {
-		return uninstallPlan{}, fmt.Errorf("%w: Git hook 中的 SlopGuard 块已被用户修改", ErrManagedConfigModified)
+	for _, block := range currentBlocks {
+		if block != installedBlock {
+			return uninstallPlan{}, fmt.Errorf("%w: Git hook 中的 SlopGuard 块已被用户修改", ErrManagedConfigModified)
+		}
 	}
 	stripped := stripHookMarkerBlock(string(current.Data))
 	trimmed := strings.TrimSpace(stripped)
@@ -498,6 +612,25 @@ func planHookUninstall(target backupTarget, rec configBackupRecord, current targ
 		return uninstallPlan{Action: uninstallDeleteFile, Reason: "移除 SlopGuard hook 后文件为空"}, nil
 	}
 	return uninstallPlan{Action: uninstallWriteMerged, NewData: []byte(stripped), NewMode: current.Mode, Reason: "仅移除 SlopGuard hook 块"}, nil
+}
+
+func extractAllHookManagedBlocks(text string) []string {
+	var blocks []string
+	rest := text
+	for {
+		start := strings.Index(rest, gitHookStartMarker)
+		if start < 0 {
+			break
+		}
+		endRel := strings.Index(rest[start:], gitHookEndMarker)
+		if endRel < 0 {
+			break
+		}
+		end := start + endRel + len(gitHookEndMarker)
+		blocks = append(blocks, rest[start:end])
+		rest = rest[end:]
+	}
+	return blocks
 }
 
 func extractHookManagedBlock(text string) string {
@@ -513,25 +646,90 @@ func extractHookManagedBlock(text string) string {
 }
 
 func planSkillUninstall(target backupTarget, rec configBackupRecord, current targetSnapshot) (uninstallPlan, error) {
-	currentBlock := extractSkillManagedBlock(string(current.Data))
+	currentBlocks := extractAllSkillManagedBlocks(string(current.Data))
 	installedBlock := extractSkillManagedBlock(string(rec.InstalledBytes))
-	if currentBlock != "" && currentBlock != installedBlock {
-		return uninstallPlan{}, fmt.Errorf("%w: Skill 受管块已被用户修改", ErrManagedConfigModified)
+	for _, block := range currentBlocks {
+		if block != installedBlock {
+			return uninstallPlan{}, fmt.Errorf("%w: Skill 受管块已被用户修改", ErrManagedConfigModified)
+		}
 	}
-	if currentBlock == "" {
+	if len(currentBlocks) == 0 {
 		if fileSHA256Hex(current.Data) != rec.InstalledSHA256 {
 			return uninstallPlan{}, ErrLegacyBackupNeedsReview
 		}
 		return restoreOriginalPlan(target, rec, current.Mode)
 	}
 	stripped := removeSkillManagedBlock(string(current.Data))
-	if rec.Existed && normalizeConfigText([]byte(stripped)) == normalizeConfigText(rec.OriginalBytes) {
-		return restoreOriginalPlan(target, rec, current.Mode)
+	if rec.Existed {
+		merged := mergeOriginalWithSkillLeftover(rec.OriginalBytes, []byte(stripped))
+		if normalizeConfigText(merged) == normalizeConfigText(rec.OriginalBytes) {
+			return restoreOriginalPlan(target, rec, current.Mode)
+		}
+		return uninstallPlan{Action: uninstallWriteMerged, NewData: merged, NewMode: current.Mode, Reason: "恢复原同名 Skill 并保留受管块外用户新增内容"}, nil
 	}
 	if strings.TrimSpace(stripped) == "" {
 		return uninstallPlan{Action: uninstallDeleteFile, Reason: "移除 SlopGuard 受管块后文件为空"}, nil
 	}
 	return uninstallPlan{Action: uninstallWriteMerged, NewData: []byte(stripped), NewMode: current.Mode, Reason: "仅移除 SlopGuard Skill 受管块"}, nil
+}
+
+// mergeOriginalWithSkillLeftover 把安装前的同名 Skill 原内容与受管块之外保留的
+// 用户新增内容合并；没有新增时返回原字节，供三方合并做精确恢复判断。
+func mergeOriginalWithSkillLeftover(original, leftover []byte) []byte {
+	if strings.TrimSpace(string(leftover)) == "" {
+		return append([]byte(nil), original...)
+	}
+	base := strings.TrimRight(string(original), "\r\n")
+	addition := strings.TrimLeft(string(leftover), "\r\n")
+	if base == "" {
+		return []byte(addition)
+	}
+	return []byte(base + "\n\n" + addition)
+}
+
+func extractAllSkillManagedBlocks(text string) []string {
+	var blocks []string
+	rest := text
+	for {
+		start := strings.Index(rest, skillManagedStartMarker)
+		if start < 0 {
+			break
+		}
+		endRel := strings.Index(rest[start:], skillManagedEndMarker)
+		if endRel < 0 {
+			break
+		}
+		end := start + endRel + len(skillManagedEndMarker)
+		blocks = append(blocks, rest[start:end])
+		rest = rest[end:]
+	}
+	return blocks
+}
+
+func replaceAllSkillManagedBlocks(text, replacement string) string {
+	var out strings.Builder
+	rest := text
+	replaced := false
+	for {
+		start := strings.Index(rest, skillManagedStartMarker)
+		if start < 0 {
+			out.WriteString(rest)
+			break
+		}
+		endRel := strings.Index(rest[start:], skillManagedEndMarker)
+		if endRel < 0 {
+			out.WriteString(rest)
+			break
+		}
+		end := start + endRel + len(skillManagedEndMarker)
+		out.WriteString(rest[:start])
+		if !replaced {
+			out.WriteString(replacement)
+			replaced = true
+		}
+		rest = rest[end:]
+	}
+	return out.String()
 }
 
 func extractSkillManagedBlock(text string) string {
@@ -547,11 +745,11 @@ func extractSkillManagedBlock(text string) string {
 }
 
 func removeSkillManagedBlock(text string) string {
-	block := extractSkillManagedBlock(text)
-	if block == "" {
-		return text
+	blocks := extractAllSkillManagedBlocks(text)
+	for _, block := range blocks {
+		text = strings.Replace(text, block, "", 1)
 	}
-	return strings.Replace(text, block, "", 1)
+	return text
 }
 
 // applyManagedUninstall 执行 planManagedUninstall 的结果，并在成功后清理备份元数据。
@@ -577,6 +775,26 @@ func applyManagedUninstall(backupsDir string, target backupTarget, plan uninstal
 		return fmt.Errorf("未知卸载动作 %q", plan.Action)
 	}
 	return removeBackupRecord(backupsDir, target)
+}
+
+// verify 在真正写入前校验卸载计划与预览记录一致。delete_file 必须对应预览中
+// 的删除语义；restore_original/write_merged 必须对应 preview 记录的最终内容 hash。
+// restore_original 允许合法恢复为“空文件”，此时 NewData 为空但 hash 应为空内容摘要。
+func (p uninstallPlan) verify(lease *applyLease, targetPath string) error {
+	if p.Action == uninstallNoop {
+		return nil
+	}
+	if lease == nil {
+		return errors.New("ui: missing preview lease")
+	}
+	switch p.Action {
+	case uninstallDeleteFile:
+		return lease.checkDeletion(targetPath)
+	case uninstallRestoreOriginal, uninstallWriteMerged:
+		return lease.checkNewContent(targetPath, p.NewData)
+	default:
+		return fmt.Errorf("未知卸载动作 %q", p.Action)
+	}
 }
 
 func removeBackupRecord(backupsDir string, target backupTarget) error {

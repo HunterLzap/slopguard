@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -11,10 +12,7 @@ import (
 	"time"
 )
 
-const (
-	uiLockFileName     = "ui.lock"
-	instanceStaleAfter = 2 * time.Minute
-)
+const uiLockFileName = "ui.lock"
 
 // AlreadyRunningError means a healthy SlopGuard dashboard already owns the
 // user's single-instance lock. Callers should attach to URL instead of starting
@@ -37,6 +35,15 @@ func (e *AlreadyRunningError) Error() string {
 	return fmt.Sprintf("SlopGuard dashboard is already running at %s (pid %d)", url, e.PID)
 }
 
+// TrustedDashboard is the verified local dashboard endpoint. Its identity comes
+// from the user's lock record and must match /api/identity on the same port.
+type TrustedDashboard struct {
+	URL        string
+	Port       int
+	PID        int
+	InstanceID string
+}
+
 type instanceLockRecord struct {
 	Version    int    `json:"version"`
 	PID        int    `json:"pid"`
@@ -47,6 +54,7 @@ type instanceLockRecord struct {
 
 type instanceLock struct {
 	path   string
+	file   *os.File
 	record instanceLockRecord
 }
 
@@ -58,9 +66,10 @@ func instanceLockPath(home string) string {
 	return filepath.Join(home, ".slopguard", uiLockFileName)
 }
 
-// acquireInstanceLock enforces one dashboard process per user home. The lock
-// file contains an instance id so a second process can verify that the local
-// HTTP endpoint is the same SlopGuard process before attaching.
+// acquireInstanceLock enforces one dashboard process per user home with an
+// operating-system-level exclusive lock. The lock file is persistent metadata;
+// the OS releases the actual lock when the process exits, so age-based stale
+// detection is neither needed nor safe.
 func acquireInstanceLock(home string, port int) (*instanceLock, error) {
 	path := instanceLockPath(home)
 	if path == "" {
@@ -87,45 +96,23 @@ func acquireInstanceLock(home string, port int) (*instanceLock, error) {
 	}
 	encoded = append(encoded, '\n')
 
-	for attempt := 0; attempt < 2; attempt++ {
-		f, openErr := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if openErr == nil {
-			if _, writeErr := f.Write(encoded); writeErr != nil {
-				_ = f.Close()
-				_ = os.Remove(path)
-				return nil, fmt.Errorf("ui: write instance lock: %w", writeErr)
-			}
-			if syncErr := f.Sync(); syncErr != nil {
-				_ = f.Close()
-				_ = os.Remove(path)
-				return nil, fmt.Errorf("ui: sync instance lock: %w", syncErr)
-			}
-			if closeErr := f.Close(); closeErr != nil {
-				_ = os.Remove(path)
-				return nil, fmt.Errorf("ui: close instance lock: %w", closeErr)
-			}
-			_ = hardenSecretFile(path)
-			return &instanceLock{path: path, record: record}, nil
-		}
-		if !os.IsExist(openErr) {
-			return nil, fmt.Errorf("ui: create instance lock: %w", openErr)
+	f, openErr := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if openErr != nil {
+		return nil, fmt.Errorf("ui: open instance lock: %w", openErr)
+	}
+
+	if lockErr := lockFileExclusive(f); lockErr != nil {
+		if !isFileLockBusy(lockErr) {
+			_ = f.Close()
+			return nil, fmt.Errorf("ui: lock instance file: %w", lockErr)
 		}
 
-		existingRaw, readErr := os.ReadFile(path)
-		if readErr != nil {
-			if os.IsNotExist(readErr) {
-				continue
-			}
-			return nil, fmt.Errorf("ui: read instance lock: %w", readErr)
-		}
-		var existing instanceLockRecord
-		parseOK := json.Unmarshal(existingRaw, &existing) == nil
-		if !parseOK && existing.InstanceID == "" {
-			if info, statErr := os.Stat(path); statErr == nil && time.Since(info.ModTime()) < instanceStaleAfter {
-				return nil, errors.New("ui: instance lock is unreadable; retry after it becomes stale")
-			}
-			_ = os.Remove(path)
-			continue
+		// Another process holds the OS lock. Its metadata is advisory only:
+		// never remove the file or treat age as proof that the process is dead.
+		existing, readErr := readInstanceLockRecord(f)
+		_ = f.Close()
+		if readErr != nil || strings.TrimSpace(existing.InstanceID) == "" {
+			return nil, errors.New("ui: another SlopGuard dashboard is starting; retry shortly")
 		}
 		if probeDashboardIdentity(existing.Port, existing.InstanceID) {
 			return nil, &AlreadyRunningError{
@@ -135,22 +122,60 @@ func acquireInstanceLock(home string, port int) (*instanceLock, error) {
 				InstanceID: existing.InstanceID,
 			}
 		}
-		startedAt, _ := time.Parse(time.RFC3339, existing.StartedAt)
-		age := time.Since(startedAt)
-		if startedAt.IsZero() {
-			if info, statErr := os.Stat(path); statErr == nil {
-				age = time.Since(info.ModTime())
-			}
-		}
-		if !processAlive(existing.PID) || age > instanceStaleAfter {
-			if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
-				return nil, fmt.Errorf("ui: remove stale instance lock: %w", removeErr)
-			}
-			continue
-		}
 		return nil, fmt.Errorf("ui: another SlopGuard dashboard is starting (pid %d); retry shortly", existing.PID)
 	}
-	return nil, errors.New("ui: could not acquire instance lock")
+
+	if err := writeInstanceLockRecord(f, encoded); err != nil {
+		_ = unlockFile(f)
+		_ = f.Close()
+		return nil, err
+	}
+	if err := hardenSecretFile(path); err != nil {
+		_ = unlockFile(f)
+		_ = f.Close()
+		return nil, fmt.Errorf("ui: protect instance lock: %w", err)
+	}
+	return &instanceLock{path: path, file: f, record: record}, nil
+}
+
+func readInstanceLockRecord(f *os.File) (instanceLockRecord, error) {
+	var record instanceLockRecord
+	if f == nil {
+		return record, errors.New("ui: missing instance lock file")
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return record, err
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, 64<<10))
+	if err != nil {
+		return record, err
+	}
+	if len(raw) == 0 {
+		return record, errors.New("ui: empty instance lock")
+	}
+	if err := json.Unmarshal(raw, &record); err != nil {
+		return record, err
+	}
+	return record, nil
+}
+
+func writeInstanceLockRecord(f *os.File, encoded []byte) error {
+	if f == nil {
+		return errors.New("ui: missing instance lock file")
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("ui: seek instance lock: %w", err)
+	}
+	if err := f.Truncate(0); err != nil {
+		return fmt.Errorf("ui: truncate instance lock: %w", err)
+	}
+	if _, err := f.Write(encoded); err != nil {
+		return fmt.Errorf("ui: write instance lock: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("ui: sync instance lock: %w", err)
+	}
+	return nil
 }
 
 func (l *instanceLock) setPort(port int) error {
@@ -163,7 +188,10 @@ func (l *instanceLock) setPort(port int) error {
 		return err
 	}
 	encoded = append(encoded, '\n')
-	if err := os.WriteFile(l.path, encoded, 0o600); err != nil {
+	if l.file == nil {
+		return errors.New("ui: instance lock is not held")
+	}
+	if err := writeInstanceLockRecord(l.file, encoded); err != nil {
 		return fmt.Errorf("ui: update instance lock: %w", err)
 	}
 	_ = hardenSecretFile(l.path)
@@ -171,22 +199,17 @@ func (l *instanceLock) setPort(port int) error {
 }
 
 func (l *instanceLock) release() {
-	if l == nil || l.path == "" {
+	if l == nil || l.file == nil {
 		return
 	}
-	raw, err := os.ReadFile(l.path)
-	if err != nil {
-		return
-	}
-	var current instanceLockRecord
-	if json.Unmarshal(raw, &current) != nil || current.InstanceID != l.record.InstanceID {
-		return
-	}
-	_ = os.Remove(l.path)
+	_ = unlockFile(l.file)
+	_ = l.file.Close()
+	l.file = nil
 }
 
 func probeDashboardIdentity(port int, instanceID string) bool {
-	if port < 1 || port > 65535 {
+	expected := strings.TrimSpace(instanceID)
+	if port < 1 || port > 65535 || expected == "" {
 		return false
 	}
 	client := &http.Client{Timeout: 600 * time.Millisecond}
@@ -202,14 +225,40 @@ func probeDashboardIdentity(port int, instanceID string) bool {
 		Service    string `json:"service"`
 		InstanceID string `json:"instance_id"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&identity); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&identity); err != nil {
 		return false
 	}
 	if identity.Service != "slopguard" {
 		return false
 	}
-	if strings.TrimSpace(instanceID) == "" {
-		return true
+	return identity.InstanceID == expected
+}
+
+// ProbeTrustedDashboard verifies that ui.lock belongs to the dashboard
+// listening on port and that the live /api/identity instance id matches it.
+func ProbeTrustedDashboard(home string, port int) (TrustedDashboard, bool) {
+	path := instanceLockPath(home)
+	if path == "" || port < 1 || port > 65535 {
+		return TrustedDashboard{}, false
 	}
-	return identity.InstanceID == instanceID
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return TrustedDashboard{}, false
+	}
+	var record instanceLockRecord
+	if err := json.Unmarshal(raw, &record); err != nil {
+		return TrustedDashboard{}, false
+	}
+	if record.Port != port || strings.TrimSpace(record.InstanceID) == "" {
+		return TrustedDashboard{}, false
+	}
+	if !probeDashboardIdentity(port, record.InstanceID) {
+		return TrustedDashboard{}, false
+	}
+	return TrustedDashboard{
+		URL:        fmt.Sprintf("http://127.0.0.1:%d/", port),
+		Port:       port,
+		PID:        record.PID,
+		InstanceID: record.InstanceID,
+	}, true
 }

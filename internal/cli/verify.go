@@ -18,22 +18,27 @@ import (
 )
 
 type verifyOptions struct {
-	root   string
-	all    bool
-	json   bool
-	jobs   int
-	record bool
-	ui     bool
-	paths  []string
+	root          string
+	all           bool
+	lastCommit    bool
+	json          bool
+	jobs          int
+	record        bool
+	autoCapture   bool
+	captureSource string
+	ui            bool
+	paths         []string
 }
 
 func runVerify(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	all := fs.Bool("all", false, "scan all project files instead of only git-changed files")
+	lastCommit := fs.Bool("last-commit", false, "scan files touched by HEAD commit (used by post-commit hook)")
 	jsonOut := fs.Bool("json", false, "emit a structured contract.VerifyResult as JSON")
 	jobs := fs.Int("jobs", 0, "maximum concurrent checks (default: config value or 2)")
 	record := fs.Bool("record", false, "record a scan_runs row after verify (pass or fail)")
+	source := fs.String("source", "auto_verify", "mistake source label when auto-capturing failures")
 	ui := fs.Bool("ui", false, "run Playwright UI smoke checks after the regular checks pass")
 	rootFlag := fs.String("root", ".", "project root directory")
 	help, err := parseFlags(fs, args)
@@ -59,12 +64,14 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 	}
 
 	return runVerifyWith(verifyOptions{
-		root:   root,
-		all:    *all,
-		json:   *jsonOut,
-		jobs:   *jobs,
-		record: *record,
-		ui:     *ui,
+		root:          root,
+		all:           *all,
+		lastCommit:    *lastCommit,
+		json:          *jsonOut,
+		jobs:          *jobs,
+		record:        *record,
+		captureSource: *source,
+		ui:            *ui,
 	}, stdout, stderr)
 }
 
@@ -146,6 +153,15 @@ func runVerifyWith(opts verifyOptions, stdout, stderr io.Writer) int {
 		files = filterFilesByExtensions(resolveScopePaths(opts.root, opts.paths), extensions)
 	case opts.all:
 		files, err = deps.engine.ListFiles(opts.root, extensions)
+	case opts.lastCommit:
+		if lcp, ok := deps.engine.(lastCommitProvider); ok {
+			files, err = lcp.LastCommitFiles(ctx, opts.root)
+		} else {
+			files, err = deps.engine.ChangedFiles(ctx, opts.root)
+		}
+		if err == nil {
+			files = filterFilesByExtensions(files, extensions)
+		}
 	default:
 		files, err = deps.engine.ChangedFiles(ctx, opts.root)
 		if err == nil {
@@ -283,6 +299,9 @@ func runVerifyWith(opts verifyOptions, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "slopguard: warning: record scan failed: %v\n", err)
 		}
 	}
+	if (opts.record || opts.autoCapture) && !result.Passed && len(result.Findings) > 0 {
+		autoCaptureVerifyMistakes(ctx, deps.recorder, opts.root, result.Findings, opts.captureSource, stderr)
+	}
 	writeResult(stdout, opts.json, result)
 	if result.Passed {
 		return ExitOK
@@ -297,6 +316,101 @@ func emptyResult(started time.Time) contract.VerifyResult {
 		Escapes:    map[string]int{},
 		DurationMs: time.Since(started).Milliseconds(),
 	}
+}
+
+const maxAutoCapturedMistakesPerRun = 5
+
+func autoCaptureVerifyMistakes(ctx context.Context, recorder scanRecorder, root string, findings []contract.Finding, source string, stderr io.Writer) {
+	mr, ok := recorder.(mistakeRecorder)
+	if !ok || mr == nil {
+		return
+	}
+	source = strings.TrimSpace(source)
+	if source == "" {
+		source = "auto_verify"
+	}
+	seen := make(map[string]struct{}, len(findings))
+	captured := 0
+	for _, f := range findings {
+		if captured >= maxAutoCapturedMistakesPerRun {
+			break
+		}
+		category := classifyFindingCategory(f)
+		summary := buildFindingSummary(f)
+		if summary == "" {
+			continue
+		}
+		fp := mistakeFingerprint(root, category, summary)
+		if _, dup := seen[fp]; dup {
+			continue
+		}
+		seen[fp] = struct{}{}
+		badSnippet := formatFindingSnippet(f)
+		if _, err := mr.RecordMistake(ctx, contract.Mistake{
+			ProjectPath: root,
+			Fingerprint: fp,
+			Category:    category,
+			Summary:     summary,
+			BadSnippet:  badSnippet,
+			Source:      source,
+			Status:      "pending",
+		}); err != nil {
+			fmt.Fprintf(stderr, "slopguard: warning: auto-capture mistake failed: %v\n", err)
+			return
+		}
+		captured++
+	}
+}
+
+func classifyFindingCategory(f contract.Finding) string {
+	rule := strings.ToLower(strings.TrimSpace(f.Rule))
+	msg := strings.ToLower(strings.TrimSpace(f.Message))
+	switch {
+	case strings.Contains(rule, "ratchet") || strings.Contains(rule, "escape") || strings.Contains(msg, "baseline"):
+		return "escape"
+	case strings.Contains(rule, "import") || strings.Contains(msg, "import"):
+		return "import"
+	case strings.Contains(rule, "type") || rule == "tsc" || strings.Contains(rule, "mypy") || strings.Contains(rule, "pyright"):
+		return "type"
+	case strings.Contains(rule, "syntax") || strings.Contains(msg, "syntax"):
+		return "syntax"
+	default:
+		return "lint"
+	}
+}
+
+func buildFindingSummary(f contract.Finding) string {
+	rule := strings.TrimSpace(f.Rule)
+	msg := strings.TrimSpace(f.Message)
+	if len(msg) > 140 {
+		msg = msg[:140] + "..."
+	}
+	if rule != "" && msg != "" {
+		return fmt.Sprintf("[%s] %s", rule, msg)
+	}
+	if rule != "" {
+		return rule
+	}
+	return msg
+}
+
+func formatFindingSnippet(f contract.Finding) string {
+	loc := strings.TrimSpace(f.File)
+	if loc != "" && f.Line > 0 {
+		if f.Column > 0 {
+			loc = fmt.Sprintf("%s:%d:%d", loc, f.Line, f.Column)
+		} else {
+			loc = fmt.Sprintf("%s:%d", loc, f.Line)
+		}
+	}
+	msg := strings.TrimSpace(f.Message)
+	if loc != "" && msg != "" {
+		return loc + " — " + msg
+	}
+	if loc != "" {
+		return loc
+	}
+	return msg
 }
 
 // loadBaselineForVerify uses the richer baseline view when the engine provides

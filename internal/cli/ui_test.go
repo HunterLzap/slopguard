@@ -48,3 +48,40 @@ func TestRunUIHelp(t *testing.T) {
 		t.Fatalf("runUI help exit = %d, want %d", code, ExitOK)
 	}
 }
+
+func TestRunUISmartLaunchWhenAlreadyRunning(t *testing.T) {
+	oldCheck := checkDashboardRunning
+	oldOpen := openDashboardWindow
+	oldRun := runDashboard
+	t.Cleanup(func() {
+		checkDashboardRunning = oldCheck
+		openDashboardWindow = oldOpen
+		runDashboard = oldRun
+	})
+
+	checkDashboardRunning = func(port int) bool { return port == 7788 }
+	var openedURL string
+	openDashboardWindow = func(url string) error {
+		openedURL = url
+		return nil
+	}
+	runCalled := false
+	runDashboard = func(_ context.Context, _ contract.Runner, _ dashboardOptions, _ io.Writer) error {
+		runCalled = true
+		return nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := runUI([]string{"--port", "7788"}, &stdout, &stderr); code != ExitOK {
+		t.Fatalf("runUI exit = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if runCalled {
+		t.Fatal("runDashboard should not be called when service is already responding")
+	}
+	if openedURL != "http://127.0.0.1:7788" {
+		t.Fatalf("openedURL = %q, want http://127.0.0.1:7788", openedURL)
+	}
+	if !strings.Contains(stdout.String(), "already running") {
+		t.Fatalf("stdout = %q, want already running message", stdout.String())
+	}
+}

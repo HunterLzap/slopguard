@@ -16,8 +16,10 @@ import (
 	"github.com/HunterLzap/slopguard/internal/store"
 )
 
+var openMCPStore = store.OpenDefault
+
 func buildMCPTools(root string) []mcp.Tool {
-	return []mcp.Tool{
+	tools := []mcp.Tool{
 		{
 			Name:        "sg_verify",
 			Description: "Run the deterministic SlopGuard gate for the project.",
@@ -122,7 +124,118 @@ func buildMCPTools(root string) []mcp.Tool {
 				return applyRuleForMCP(ctx, root, args)
 			},
 		},
+		{
+			Name:        "sg_list_inbox",
+			Description: "List auto-captured or pending inbox mistakes (pending_ai / pending_user) so the host Agent can analyze them.",
+			InputSchema: objectSchema(map[string]any{
+				"project":       map[string]any{"type": "string", "description": "optional project path filter"},
+				"review_status": map[string]any{"type": "string", "enum": []string{"pending_ai", "pending_user", "approved", "ignored"}},
+			}),
+			Handler: func(ctx context.Context, args json.RawMessage) (any, error) {
+				var a struct {
+					Project      string `json:"project"`
+					ReviewStatus string `json:"review_status"`
+				}
+				if err := decodeMCPArgs(args, &a); err != nil {
+					return nil, err
+				}
+				return listInboxForMCP(ctx, a.Project, a.ReviewStatus)
+			},
+		},
+		{
+			Name:        "sg_submit_analysis",
+			Description: "Submit plain-language Chinese AI analysis and recommendation for a captured mistake to await user approval in the dashboard.",
+			InputSchema: objectSchema(map[string]any{
+				"fingerprint": map[string]any{"type": "string"},
+				"decision":    map[string]any{"type": "string", "enum": []string{"recommend", "skip"}},
+				"reason":      map[string]any{"type": "string", "description": "plain-language Chinese explanation of why to recommend or skip"},
+				"rule_draft":  map[string]any{"type": "string", "description": "optional draft rule configuration"},
+			}, "fingerprint", "decision", "reason"),
+			Handler: func(ctx context.Context, args json.RawMessage) (any, error) {
+				var a struct {
+					Fingerprint string `json:"fingerprint"`
+					Decision    string `json:"decision"`
+					Reason      string `json:"reason"`
+					RuleDraft   string `json:"rule_draft"`
+				}
+				if err := decodeMCPArgs(args, &a); err != nil {
+					return nil, err
+				}
+				return submitAnalysisForMCP(ctx, a.Fingerprint, a.Decision, a.Reason, a.RuleDraft)
+			},
+		},
 	}
+	return wrapMCPToolsWithAudit(root, tools)
+}
+
+func wrapMCPToolsWithAudit(root string, tools []mcp.Tool) []mcp.Tool {
+	wrapped := make([]mcp.Tool, len(tools))
+	for i, tool := range tools {
+		t := tool
+		orig := t.Handler
+		t.Handler = func(ctx context.Context, args json.RawMessage) (any, error) {
+			started := time.Now()
+			res, err := orig(ctx, args)
+			durationMs := time.Since(started).Milliseconds()
+			recordMCPAuditEvent(ctx, root, t.Name, args, res, err, durationMs)
+			return res, err
+		}
+		wrapped[i] = t
+	}
+	return wrapped
+}
+
+func recordMCPAuditEvent(ctx context.Context, root, toolName string, args json.RawMessage, res any, callErr error, durationMs int64) {
+	db, err := openMCPStore()
+	if err != nil {
+		return
+	}
+	defer db.Close()
+
+	passed := callErr == nil
+	findingsCount := 0
+	errorText := ""
+	if callErr != nil {
+		errorText = callErr.Error()
+	}
+	switch v := res.(type) {
+	case contract.VerifyResult:
+		passed = passed && v.Passed
+		findingsCount = len(v.Findings)
+	case *contract.VerifyResult:
+		if v != nil {
+			passed = passed && v.Passed
+			findingsCount = len(v.Findings)
+		}
+	}
+
+	auditCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	_ = db.RecordMCPEvent(auditCtx, store.MCPEvent{
+		ProjectPath:   root,
+		ToolName:      toolName,
+		ArgsSummary:   summarizeMCPArgs(args),
+		Passed:        passed,
+		FindingsCount: findingsCount,
+		DurationMs:    durationMs,
+		ErrorText:     errorText,
+	})
+}
+
+func summarizeMCPArgs(raw json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return "{}"
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, []byte(trimmed)); err == nil {
+		trimmed = compact.String()
+	}
+	const maxLen = 240
+	if len(trimmed) > maxLen {
+		return trimmed[:maxLen] + "..."
+	}
+	return trimmed
 }
 
 func objectSchema(properties map[string]any, required ...string) map[string]any {
@@ -150,11 +263,12 @@ func decodeMCPArgs(raw json.RawMessage, target any) error {
 func verifyForMCP(root string, all bool, paths []string, ui bool) (contract.VerifyResult, error) {
 	var stdout, stderr bytes.Buffer
 	code := runVerifyWith(verifyOptions{
-		root:  root,
-		all:   all,
-		json:  true,
-		ui:    ui,
-		paths: paths,
+		root:        root,
+		all:         all,
+		json:        true,
+		autoCapture: true,
+		ui:          ui,
+		paths:       paths,
 	}, &stdout, &stderr)
 	if code == ExitError {
 		msg := strings.TrimSpace(stderr.String())
@@ -189,7 +303,7 @@ func recordMistakeForMCP(ctx context.Context, project, category, summary, bad, g
 		category = "other"
 	}
 	fingerprint := mistakeFingerprint(project, category, summary)
-	db, err := store.OpenDefault()
+	db, err := openMCPStore()
 	if err != nil {
 		return nil, fmt.Errorf("open mistake store: %w", err)
 	}
@@ -210,7 +324,7 @@ func recordMistakeForMCP(ctx context.Context, project, category, summary, bad, g
 }
 
 func listCandidatesForMCP(ctx context.Context, minCount int) ([]contract.Mistake, error) {
-	db, err := store.OpenDefault()
+	db, err := openMCPStore()
 	if err != nil {
 		return nil, fmt.Errorf("open mistake store: %w", err)
 	}
@@ -223,6 +337,39 @@ func listCandidatesForMCP(ctx context.Context, minCount int) ([]contract.Mistake
 		candidates = []contract.Mistake{}
 	}
 	return candidates, nil
+}
+
+func listInboxForMCP(ctx context.Context, project, reviewStatus string) ([]store.MistakeRecord, error) {
+	db, err := openMCPStore()
+	if err != nil {
+		return nil, fmt.Errorf("open mistake store: %w", err)
+	}
+	defer db.Close()
+	items, err := db.ListInboxMistakes(ctx, project, reviewStatus)
+	if err != nil {
+		return nil, fmt.Errorf("list inbox mistakes: %w", err)
+	}
+	if items == nil {
+		items = []store.MistakeRecord{}
+	}
+	return items, nil
+}
+
+func submitAnalysisForMCP(ctx context.Context, fingerprint, decision, reason, ruleDraft string) (any, error) {
+	db, err := openMCPStore()
+	if err != nil {
+		return nil, fmt.Errorf("open mistake store: %w", err)
+	}
+	defer db.Close()
+	if err := db.SubmitMistakeAnalysis(ctx, fingerprint, decision, reason, ruleDraft); err != nil {
+		return nil, fmt.Errorf("submit analysis: %w", err)
+	}
+	return map[string]any{
+		"submitted":     true,
+		"fingerprint":   strings.TrimSpace(fingerprint),
+		"decision":      strings.ToLower(strings.TrimSpace(decision)),
+		"review_status": "pending_user",
+	}, nil
 }
 
 type dryRunArgs struct {
@@ -320,7 +467,7 @@ func applyRuleForMCP(ctx context.Context, root string, args json.RawMessage) (an
 }
 
 func recordRuleLedger(ctx context.Context, scope, project, engineName, ruleID, payload, rationale string) error {
-	db, err := store.OpenDefault()
+	db, err := openMCPStore()
 	if err != nil {
 		return err
 	}

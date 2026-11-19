@@ -117,6 +117,26 @@ func (g *Git) ChangedFiles(ctx context.Context) ([]string, error) {
 	return existingFiles(g.dir, set), nil
 }
 
+// LastCommitFiles 返回最近一次提交（HEAD）中新增、复制、修改或重命名的文件列表，
+// 仅保留当前工作区仍存在的文件。仓库尚无 HEAD 提交时返回空切片。
+func (g *Git) LastCommitFiles(ctx context.Context) ([]string, error) {
+	if g == nil || !g.hasHEAD(ctx) {
+		return []string{}, nil
+	}
+	out, err := g.output(ctx, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--root", "--diff-filter=ACMR", "HEAD")
+	if err != nil {
+		return nil, err
+	}
+	files := ParseNameOnly(out)
+	set := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		if file != "" {
+			set[file] = struct{}{}
+		}
+	}
+	return existingFiles(g.dir, set), nil
+}
+
 // HotfixFiles 统计最近 days 天内 message 含 fix/bug/hotfix 等关键词的提交
 // 触及的文件次数。days <= 0 时默认 30 天。返回的 key 是相对仓库根目录、
 // 使用正斜杠（filepath.ToSlash）的文件路径，便于 radar 与 Hotspot.File 对齐。

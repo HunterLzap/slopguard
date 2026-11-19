@@ -169,3 +169,192 @@ func TestListRuleLedgerFilters(t *testing.T) {
 		t.Fatalf("engine ledger = %+v, err=%v", ruff, err)
 	}
 }
+
+func TestDashboardEnhancedQueries(t *testing.T) {
+	s := openMemoryStore(t)
+	ctx := context.Background()
+	p1 := "/projects/alpha"
+
+	for i := 0; i < 35; i++ {
+		if err := s.RecordScan(ctx, p1, int64(100+i), i%4, i%2 == 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.RecordMistake(ctx, contract.Mistake{
+		ProjectPath: p1, Fingerprint: "fp-cand", Category: "type", Summary: "avoid any",
+		BadSnippet: "let a: any", GoodSnippet: "let a: unknown", Source: "agent",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordMistake(ctx, contract.Mistake{
+		ProjectPath: p1, Fingerprint: "fp-cand", Category: "type", Summary: "avoid any",
+		Source: "agent",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordMistake(ctx, contract.Mistake{
+		ProjectPath: p1, Fingerprint: "fp-single", Category: "import", Summary: "bad import",
+		Source: "manual",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	overview, err := s.OverviewStats(ctx, p1, "day")
+	if err != nil {
+		t.Fatalf("OverviewStats: %v", err)
+	}
+	if len(overview.RecentRuns) != 30 {
+		t.Fatalf("recent_runs len = %d, want 30", len(overview.RecentRuns))
+	}
+	if overview.Totals.TotalRuns != 35 || overview.Totals.PassedRuns != 18 || overview.Totals.FailedRuns != 17 {
+		t.Fatalf("totals = %+v", overview.Totals)
+	}
+	if overview.Totals.PendingMistakes != 2 || overview.Totals.CandidateMistakes != 1 {
+		t.Fatalf("mistake totals = %+v", overview.Totals)
+	}
+
+	filtered, err := s.QueryMistakes(ctx, MistakeQuery{
+		ProjectPath: p1,
+		Category:    "type",
+		Source:      "agent",
+		Q:           "unknown",
+	})
+	if err != nil {
+		t.Fatalf("QueryMistakes: %v", err)
+	}
+	if len(filtered) != 1 || filtered[0].Fingerprint != "fp-cand" || !filtered[0].IsCandidate || filtered[0].UpdatedAt.IsZero() {
+		t.Fatalf("filtered mistakes = %+v", filtered)
+	}
+
+	projects, err := s.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("ListProjects: %v", err)
+	}
+	if len(projects) != 1 || projects[0].ScanCount != 35 || projects[0].PassedCount != 18 || projects[0].PendingMistakes != 2 {
+		t.Fatalf("projects = %+v", projects)
+	}
+	if projects[0].PassRate <= 50 || projects[0].PassRate >= 52 {
+		t.Fatalf("pass_rate = %v, want ~51.43", projects[0].PassRate)
+	}
+}
+
+func TestMCPEventsAndInboxWorkflow(t *testing.T) {
+	s := openMemoryStore(t)
+	ctx := context.Background()
+	p1 := "/projects/alpha"
+	p2 := "/projects/beta"
+
+	// Record MCP events
+	if err := s.RecordMCPEvent(ctx, MCPEvent{
+		ProjectPath:   p1,
+		ToolName:      "sg_verify",
+		ArgsSummary:   `{"all":true}`,
+		Passed:        false,
+		FindingsCount: 3,
+		DurationMs:    120,
+	}); err != nil {
+		t.Fatalf("RecordMCPEvent 1: %v", err)
+	}
+	if err := s.RecordMCPEvent(ctx, MCPEvent{
+		ProjectPath:   p2,
+		ToolName:      "sg_radar",
+		ArgsSummary:   `{"top":5}`,
+		Passed:        true,
+		FindingsCount: 0,
+		DurationMs:    45,
+	}); err != nil {
+		t.Fatalf("RecordMCPEvent 2: %v", err)
+	}
+	allEvents, err := s.ListMCPEvents(ctx, "", "", 10)
+	if err != nil {
+		t.Fatalf("ListMCPEvents all: %v", err)
+	}
+	if len(allEvents) != 2 {
+		t.Fatalf("ListMCPEvents len = %d, want 2", len(allEvents))
+	}
+	filteredEvents, err := s.ListMCPEvents(ctx, p1, "sg_verify", 10)
+	if err != nil {
+		t.Fatalf("ListMCPEvents filtered: %v", err)
+	}
+	if len(filteredEvents) != 1 || filteredEvents[0].Passed || filteredEvents[0].FindingsCount != 3 {
+		t.Fatalf("filteredEvents = %+v", filteredEvents)
+	}
+
+	// Record mistakes and test inbox lifecycle
+	if _, err := s.RecordMistake(ctx, contract.Mistake{
+		ProjectPath: p1,
+		Fingerprint: "fp-auto-1",
+		Category:    "type",
+		Summary:     "avoid any",
+		Source:      "auto_verify",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordMistake(ctx, contract.Mistake{
+		ProjectPath: p1,
+		Fingerprint: "fp-auto-2",
+		Category:    "import",
+		Summary:     "unused import",
+		Source:      "auto_verify",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	inbox, err := s.ListInboxMistakes(ctx, p1, "")
+	if err != nil {
+		t.Fatalf("ListInboxMistakes: %v", err)
+	}
+	if len(inbox) != 2 || inbox[0].ReviewStatus != "pending_ai" {
+		t.Fatalf("inbox = %+v", inbox)
+	}
+
+	// Submit AI analysis on fp-auto-1
+	if err := s.SubmitMistakeAnalysis(ctx, "fp-auto-1", "recommend", "多次出现 any 类型逃生舱", `"@typescript-eslint/no-explicit-any": "error"`); err != nil {
+		t.Fatalf("SubmitMistakeAnalysis: %v", err)
+	}
+	pendingUser, err := s.ListInboxMistakes(ctx, p1, "pending_user")
+	if err != nil {
+		t.Fatalf("ListInboxMistakes pending_user: %v", err)
+	}
+	if len(pendingUser) != 1 || pendingUser[0].Fingerprint != "fp-auto-1" ||
+		pendingUser[0].AIDecision != "recommend" || pendingUser[0].AIAnalyzedAt.IsZero() {
+		t.Fatalf("pending_user = %+v", pendingUser)
+	}
+
+	// Ignore and restore analyzed mistake -> restores to pending_user
+	if err := s.IgnoreMistake(ctx, "fp-auto-1"); err != nil {
+		t.Fatalf("IgnoreMistake: %v", err)
+	}
+	ignored, err := s.QueryMistakes(ctx, MistakeQuery{ReviewStatus: "ignored"})
+	if err != nil || len(ignored) != 1 || ignored[0].Status != "ignored" {
+		t.Fatalf("ignored = %+v, err=%v", ignored, err)
+	}
+	if err := s.RestoreMistake(ctx, "fp-auto-1"); err != nil {
+		t.Fatalf("RestoreMistake analyzed: %v", err)
+	}
+	restored, err := s.QueryMistakes(ctx, MistakeQuery{ProjectPath: p1, ReviewStatus: "pending_user"})
+	if err != nil || len(restored) != 1 || restored[0].Status != "pending" {
+		t.Fatalf("restored analyzed = %+v, err=%v", restored, err)
+	}
+
+	// Ignore and restore unanalyzed mistake -> restores to pending_ai
+	if err := s.IgnoreMistake(ctx, "fp-auto-2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RestoreMistake(ctx, "fp-auto-2"); err != nil {
+		t.Fatal(err)
+	}
+	restoredAI, err := s.QueryMistakes(ctx, MistakeQuery{ProjectPath: p1, ReviewStatus: "pending_ai"})
+	if err != nil || len(restoredAI) != 1 || restoredAI[0].Fingerprint != "fp-auto-2" {
+		t.Fatalf("restored unanalyzed = %+v, err=%v", restoredAI, err)
+	}
+
+	// Approve mistake -> status='promoted', review_status='approved'
+	if err := s.ApproveMistake(ctx, "fp-auto-1"); err != nil {
+		t.Fatalf("ApproveMistake: %v", err)
+	}
+	approved, err := s.QueryMistakes(ctx, MistakeQuery{ReviewStatus: "approved"})
+	if err != nil || len(approved) != 1 || approved[0].Status != "promoted" {
+		t.Fatalf("approved = %+v, err=%v", approved, err)
+	}
+}

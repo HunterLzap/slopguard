@@ -160,7 +160,7 @@ func (s *Store) ListRules(ctx context.Context, engine string) ([]Rule, error) {
 	return rules, nil
 }
 
-// UpdateMistakeStatus 按 fingerprint 更新错题状态（pending -> promoted / ignored）。
+// UpdateMistakeStatus 按 fingerprint 更新错题状态（pending -> promoted / ignored），并同步 review_status。
 func (s *Store) UpdateMistakeStatus(ctx context.Context, fingerprint, status string) error {
 	if s == nil || s.db == nil {
 		return errors.New("store: not opened")
@@ -173,14 +173,20 @@ func (s *Store) UpdateMistakeStatus(ctx context.Context, fingerprint, status str
 		return errors.New("store: fingerprint is required")
 	}
 	status = strings.ToLower(strings.TrimSpace(status))
+	var updateSQL string
 	switch status {
-	case "pending", "promoted", "ignored":
+	case "promoted":
+		updateSQL = `UPDATE mistakes SET status = 'promoted', review_status = 'approved' WHERE fingerprint = ?`
+	case "ignored":
+		updateSQL = `UPDATE mistakes SET status = 'ignored', review_status = 'ignored' WHERE fingerprint = ?`
+	case "pending":
+		updateSQL = `UPDATE mistakes SET status = 'pending', review_status = CASE WHEN ai_decision != '' OR ai_analyzed_at IS NOT NULL THEN 'pending_user' ELSE 'pending_ai' END WHERE fingerprint = ?`
 	default:
 		return fmt.Errorf("%w: %q", ErrInvalidStatus, status)
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	result, err := s.db.ExecContext(ctx, `UPDATE mistakes SET status = ? WHERE fingerprint = ?`, status, fingerprint)
+	result, err := s.db.ExecContext(ctx, updateSQL, fingerprint)
 	if err != nil {
 		return fmt.Errorf("store: update mistake status: %w", err)
 	}
@@ -190,6 +196,16 @@ func (s *Store) UpdateMistakeStatus(ctx context.Context, fingerprint, status str
 		return ErrMistakeNotFound
 	}
 	return nil
+}
+
+// IgnoreMistake 忽略指定错题，同步将 status 与 review_status 置为 ignored。
+func (s *Store) IgnoreMistake(ctx context.Context, fingerprint string) error {
+	return s.UpdateMistakeStatus(ctx, fingerprint, "ignored")
+}
+
+// RestoreMistake 恢复指定错题为 pending（若已有 AI 分析则 review_status 为 pending_user，否则为 pending_ai）。
+func (s *Store) RestoreMistake(ctx context.Context, fingerprint string) error {
+	return s.UpdateMistakeStatus(ctx, fingerprint, "pending")
 }
 
 func normalizeRule(rule Rule) Rule {

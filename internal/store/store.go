@@ -20,7 +20,7 @@ import (
 
 const (
 	driverName     = "sqlite"
-	schemaVersion  = 2
+	schemaVersion  = 3
 	defaultDirName = ".slopguard"
 	defaultDBName  = "slopguard.db"
 )
@@ -123,9 +123,17 @@ func (s *Store) configure() error {
 	return nil
 }
 
+type columnMigration struct {
+	table      string
+	column     string
+	definition string
+}
+
 type migration struct {
-	version    int
-	statements []string
+	version       int
+	preStatements []string
+	columns       []columnMigration
+	statements    []string
 }
 
 var migrations = []migration{
@@ -182,6 +190,49 @@ var migrations = []migration{
 			`CREATE INDEX IF NOT EXISTS idx_rules_status ON rules(status)`,
 		},
 	},
+	{
+		version: 3,
+		preStatements: []string{
+			`CREATE TABLE IF NOT EXISTS mistakes (
+				id            TEXT PRIMARY KEY,
+				project_path  TEXT NOT NULL,
+				fingerprint   TEXT NOT NULL,
+				category      TEXT NOT NULL,
+				summary       TEXT NOT NULL,
+				bad_snippet   TEXT NOT NULL DEFAULT '',
+				good_snippet  TEXT NOT NULL DEFAULT '',
+				source        TEXT NOT NULL,
+				status        TEXT NOT NULL DEFAULT 'pending',
+				count         INTEGER NOT NULL DEFAULT 1,
+				created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+			)`,
+		},
+		columns: []columnMigration{
+			{table: "mistakes", column: "ai_decision", definition: "TEXT NOT NULL DEFAULT ''"},
+			{table: "mistakes", column: "ai_reason", definition: "TEXT NOT NULL DEFAULT ''"},
+			{table: "mistakes", column: "ai_rule_draft", definition: "TEXT NOT NULL DEFAULT ''"},
+			{table: "mistakes", column: "ai_analyzed_at", definition: "DATETIME"},
+			{table: "mistakes", column: "review_status", definition: "TEXT NOT NULL DEFAULT 'pending_ai'"},
+		},
+		statements: []string{
+			`CREATE TABLE IF NOT EXISTS mcp_events (
+				id             TEXT PRIMARY KEY,
+				project_path   TEXT NOT NULL,
+				tool_name      TEXT NOT NULL,
+				args_summary   TEXT NOT NULL DEFAULT '',
+				passed         INTEGER NOT NULL DEFAULT 1,
+				findings_count INTEGER NOT NULL DEFAULT 0,
+				duration_ms    INTEGER NOT NULL DEFAULT 0,
+				error_text     TEXT NOT NULL DEFAULT '',
+				created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_mcp_events_project_created ON mcp_events(project_path, created_at DESC)`,
+			`CREATE INDEX IF NOT EXISTS idx_mcp_events_tool_created ON mcp_events(tool_name, created_at DESC)`,
+			`CREATE INDEX IF NOT EXISTS idx_mistakes_review_status ON mistakes(review_status)`,
+			`UPDATE mistakes SET review_status = 'approved' WHERE status = 'promoted' AND review_status = 'pending_ai'`,
+			`UPDATE mistakes SET review_status = 'ignored' WHERE status = 'ignored' AND review_status = 'pending_ai'`,
+		},
+	},
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -206,6 +257,18 @@ func (s *Store) migrate(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("store: begin migration %d: %w", m.version, err)
 		}
+		for _, statement := range m.preStatements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("store: apply migration %d: %w", m.version, err)
+			}
+		}
+		for _, col := range m.columns {
+			if err := ensureColumn(ctx, tx, col.table, col.column, col.definition); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("store: apply migration %d column %s.%s: %w", m.version, col.table, col.column, err)
+			}
+		}
 		for _, statement := range m.statements {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
 				_ = tx.Rollback()
@@ -223,6 +286,35 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func ensureColumn(ctx context.Context, tx *sql.Tx, table, column, definition string) error {
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			colType   string
+			notNull   int
+			dfltValue sql.NullString
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			return err
+		}
+		if strings.EqualFold(name, column) {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition))
+	return err
 }
 
 // RecordMistake 记录一条错题；同一 fingerprint 重复出现时累加 count。

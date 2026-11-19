@@ -61,6 +61,12 @@ type baselineProvider interface {
 	LoadBaselineState(path string) (baselineState, error)
 }
 
+// lastCommitProvider is an optional extension for resolving files touched by
+// HEAD (used by post-commit hooks and background auto-guard).
+type lastCommitProvider interface {
+	LastCommitFiles(ctx context.Context, root string) ([]string, error)
+}
+
 // signalContextProvider is an optional engine capability for graceful
 // Ctrl+C/SIGTERM cancellation.
 type signalContextProvider interface {
@@ -160,6 +166,12 @@ type uiOptions struct {
 // uiProvider runs the optional Playwright UI smoke validation.
 type uiProvider interface {
 	RunUISmoke(ctx context.Context, opts uiOptions) (contract.UISmokeResult, error)
+}
+
+// mistakeRecorder is an optional extension of scanRecorder for auto-capturing
+// recurring verify failures into the mistakes inbox.
+type mistakeRecorder interface {
+	RecordMistake(ctx context.Context, m contract.Mistake) (int, error)
 }
 
 type dependencies struct {

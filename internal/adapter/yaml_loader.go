@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/HunterLzap/slopguard/internal/contract"
@@ -117,7 +118,7 @@ func LoadYAML(data []byte, source string) ([]contract.Adapter, error) {
 func LoadYAMLDir(dir string) ([]contract.Adapter, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("adapter: read YAML directory %s: %w", dir, err)

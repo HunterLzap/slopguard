@@ -3,7 +3,12 @@ package cli
 import (
 	"context"
 	"flag"
+	"fmt"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 
 	"github.com/HunterLzap/slopguard/internal/contract"
 )
@@ -15,6 +20,11 @@ type dashboardOptions struct {
 
 // runDashboard is assigned to the production implementation in wire.go.
 var runDashboard func(ctx context.Context, runner contract.Runner, opts dashboardOptions, stdout io.Writer) error
+
+var (
+	checkDashboardRunning = isLocalDashboardResponding
+	openDashboardWindow   = defaultOpenDashboardWindow
+)
 
 func runUI(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("ui", flag.ContinueOnError)
@@ -31,6 +41,18 @@ func runUI(args []string, stdout, stderr io.Writer) int {
 	if *port < 1 || *port > 65535 {
 		return commandError(stderr, "--port must be between 1 and 65535")
 	}
+
+	if checkDashboardRunning != nil && checkDashboardRunning(*port) {
+		url := fmt.Sprintf("http://127.0.0.1:%d", *port)
+		if !*noOpen && openDashboardWindow != nil {
+			if err := openDashboardWindow(url); err != nil {
+				fmt.Fprintf(stderr, "slopguard: warning: open dashboard window: %v\n", err)
+			}
+		}
+		fmt.Fprintf(stdout, "SlopGuard dashboard already running at %s\n", url)
+		return ExitOK
+	}
+
 	deps, err := newDependencies()
 	if err != nil {
 		return commandError(stderr, "prepare dashboard: %v", err)
@@ -44,4 +66,51 @@ func runUI(args []string, stdout, stderr io.Writer) int {
 		return commandError(stderr, "dashboard: %v", err)
 	}
 	return ExitOK
+}
+
+func defaultOpenDashboardWindow(targetURL string) error {
+	name, args := standaloneWindowCommand(runtime.GOOS, targetURL)
+	return exec.Command(name, args...).Start()
+}
+
+func standaloneWindowCommand(goos, targetURL string) (string, []string) {
+	appArgs := []string{"--app=" + targetURL, "--window-size=1180,780"}
+	if goos == "darwin" {
+		appRelPaths := []string{
+			"Google Chrome.app/Contents/MacOS/Google Chrome",
+			"Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+			"Brave Browser.app/Contents/MacOS/Brave Browser",
+			"Arc.app/Contents/MacOS/Arc",
+			"Chromium.app/Contents/MacOS/Chromium",
+		}
+		var candidates []string
+		for _, rel := range appRelPaths {
+			candidates = append(candidates, filepath.Join("/Applications", rel))
+		}
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			for _, rel := range appRelPaths {
+				candidates = append(candidates, filepath.Join(home, "Applications", rel))
+			}
+		}
+		for _, c := range candidates {
+			if info, err := os.Stat(c); err == nil && !info.IsDir() {
+				return c, appArgs
+			}
+		}
+		return "open", []string{targetURL}
+	}
+	if goos == "windows" {
+		for _, bin := range []string{"chrome.exe", "msedge.exe", "brave.exe", "chromium.exe"} {
+			if p, err := exec.LookPath(bin); err == nil && p != "" {
+				return p, appArgs
+			}
+		}
+		return "rundll32", []string{"url.dll,FileProtocolHandler", targetURL}
+	}
+	for _, bin := range []string{"google-chrome", "chromium", "chromium-browser", "microsoft-edge", "brave-browser"} {
+		if p, err := exec.LookPath(bin); err == nil && p != "" {
+			return p, appArgs
+		}
+	}
+	return "xdg-open", []string{targetURL}
 }

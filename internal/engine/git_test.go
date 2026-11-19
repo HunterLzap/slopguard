@@ -303,3 +303,36 @@ func TestGitHotfixFilesNoHEAD(t *testing.T) {
 		t.Fatalf("counts = %v, want empty", counts)
 	}
 }
+
+func TestGitLastCommitFiles(t *testing.T) {
+	dir := t.TempDir()
+	keep := filepath.Join(dir, "src", "keep.ts")
+	if err := os.MkdirAll(filepath.Dir(keep), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keep, []byte("export const a = 1;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runner := &stubRunner{runFn: func(spec contract.RunSpec) contract.RunResult {
+		joined := strings.Join(spec.Args, " ")
+		switch {
+		case strings.Contains(joined, "rev-parse"):
+			return contract.RunResult{ExitCode: 0, Stdout: "true\n"}
+		case strings.Contains(joined, "diff-tree"):
+			return contract.RunResult{ExitCode: 0, Stdout: "src/keep.ts\x00src/deleted.ts\x00"}
+		default:
+			return contract.RunResult{ExitCode: 0}
+		}
+	}}
+	files, err := NewGit(runner, dir).LastCommitFiles(context.Background())
+	if err != nil {
+		t.Fatalf("LastCommitFiles error: %v", err)
+	}
+	if len(files) != 1 || files[0] != filepath.Join("src", "keep.ts") {
+		t.Fatalf("files = %v, want [src/keep.ts]", files)
+	}
+	calls := runner.Calls()
+	if len(calls) < 2 || !strings.Contains(strings.Join(calls[1].Args, " "), "diff-tree") {
+		t.Fatalf("git diff-tree args = %#v", calls)
+	}
+}

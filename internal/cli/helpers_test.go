@@ -12,10 +12,12 @@ import (
 
 // fakeEngine implements engineClient without touching real processes.
 type fakeEngine struct {
-	changedFiles   []string
-	changedErr     error
-	listFiles      []string
-	listErr        error
+	changedFiles    []string
+	changedErr      error
+	lastCommitFiles []string
+	lastCommitErr   error
+	listFiles       []string
+	listErr         error
 	runChecksFn    func(ctx context.Context, root string, jobs int, tasks []checkTask) ([]checkOutcome, error)
 	lastJobs       int
 	lastTasks      []checkTask
@@ -31,6 +33,10 @@ type fakeEngine struct {
 
 func (f *fakeEngine) ChangedFiles(context.Context, string) ([]string, error) {
 	return f.changedFiles, f.changedErr
+}
+
+func (f *fakeEngine) LastCommitFiles(context.Context, string) ([]string, error) {
+	return f.lastCommitFiles, f.lastCommitErr
 }
 
 func (f *fakeEngine) ListFiles(string, []string) ([]string, error) {

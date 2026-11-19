@@ -450,3 +450,86 @@ func TestVerifySkippedDetails(t *testing.T) {
 		t.Fatalf("skipped details = %+v", result.SkippedDetails)
 	}
 }
+
+type fakeMistakeRecorder struct {
+	fakeRecorder
+	mistakes []contract.Mistake
+}
+
+func (f *fakeMistakeRecorder) RecordMistake(_ context.Context, m contract.Mistake) (int, error) {
+	f.mistakes = append(f.mistakes, m)
+	return len(f.mistakes), nil
+}
+
+func TestVerifyAutoCapturesUniqueMistakes(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "src", "a.ts"), "const x: any = 1\n")
+	eng := &fakeEngine{
+		listFiles: []string{"src/a.ts"},
+		runChecksFn: func(_ context.Context, _ string, _ int, tasks []checkTask) ([]checkOutcome, error) {
+			return []checkOutcome{
+				{Task: tasks[0], Result: contract.RunResult{ExitCode: 1, Stdout: "Unexpected any"}},
+				{Task: tasks[0], Result: contract.RunResult{ExitCode: 1, Stdout: "Unexpected any"}},
+				{Task: checkTask{AdapterName: "fake-js", Check: contract.Check{ID: "tsc", Cmd: []string{"tsc"}}}, Result: contract.RunResult{ExitCode: 1, Stdout: "Type error"}},
+			}, nil
+		},
+	}
+	adp := &fakeAdapters{
+		detected: []contract.Adapter{verifyAdapter()},
+		plan:     checkPlan{Runnable: []contract.Check{{ID: "eslint", Cmd: []string{"eslint"}}}},
+	}
+	rec := &fakeMistakeRecorder{}
+	withDependencies(t, dependencies{
+		engine:   eng,
+		adapters: adp,
+		recorder: rec,
+	})
+	var stdout, stderr bytes.Buffer
+	code := runVerifyWith(verifyOptions{root: root, all: true, record: true}, &stdout, &stderr)
+	if code != ExitFindings {
+		t.Fatalf("code = %d, want %d; stderr = %s", code, ExitFindings, stderr.String())
+	}
+	if len(rec.mistakes) != 2 {
+		t.Fatalf("captured mistakes = %d, want 2 (deduplicated): %+v", len(rec.mistakes), rec.mistakes)
+	}
+	if rec.mistakes[0].Source != "auto_verify" || rec.mistakes[0].Status != "pending" {
+		t.Fatalf("mistake[0] = %+v", rec.mistakes[0])
+	}
+}
+
+func TestVerifyLastCommitAndCustomSource(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "src", "committed.ts"), "const x: any = 1\n")
+	eng := &fakeEngine{
+		lastCommitFiles: []string{"src/committed.ts"},
+		listFiles:       []string{"src/committed.ts"},
+		runChecksFn: func(_ context.Context, _ string, _ int, tasks []checkTask) ([]checkOutcome, error) {
+			return []checkOutcome{
+				{Task: tasks[0], Result: contract.RunResult{ExitCode: 1, Stdout: "Unexpected any"}},
+			}, nil
+		},
+	}
+	adp := &fakeAdapters{
+		detected: []contract.Adapter{verifyAdapter()},
+		plan:     checkPlan{Runnable: []contract.Check{{ID: "eslint", Cmd: []string{"eslint"}}}},
+	}
+	rec := &fakeMistakeRecorder{}
+	withDependencies(t, dependencies{
+		engine:   eng,
+		adapters: adp,
+		recorder: rec,
+	})
+	var stdout, stderr bytes.Buffer
+	code := runVerifyWith(verifyOptions{
+		root:          root,
+		lastCommit:    true,
+		record:        true,
+		captureSource: "git_hook",
+	}, &stdout, &stderr)
+	if code != ExitFindings {
+		t.Fatalf("code = %d, want %d; stderr = %s", code, ExitFindings, stderr.String())
+	}
+	if len(rec.mistakes) != 1 || rec.mistakes[0].Source != "git_hook" {
+		t.Fatalf("mistakes = %+v, want source=git_hook", rec.mistakes)
+	}
+}

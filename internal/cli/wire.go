@@ -58,6 +58,14 @@ func (p productionEngine) ChangedFiles(ctx context.Context, root string) ([]stri
 	return git.ChangedFiles(ctx)
 }
 
+func (p productionEngine) LastCommitFiles(ctx context.Context, root string) ([]string, error) {
+	git := engine.NewGit(p.runner, root)
+	if !git.IsRepository(ctx) {
+		return nil, fmt.Errorf("not a git repository; use --all to scan every file")
+	}
+	return git.LastCommitFiles(ctx)
+}
+
 func (p productionEngine) ListFiles(root string, extensions []string) ([]string, error) {
 	return engine.ListFiles(root, extensions)
 }
@@ -316,4 +324,15 @@ func (productionRecorder) RecordScan(ctx context.Context, projectPath string, du
 	recordCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	return db.RecordScan(recordCtx, projectPath, durationMs, escapes, passed)
+}
+
+func (productionRecorder) RecordMistake(ctx context.Context, m contract.Mistake) (int, error) {
+	db, err := store.OpenDefault()
+	if err != nil {
+		return 0, err
+	}
+	defer db.Close()
+	recordCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	return db.RecordMistake(recordCtx, m)
 }

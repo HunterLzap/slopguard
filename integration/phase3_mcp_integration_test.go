@@ -22,7 +22,7 @@ exit /b 1
 `
 
 const mcpEslintUnix = `#!/bin/sh
-echo '[{"filePath":"src/app.ts","messages":[{"ruleId":"no-console","severity":2,"message":"Unexpected console statement","line":1,"column":1}]}'
+echo '[{"filePath":"src/app.ts","messages":[{"ruleId":"no-console","severity":2,"message":"Unexpected console statement","line":1,"column":1}]}]'
 exit 1
 `
 
@@ -212,7 +212,10 @@ func TestPhase3MCPStdioEndToEnd(t *testing.T) {
 			t.Fatalf("tool %s missing inputSchema", name)
 		}
 	}
-	wantTools := []string{"sg_verify", "sg_radar", "sg_record_mistake", "sg_list_candidates", "sg_dry_run_rule", "sg_apply_rule"}
+	wantTools := []string{
+		"sg_verify", "sg_radar", "sg_record_mistake", "sg_list_candidates",
+		"sg_list_inbox", "sg_submit_analysis", "sg_dry_run_rule", "sg_apply_rule",
+	}
 	if len(names) != len(wantTools) {
 		t.Fatalf("tools = %v, want %v", names, wantTools)
 	}

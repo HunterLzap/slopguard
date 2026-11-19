@@ -324,7 +324,28 @@ func recordBackupInstalledHash(backupsDir, kind, id, targetPath string, installe
 // 避免以后卸载时把两次安装之间用户新增的配置回滚掉。
 func refreshBackupBaselineForReinstall(target backupTarget, rec configBackupRecord) (configBackupRecord, bool, error) {
 	if strings.TrimSpace(rec.InstalledSHA256) == "" || len(rec.InstalledBytes) == 0 {
-		return rec, false, nil
+		upgraded, migrateErr := migrateLegacyBackup(target, rec)
+		if migrateErr != nil {
+			return rec, false, migrateErr
+		}
+		rec = upgraded
+	}
+	if strings.TrimSpace(rec.InstalledSHA256) == "" || len(rec.InstalledBytes) == 0 {
+		// 迁移后仍无安装快照：只有能证明当前内容就是原始基线时才允许重复接入。
+		current, err := readTargetSnapshot(target.Path)
+		if err != nil {
+			return rec, false, err
+		}
+		if !current.Existed {
+			if !rec.Existed {
+				return rec, false, nil
+			}
+			return rec, false, ErrLegacyBackupNeedsReview
+		}
+		if rec.OriginalSHA256 != "" && fileSHA256Hex(current.Data) == rec.OriginalSHA256 {
+			return rec, false, nil
+		}
+		return rec, false, ErrLegacyBackupNeedsReview
 	}
 	current, err := readTargetSnapshot(target.Path)
 	if err != nil {

@@ -500,13 +500,13 @@
           <div class="card inbox-card">
             <div class="inbox-head-row">
               <div class="seg-tabs" id="mistakes-review-tabs" role="tablist" aria-label="错题与规则视图">
-                <button class="seg-tab active" data-review-status="" type="button">
-                  <span>全部</span>
-                  <span class="pill-count" id="count-all-mistakes">0</span>
-                </button>
-                <button class="seg-tab" data-review-status="pending" type="button" data-tip="尚未转为规则或忽略的错题；可点右侧「一键分析」快速分类筛选">
+                <button class="seg-tab active" data-review-status="pending" type="button" data-tip="尚未转为规则或忽略的错题；优先展示待处理，可点右侧「一键分析」快速分类筛选">
                   <span>待处理</span>
                   <span class="pill-count" id="count-pending">0</span>
+                </button>
+                <button class="seg-tab" data-review-status="" type="button">
+                  <span>全部</span>
+                  <span class="pill-count" id="count-all-mistakes">0</span>
                 </button>
                 <button class="seg-tab" data-review-status="rules_view" type="button" data-tip="在错题中点击「转为规则」后会永久记录于此，后续守护与体检自动拦截">
                   <span>已入库规则</span>

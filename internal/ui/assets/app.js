@@ -8,7 +8,7 @@
     theme: localStorage.getItem("slopguard.theme") || "system",
     granularity: "day",
     radarTop: "10",
-    reviewStatus: "",
+    reviewStatus: "pending",
     overview: null,
     mistakes: [],
     events: [],
@@ -21,6 +21,7 @@
     agentsData: null,
     diffPreview: null,
     userPickedReviewTab: false,
+    recBannerDismissed: false,
     onboardingDismissed: localStorage.getItem("slopguard.onboardingDismissed") === "1",
   };
 
@@ -725,16 +726,18 @@
     }
 
     const banner = $("session-scan-banner");
-    if (banner && (recApprove > 0 || recSkip > 0)) {
-      banner.hidden = false;
+    if (banner && !state.recBannerDismissed && (recApprove > 0 || recSkip > 0)) {
       const parts = [];
       if (recApprove > 0) parts.push(`建议入库 <strong>${recApprove}</strong> 条`);
       if (recSkip > 0) parts.push(`建议忽略 <strong>${recSkip}</strong> 条`);
       const actionParts = [];
       if (recApprove > 0) actionParts.push(`${recApprove} 转规则`);
       if (recSkip > 0) actionParts.push(`${recSkip} 忽略`);
-      banner.innerHTML = `<span class="banner-text"><strong>一键分析已就绪：</strong>共 ${recApprove + recSkip} 条待处理（${parts.join(" · ")}）。</span>` +
-        `<button class="btn btn-primary btn-sm js-apply-ai-rec" type="button">一键采纳建议（${actionParts.join(" · ")}）</button>`;
+      showInboxBanner(
+        `<strong>一键分析已就绪：</strong>共 ${recApprove + recSkip} 条待处理（${parts.join(" · ")}）。`,
+        `<button class="btn btn-primary btn-sm js-apply-ai-rec" type="button">一键采纳建议（${actionParts.join(" · ")}）</button>`,
+        true
+      );
       const applyBtn = banner.querySelector(".js-apply-ai-rec");
       if (applyBtn) {
         applyBtn.addEventListener("click", () => applyAIRecommendations(applyBtn));
@@ -753,6 +756,21 @@
     populateSelectOptions($("mistakes-filter-source"), mistakes.map((m) => m.source), $("mistakes-filter-source").value, formatSourceLabel, "全部来源");
 
     applyMistakeFilters();
+  }
+
+  function showInboxBanner(textHTML, actionHTML = "", isRecPrompt = false) {
+    const banner = $("session-scan-banner");
+    if (!banner) return;
+    banner.hidden = false;
+    banner.innerHTML = `<span class="banner-text">${textHTML}</span>` +
+      `<div class="card-header-actions">${actionHTML}<button class="icon-btn js-close-banner" type="button" aria-label="关闭提示">✕</button></div>`;
+    const closeBtn = banner.querySelector(".js-close-banner");
+    if (closeBtn) {
+      closeBtn.addEventListener("click", () => {
+        banner.hidden = true;
+        if (isRecPrompt) state.recBannerDismissed = true;
+      });
+    }
   }
 
   function applyMistakeFilters() {
@@ -777,11 +795,19 @@
       return true;
     });
 
+    if (reviewF === "") {
+      const rank = { pending_user: 0, pending_ai: 1, approved: 2, ignored: 3 };
+      filtered.sort((a, b) => (rank[normalizeReviewStatus(a)] ?? 9) - (rank[normalizeReviewStatus(b)] ?? 9));
+    }
+
     $("mistakes-summary").textContent = `共 ${filtered.length} 条`;
     const list = $("mistakes-list");
     const empty = $("mistakes-empty");
     list.innerHTML = "";
     if (!filtered.length) {
+      empty.textContent = reviewF === "pending"
+        ? "待处理已清零 · 所有捕获问题均已处理，可在「已入库规则」或「全部」中查看"
+        : "当前分类暂无错题 · 点击右上「立即体检」或「嗅探会话」可自动捕获";
       empty.hidden = false;
       return;
     }
@@ -1859,26 +1885,20 @@
 
   async function analyzeAllMistakes() {
     const btn = $("btn-analyze-all");
-    const banner = $("session-scan-banner");
     if (!btn) return;
     btn.disabled = true;
     btn.textContent = "分析中…";
+    state.recBannerDismissed = false;
     try {
       const res = await api("/api/mistakes/analyze-all", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ project: state.project || "" }),
       });
-      if (banner) {
-        banner.hidden = false;
-        banner.innerHTML = `<strong>一键分析完成：</strong>共评估 <strong>${res.analyzed || 0}</strong> 条（建议入库 <strong>${res.recommended || 0}</strong> 条 · 建议忽略 <strong>${res.skipped || 0}</strong> 条）。`;
-      }
+      showInboxBanner(`<strong>一键分析完成：</strong>共评估 <strong>${res.analyzed || 0}</strong> 条（建议入库 <strong>${res.recommended || 0}</strong> 条 · 建议忽略 <strong>${res.skipped || 0}</strong> 条）。`);
       await refresh();
     } catch (error) {
-      if (banner) {
-        banner.hidden = false;
-        banner.textContent = `分析失败：${error.message}`;
-      }
+      showInboxBanner(`分析失败：${escapeHTML(error.message)}`);
     } finally {
       btn.disabled = false;
     }
@@ -1897,16 +1917,10 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ project: state.project || "" }),
       });
-      if (banner) {
-        banner.hidden = false;
-        banner.innerHTML = `<span class="banner-text"><strong>已一键采纳建议：</strong><strong>${res.applied_rules || 0}</strong> 条已转为生效规则，<strong>${res.ignored || 0}</strong> 条已移入已忽略。</span>`;
-      }
+      showInboxBanner(`<strong>已一键采纳建议：</strong><strong>${res.applied_rules || 0}</strong> 条已转为生效规则，<strong>${res.ignored || 0}</strong> 条已移入已忽略。`);
       await refresh();
     } catch (error) {
-      if (banner) {
-        banner.hidden = false;
-        banner.innerHTML = `<span class="banner-text">采纳失败：${escapeHTML(error.message)}</span>`;
-      }
+      showInboxBanner(`采纳失败：${escapeHTML(error.message)}`);
     } finally {
       if (btn) btn.disabled = false;
     }
@@ -1914,10 +1928,10 @@
 
   async function scanLocalSessions() {
     const btn = $("btn-scan-sessions");
-    const banner = $("session-scan-banner");
     if (!btn) return;
     btn.disabled = true;
     btn.textContent = "嗅探中…";
+    state.recBannerDismissed = false;
     try {
       const res = await api("/api/sessions/scan", {
         method: "POST",
@@ -1925,18 +1939,14 @@
         body: JSON.stringify({ project: state.project || "", days: 14 }),
       });
       const sc = res.scanned || {};
-      if (banner) {
-        banner.hidden = false;
-        banner.innerHTML = `<span class="banner-text"><strong>嗅探完成（近 ${res.days || 14} 天）：</strong>` +
-          `Git ${sc.git_commits || 0} 提交 · Claude ${sc.claude_files || 0} · Codex ${sc.codex_files || 0} · Antigravity ${sc.antigravity_files || 0}；` +
-          `提取 <strong>${res.found || 0}</strong> 条，入库 <strong>${res.imported || 0}</strong> 条。</span>`;
-      }
+      showInboxBanner(
+        `<strong>嗅探完成（近 ${res.days || 14} 天）：</strong>` +
+        `Git ${sc.git_commits || 0} 提交 · Claude ${sc.claude_files || 0} · Codex ${sc.codex_files || 0} · Antigravity ${sc.antigravity_files || 0}；` +
+        `提取 <strong>${res.found || 0}</strong> 条，入库 <strong>${res.imported || 0}</strong> 条。`
+      );
       await refresh();
     } catch (error) {
-      if (banner) {
-        banner.hidden = false;
-        banner.innerHTML = `<span class="banner-text">嗅探失败：${escapeHTML(error.message)}</span>`;
-      }
+      showInboxBanner(`嗅探失败：${escapeHTML(error.message)}`);
     } finally {
       btn.disabled = false;
       btn.textContent = "嗅探会话";
@@ -2112,7 +2122,7 @@
     $("stat-card-mistakes")?.addEventListener("click", (e) => {
       if (e.target.closest?.(".help-tip")) return;
       switchTab("mistakes");
-      selectReviewTab("", true);
+      selectReviewTab("pending", true);
     });
     $("stat-card-rules")?.addEventListener("click", (e) => {
       if (e.target.closest?.(".help-tip")) return;

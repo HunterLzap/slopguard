@@ -18,17 +18,17 @@ type fakeEngine struct {
 	lastCommitErr   error
 	listFiles       []string
 	listErr         error
-	runChecksFn    func(ctx context.Context, root string, jobs int, tasks []checkTask) ([]checkOutcome, error)
-	lastJobs       int
-	lastTasks      []checkTask
-	baseline       map[string]int
-	baselineErr    error
-	saveErr        error
-	savedMetrics   map[string]int
-	savedPath      string
-	escapes        map[string]int
-	escapesErr     error
-	ratchetResults []contract.Finding
+	runChecksFn     func(ctx context.Context, root string, jobs int, tasks []checkTask) ([]checkOutcome, error)
+	lastJobs        int
+	lastTasks       []checkTask
+	baseline        map[string]int
+	baselineErr     error
+	saveErr         error
+	savedMetrics    map[string]int
+	savedPath       string
+	escapes         map[string]int
+	escapesErr      error
+	ratchetResults  []contract.Finding
 }
 
 func (f *fakeEngine) ChangedFiles(context.Context, string) ([]string, error) {

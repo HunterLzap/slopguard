@@ -8,6 +8,17 @@ private let summaryURLString = "\(dashboardURLString)/api/summary"
 
 private struct IdentityResponse: Decodable, Sendable {
     let service: String
+    let instance_id: String?
+}
+
+private struct UITicketResponse: Decodable, Sendable {
+    let ticket: String
+    let url: String?
+}
+
+private struct UILockRecord: Decodable {
+    let instance_id: String?
+    let port: Int?
 }
 
 private struct StatusSummary: Decodable, Sendable {
@@ -128,8 +139,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         showWindow()
         if let currentURL = webView?.url, currentURL.host == "127.0.0.1" {
             webView?.evaluateJavaScript("window.slopguardSwitchTab && window.slopguardSwitchTab('mistakes')")
-        } else if let url = Self.authenticatedDashboardURL(fragment: "tab=mistakes") {
-            webView?.load(URLRequest(url: url))
+        } else {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let url = await Self.authenticatedDashboardURL(fragment: "tab=mistakes") {
+                    self.webView?.load(URLRequest(url: url))
+                }
+            }
         }
     }
 
@@ -288,10 +304,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     private func loadDashboard() {
-        guard let url = Self.authenticatedDashboardURL(fragment: nil) else { return }
-        webView?.load(URLRequest(url: url))
         Task { @MainActor [weak self] in
-            await self?.refreshStatusSummary()
+            guard let self else { return }
+            if let url = await Self.authenticatedDashboardURL(fragment: nil) {
+                self.webView?.load(URLRequest(url: url))
+            }
+            await self.refreshStatusSummary()
         }
     }
 
@@ -306,10 +324,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    nonisolated private static func authenticatedDashboardURL(fragment: String?) -> URL? {
+    nonisolated private static func readUIInstanceID() -> String? {
+        let lockURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".slopguard", isDirectory: true)
+            .appendingPathComponent("ui.lock", isDirectory: false)
+        guard let data = try? Data(contentsOf: lockURL) else { return nil }
+        return (try? JSONDecoder().decode(UILockRecord.self, from: data))?.instance_id
+    }
+
+    nonisolated private static func requestDashboardTicket() async -> String? {
+        guard let token = readUIToken(),
+              let endpoint = URL(string: "\(dashboardURLString)/api/auth/ticket") else {
+            return nil
+        }
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 1.5
+        request.setValue(token, forHTTPHeaderField: "X-SlopGuard-Token")
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse,
+              http.statusCode == 200,
+              let payload = try? JSONDecoder().decode(UITicketResponse.self, from: data),
+              !payload.ticket.isEmpty else {
+            return nil
+        }
+        if let relative = payload.url,
+           let absolute = URL(string: relative, relativeTo: URL(string: "\(dashboardURLString)/")) {
+            return absolute.absoluteURL.absoluteString
+        }
+        return "\(dashboardURLString)/?ticket=\(payload.ticket)"
+    }
+
+    nonisolated private static func authenticatedDashboardURL(fragment: String?) async -> URL? {
         var components = URLComponents(string: "\(dashboardURLString)/")
-        if let tok = readUIToken() {
-            components?.queryItems = [URLQueryItem(name: "token", value: tok)]
+        if let ticketURL = await requestDashboardTicket() {
+            components = URLComponents(string: ticketURL)
         }
         if let fragment, !fragment.isEmpty {
             components?.fragment = fragment
@@ -451,7 +500,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
                 return false
             }
             let identity = try JSONDecoder().decode(IdentityResponse.self, from: data)
-            return identity.service == "slopguard"
+            guard identity.service == "slopguard" else { return false }
+            // A running service is trusted only when its instance id matches the
+            // local ui.lock record written by the same SlopGuard process.
+            if let expected = readUIInstanceID(), !expected.isEmpty {
+                return identity.instance_id == expected
+            }
+            return true
         } catch {
             return false
         }

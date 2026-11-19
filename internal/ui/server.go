@@ -43,23 +43,33 @@ type Options struct {
 
 // Server exposes the dashboard API, local action handlers, background guard, and embedded single-page app.
 type Server struct {
-	db        *store.Store
-	runner    contract.Runner
-	mux       *http.ServeMux
-	port      int
-	homeDir   string
-	guard     *GuardManager
-	ai        *AIManager
-	authMu    sync.RWMutex
-	authToken string
+	db           *store.Store
+	runner       contract.Runner
+	mux          *http.ServeMux
+	port         int
+	homeDir      string
+	instanceID   string
+	startedAt    time.Time
+	guard        *GuardManager
+	ai           *AIManager
+	authMu       sync.RWMutex
+	authToken    string
+	authTickets  map[string]authTicket
+	authSessions map[string]authSession
+	mutationMu   sync.Mutex
+	previewMu    sync.Mutex
+	previews     map[string]*previewRecord
 }
 
 // NewServer creates a dashboard server backed by the given store and runner.
 func NewServer(db *store.Store, runner contract.Runner) *Server {
 	s := &Server{
-		db:        db,
-		runner:    runner,
-		authToken: generateRandomToken(),
+		db:           db,
+		runner:       runner,
+		authToken:    generateRandomToken(),
+		authTickets:  make(map[string]authTicket),
+		authSessions: make(map[string]authSession),
+		previews:     make(map[string]*previewRecord),
 	}
 	s.guard = newGuardManager(s)
 	s.ai = newAIManager(s)
@@ -67,6 +77,7 @@ func NewServer(db *store.Store, runner contract.Runner) *Server {
 	mux.HandleFunc("/", s.handleIndex)
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(mustSubFS(assets, "assets")))))
 	mux.HandleFunc("/api/identity", s.handleIdentity)
+	mux.HandleFunc("/api/auth/ticket", s.handleAuthTicket)
 	mux.HandleFunc("/api/overview", s.handleOverview)
 	mux.HandleFunc("/api/summary", s.handleSummary)
 	mux.HandleFunc("/api/projects", s.handleProjects)
@@ -121,12 +132,19 @@ func Run(ctx context.Context, db *store.Store, runner contract.Runner, opts Opti
 		return fmt.Errorf("ui: port out of range: %d", opts.Port)
 	}
 	server := NewServer(db, runner)
-	server.port = opts.Port
-	token, err := ensurePersistentAuthToken(server.resolveHomeDir())
-	if err != nil {
-		return fmt.Errorf("ui: initialize session token: %w", err)
+	home := server.resolveHomeDir()
+	if strings.TrimSpace(home) == "" {
+		return errors.New("ui: cannot locate user home directory")
 	}
-	server.SetAuthToken(token)
+	server.homeDir = home
+
+	// Take ownership before touching the persistent token. A failed start must
+	// never rotate the token of an already-running dashboard.
+	lock, err := acquireInstanceLock(home, opts.Port)
+	if err != nil {
+		return err
+	}
+	defer lock.release()
 
 	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", opts.Port))
 	if err != nil {
@@ -134,13 +152,34 @@ func Run(ctx context.Context, db *store.Store, runner contract.Runner, opts Opti
 	}
 	defer listener.Close()
 
+	actualPort := opts.Port
+	if tcpAddr, ok := listener.Addr().(*net.TCPAddr); ok {
+		actualPort = tcpAddr.Port
+	}
+	server.port = actualPort
+	server.instanceID = lock.record.InstanceID
+	server.startedAt = time.Now().UTC()
+	if err := lock.setPort(actualPort); err != nil {
+		return err
+	}
+
+	token, err := loadOrCreateAuthToken(home)
+	if err != nil {
+		return fmt.Errorf("ui: initialize session token: %w", err)
+	}
+	server.SetAuthToken(token)
+
 	address := listener.Addr().String()
 	url := "http://" + address + "/"
 	if stdout != nil {
 		fmt.Fprintf(stdout, "SlopGuard dashboard: %s\n", url)
 	}
 	if !opts.NoOpen {
-		authURL := url + "?token=" + neturl.QueryEscape(token)
+		ticket, _, ticketErr := server.IssueAuthTicket(authTicketTTL)
+		if ticketErr != nil {
+			return fmt.Errorf("ui: issue browser ticket: %w", ticketErr)
+		}
+		authURL := url + "?ticket=" + neturl.QueryEscape(ticket)
 		if err := openBrowser(authURL); err != nil && stdout != nil {
 			fmt.Fprintf(stdout, "slopguard: warning: cannot open browser: %v\n", err)
 		}

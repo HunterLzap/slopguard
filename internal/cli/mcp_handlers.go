@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -20,6 +21,7 @@ import (
 var openMCPStore = store.OpenDefault
 
 func buildMCPTools(root string) []mcp.Tool {
+	scopeRoot := normalizeMCPScopePath(root)
 	tools := []mcp.Tool{
 		{
 			Name:        "sg_verify",
@@ -38,7 +40,7 @@ func buildMCPTools(root string) []mcp.Tool {
 				if err := decodeMCPArgs(args, &a); err != nil {
 					return nil, err
 				}
-				return verifyForMCP(ctx, root, a.All, a.Paths, a.UI)
+				return verifyForMCP(ctx, scopeRoot, a.All, a.Paths, a.UI)
 			},
 		},
 		{
@@ -54,12 +56,12 @@ func buildMCPTools(root string) []mcp.Tool {
 				if err := decodeMCPArgs(args, &a); err != nil {
 					return nil, err
 				}
-				return radarForMCP(ctx, root, a.Top)
+				return radarForMCP(ctx, scopeRoot, a.Top)
 			},
 		},
 		{
 			Name:        "sg_record_mistake",
-			Description: "Record an AI mistake for later rule extraction; repeated fingerprints increment the count.",
+			Description: "Record an AI mistake in the current project for later rule extraction; repeated fingerprints increment the count.",
 			InputSchema: objectSchema(map[string]any{
 				"category":     map[string]any{"type": "string", "description": "import | syntax | type | architecture | ui"},
 				"summary":      map[string]any{"type": "string"},
@@ -76,12 +78,12 @@ func buildMCPTools(root string) []mcp.Tool {
 				if err := decodeMCPArgs(args, &a); err != nil {
 					return nil, err
 				}
-				return recordMistakeForMCP(ctx, root, a.Category, a.Summary, a.BadSnippet, a.GoodSnippet)
+				return recordMistakeForMCP(ctx, scopeRoot, a.Category, a.Summary, a.BadSnippet, a.GoodSnippet)
 			},
 		},
 		{
 			Name:        "sg_list_candidates",
-			Description: "List pending mistake clusters that reached the minimum occurrence count.",
+			Description: "List pending mistake clusters in the current project that reached the minimum occurrence count.",
 			InputSchema: objectSchema(map[string]any{
 				"min_count": map[string]any{"type": "integer", "description": "minimum occurrence count (default 2)"},
 			}),
@@ -92,7 +94,7 @@ func buildMCPTools(root string) []mcp.Tool {
 				if err := decodeMCPArgs(args, &a); err != nil {
 					return nil, err
 				}
-				return listCandidatesForMCP(ctx, a.MinCount)
+				return listCandidatesForMCP(ctx, scopeRoot, a.MinCount)
 			},
 		},
 		{
@@ -107,7 +109,7 @@ func buildMCPTools(root string) []mcp.Tool {
 				"threshold":    map[string]any{"type": "integer"},
 			}, "engine", "rule_payload"),
 			Handler: func(ctx context.Context, args json.RawMessage) (any, error) {
-				return dryRunRuleForMCP(ctx, root, args)
+				return dryRunRuleForMCP(ctx, scopeRoot, args)
 			},
 		},
 		{
@@ -122,7 +124,7 @@ func buildMCPTools(root string) []mcp.Tool {
 				"confirm":      map[string]any{"type": "boolean", "description": "must be true; user confirmation is required"},
 			}, "engine", "rule_payload", "confirm"),
 			Handler: func(ctx context.Context, args json.RawMessage) (any, error) {
-				return applyRuleForMCP(ctx, root, args)
+				return applyRuleForMCP(ctx, scopeRoot, args)
 			},
 		},
 		{
@@ -140,7 +142,7 @@ func buildMCPTools(root string) []mcp.Tool {
 				if err := decodeMCPArgs(args, &a); err != nil {
 					return nil, err
 				}
-				return listInboxForMCP(ctx, root, a.Project, a.ReviewStatus)
+				return listInboxForMCP(ctx, scopeRoot, a.Project, a.ReviewStatus)
 			},
 		},
 		{
@@ -162,11 +164,11 @@ func buildMCPTools(root string) []mcp.Tool {
 				if err := decodeMCPArgs(args, &a); err != nil {
 					return nil, err
 				}
-				return submitAnalysisForMCP(ctx, root, a.Fingerprint, a.Decision, a.Reason, a.RuleDraft)
+				return submitAnalysisForMCP(ctx, scopeRoot, a.Fingerprint, a.Decision, a.Reason, a.RuleDraft)
 			},
 		},
 	}
-	return wrapMCPToolsWithAudit(root, tools)
+	return wrapMCPToolsWithAudit(scopeRoot, tools)
 }
 
 func wrapMCPToolsWithAudit(root string, tools []mcp.Tool) []mcp.Tool {
@@ -285,9 +287,13 @@ type mcpVerifyResponse struct {
 }
 
 func verifyForMCP(ctx context.Context, root string, all bool, paths []string, ui bool) (mcpVerifyResponse, error) {
+	scopeRoot, err := resolveMCPEnforcedRoot(root)
+	if err != nil {
+		return mcpVerifyResponse{}, err
+	}
 	var stdout, stderr bytes.Buffer
 	code := runVerifyWith(verifyOptions{
-		root:        root,
+		root:        scopeRoot,
 		all:         all,
 		json:        true,
 		autoCapture: true,
@@ -307,28 +313,25 @@ func verifyForMCP(ctx context.Context, root string, all bool, paths []string, ui
 	}
 
 	out := mcpVerifyResponse{VerifyResult: result}
-	if db, err := openMCPStore(); err == nil {
-		defer db.Close()
-		qCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		defer cancel()
-		if items, qErr := db.ListInboxMistakes(qCtx, root, "pending_ai"); qErr == nil && len(items) > 0 {
-			out.PendingInboxCount = len(items)
-			limit := len(items)
-			if limit > 5 {
-				limit = 5
-			}
-			out.PendingInbox = make([]mcpInboxBriefItem, 0, limit)
-			for i := 0; i < limit; i++ {
-				out.PendingInbox = append(out.PendingInbox, mcpInboxBriefItem{
-					Fingerprint: items[i].Fingerprint,
-					Category:    items[i].Category,
-					Summary:     items[i].Summary,
-					BadSnippet:  items[i].BadSnippet,
-					Count:       items[i].Count,
-				})
-			}
-			out.NextAction = "There are unanalyzed mistakes in pending_inbox. Please call sg_submit_analysis with a plain-language Chinese reason and recommend/skip decision so the user can review them in the SlopGuard dashboard."
+	qCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if items, qErr := listInboxForMCP(qCtx, scopeRoot, "", "pending_ai"); qErr == nil && len(items) > 0 {
+		out.PendingInboxCount = len(items)
+		limit := len(items)
+		if limit > 5 {
+			limit = 5
 		}
+		out.PendingInbox = make([]mcpInboxBriefItem, 0, limit)
+		for i := 0; i < limit; i++ {
+			out.PendingInbox = append(out.PendingInbox, mcpInboxBriefItem{
+				Fingerprint: items[i].Fingerprint,
+				Category:    items[i].Category,
+				Summary:     items[i].Summary,
+				BadSnippet:  items[i].BadSnippet,
+				Count:       items[i].Count,
+			})
+		}
+		out.NextAction = "There are unanalyzed mistakes in pending_inbox. Please call sg_submit_analysis with a plain-language Chinese reason and recommend/skip decision so the user can review them in the SlopGuard dashboard."
 	}
 	return out, nil
 }
@@ -344,21 +347,25 @@ func radarForMCP(ctx context.Context, root string, top int) (radarResult, error)
 	return deps.radar.Scan(ctx, root, top)
 }
 
-func recordMistakeForMCP(ctx context.Context, project, category, summary, bad, good string) (any, error) {
+func recordMistakeForMCP(ctx context.Context, root, category, summary, bad, good string) (any, error) {
 	if strings.TrimSpace(summary) == "" {
 		return nil, errors.New("summary is required")
+	}
+	scopeRoot, err := resolveMCPEnforcedRoot(root)
+	if err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(category) == "" {
 		category = "other"
 	}
-	fingerprint := mistakeFingerprint(project, category, summary)
+	fingerprint := mistakeFingerprint(scopeRoot, category, summary)
 	db, err := openMCPStore()
 	if err != nil {
 		return nil, fmt.Errorf("open mistake store: %w", err)
 	}
 	defer db.Close()
 	count, err := db.RecordMistake(ctx, contract.Mistake{
-		ProjectPath: project,
+		ProjectPath: scopeRoot,
 		Fingerprint: fingerprint,
 		Category:    category,
 		Summary:     summary,
@@ -369,16 +376,20 @@ func recordMistakeForMCP(ctx context.Context, project, category, summary, bad, g
 	if err != nil {
 		return nil, fmt.Errorf("record mistake: %w", err)
 	}
-	return map[string]any{"recorded": true, "fingerprint": fingerprint, "count": count}, nil
+	return map[string]any{"recorded": true, "project": scopeRoot, "fingerprint": fingerprint, "count": count}, nil
 }
 
-func listCandidatesForMCP(ctx context.Context, minCount int) ([]contract.Mistake, error) {
+func listCandidatesForMCP(ctx context.Context, root string, minCount int) ([]contract.Mistake, error) {
+	scopeRoot, err := resolveMCPEnforcedRoot(root)
+	if err != nil {
+		return nil, err
+	}
 	db, err := openMCPStore()
 	if err != nil {
 		return nil, fmt.Errorf("open mistake store: %w", err)
 	}
 	defer db.Close()
-	candidates, err := db.ListCandidates(ctx, minCount)
+	candidates, err := db.ListCandidatesScoped(ctx, scopeRoot, minCount)
 	if err != nil {
 		return nil, fmt.Errorf("list candidates: %w", err)
 	}
@@ -403,13 +414,20 @@ func normalizeMCPScopePath(p string) string {
 }
 
 func resolveMCPEnforcedRoot(root string) (string, error) {
-	scopeRoot := strings.TrimSpace(root)
+	raw := strings.TrimSpace(root)
+	if raw == "" {
+		return "", errors.New("mcp workspace root is required for mistake operations")
+	}
+	scopeRoot := normalizeMCPScopePath(raw)
 	if scopeRoot == "" {
-		abs, err := filepath.Abs(".")
-		if err != nil || strings.TrimSpace(abs) == "" {
-			return "", errors.New("mcp workspace root is required for inbox operations")
-		}
-		scopeRoot = abs
+		return "", errors.New("mcp workspace root is required for mistake operations")
+	}
+	info, err := os.Stat(scopeRoot)
+	if err != nil {
+		return "", fmt.Errorf("mcp project root %s: %w", scopeRoot, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("mcp project root %s is not a directory", scopeRoot)
 	}
 	return scopeRoot, nil
 }

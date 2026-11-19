@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -22,6 +23,8 @@ const (
 	uiSessionCookieName = "slopguard_session"
 	uiTokenHeaderName   = "X-SlopGuard-Token"
 	maxRequestBodyBytes = 2 << 20 // 2 MiB
+	authTicketTTL       = 60 * time.Second
+	authSessionTTL      = 12 * time.Hour
 )
 
 func generateRandomToken() string {
@@ -42,9 +45,11 @@ func tokenFilePath(home string) string {
 	return filepath.Join(home, ".slopguard", uiTokenFileName)
 }
 
-// ensurePersistentAuthToken generates a fresh cryptographically random session token
-// and stores it atomically with 0600 permissions inside a 0700 ~/.slopguard directory.
-func ensurePersistentAuthToken(home string) (string, error) {
+// loadOrCreateAuthToken returns the stable local long-term API token. It only
+// creates a new token when the existing file is missing or malformed; normal
+// restarts must not rotate the token out from under an already running
+// dashboard or a cached CLI process.
+func loadOrCreateAuthToken(home string) (string, error) {
 	path := tokenFilePath(home)
 	if path == "" {
 		return "", errors.New("cannot locate home directory for ui-token")
@@ -53,7 +58,24 @@ func ensurePersistentAuthToken(home string) (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("create slopguard state dir: %w", err)
 	}
-	_ = os.Chmod(dir, 0o700)
+	if err := hardenSecretDir(dir); err != nil {
+		return "", fmt.Errorf("protect slopguard state dir: %w", err)
+	}
+
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return "", fmt.Errorf("ui-token is not a regular file: %s", path)
+		}
+		if raw, readErr := os.ReadFile(path); readErr == nil {
+			token := strings.TrimSpace(string(raw))
+			if validLongTermToken(token) {
+				_ = hardenSecretFile(path)
+				return token, nil
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("inspect ui-token: %w", err)
+	}
 
 	token := generateRandomToken()
 	tmpFile, err := os.CreateTemp(dir, uiTokenFileName+".tmp-*")
@@ -62,10 +84,10 @@ func ensurePersistentAuthToken(home string) (string, error) {
 	}
 	tmpPath := tmpFile.Name()
 	cleanup := func() { _ = os.Remove(tmpPath) }
-	if err := tmpFile.Chmod(0o600); err != nil {
+	if err := hardenSecretFile(tmpPath); err != nil {
 		_ = tmpFile.Close()
 		cleanup()
-		return "", fmt.Errorf("chmod ui-token: %w", err)
+		return "", fmt.Errorf("protect temp ui-token: %w", err)
 	}
 	if _, err := tmpFile.WriteString(token + "\n"); err != nil {
 		_ = tmpFile.Close()
@@ -85,11 +107,31 @@ func ensurePersistentAuthToken(home string) (string, error) {
 		cleanup()
 		return "", fmt.Errorf("install ui-token: %w", err)
 	}
-	_ = os.Chmod(path, 0o600)
+	if err := hardenSecretFile(path); err != nil {
+		return "", fmt.Errorf("protect ui-token: %w", err)
+	}
 	return token, nil
 }
 
-// AuthToken returns the active session token required to access the dashboard API.
+// ensurePersistentAuthToken is kept for package-internal compatibility; it now
+// follows the stable-token semantics above.
+func ensurePersistentAuthToken(home string) (string, error) {
+	return loadOrCreateAuthToken(home)
+}
+
+func validLongTermToken(token string) bool {
+	if len(token) != 64 {
+		return false
+	}
+	for _, r := range token {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+// AuthToken returns the active long-term local API token.
 func (s *Server) AuthToken() string {
 	if s == nil {
 		return ""
@@ -99,7 +141,8 @@ func (s *Server) AuthToken() string {
 	return s.authToken
 }
 
-// SetAuthToken updates the active dashboard session token.
+// SetAuthToken updates the active dashboard long-term token and clears any
+// browser tickets/sessions derived from a previous token.
 func (s *Server) SetAuthToken(token string) {
 	if s == nil {
 		return
@@ -107,6 +150,80 @@ func (s *Server) SetAuthToken(token string) {
 	s.authMu.Lock()
 	defer s.authMu.Unlock()
 	s.authToken = strings.TrimSpace(token)
+	s.authTickets = make(map[string]authTicket)
+	s.authSessions = make(map[string]authSession)
+}
+
+type authTicket struct {
+	ExpiresAt time.Time
+}
+
+type authSession struct {
+	ExpiresAt time.Time
+}
+
+// IssueAuthTicket creates a short-lived, one-time browser bootstrap ticket.
+func (s *Server) IssueAuthTicket(ttl time.Duration) (string, time.Time, error) {
+	if s == nil {
+		return "", time.Time{}, errors.New("ui: nil server")
+	}
+	if ttl <= 0 {
+		ttl = authTicketTTL
+	}
+	ticket := generateRandomToken()
+	expires := time.Now().Add(ttl)
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	if s.authTickets == nil {
+		s.authTickets = make(map[string]authTicket)
+	}
+	s.authTickets[ticket] = authTicket{ExpiresAt: expires}
+	return ticket, expires, nil
+}
+
+func (s *Server) consumeAuthTicket(ticket string) bool {
+	if s == nil || strings.TrimSpace(ticket) == "" {
+		return false
+	}
+	now := time.Now()
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	rec, ok := s.authTickets[ticket]
+	if !ok {
+		return false
+	}
+	delete(s.authTickets, ticket)
+	return now.Before(rec.ExpiresAt)
+}
+
+func (s *Server) issueAuthSession() (string, time.Time) {
+	session := generateRandomToken()
+	expires := time.Now().Add(authSessionTTL)
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	if s.authSessions == nil {
+		s.authSessions = make(map[string]authSession)
+	}
+	s.authSessions[session] = authSession{ExpiresAt: expires}
+	return session, expires
+}
+
+func (s *Server) validAuthSession(session string) bool {
+	if s == nil || strings.TrimSpace(session) == "" {
+		return false
+	}
+	now := time.Now()
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	rec, ok := s.authSessions[session]
+	if !ok {
+		return false
+	}
+	if !now.Before(rec.ExpiresAt) {
+		delete(s.authSessions, session)
+		return false
+	}
+	return true
 }
 
 func constantTimeTokenMatch(expected, candidate string) bool {
@@ -198,11 +315,33 @@ func (s *Server) authenticateRequest(r *http.Request) (ok bool, viaHeader bool) 
 		return false, false
 	}
 	if c, err := r.Cookie(uiSessionCookieName); err == nil {
-		if constantTimeTokenMatch(expected, strings.TrimSpace(c.Value)) {
+		if s.validAuthSession(strings.TrimSpace(c.Value)) {
 			return true, false
 		}
 	}
 	return false, false
+}
+
+func (s *Server) handleAuthTicket(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	if !constantTimeTokenMatch(s.AuthToken(), strings.TrimSpace(r.Header.Get(uiTokenHeaderName))) {
+		writeError(w, http.StatusUnauthorized, "未授权访问：缺少有效的本地长期令牌")
+		return
+	}
+	ticket, expires, err := s.IssueAuthTicket(authTicketTTL)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"ticket":     ticket,
+		"expires_at": expires.UTC().Format(time.RFC3339),
+		"url":        "/?ticket=" + neturl.QueryEscape(ticket),
+	})
 }
 
 func (s *Server) handleIdentity(w http.ResponseWriter, r *http.Request) {
@@ -210,10 +349,16 @@ func (s *Server) handleIdentity(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, http.MethodGet)
 		return
 	}
+	startedAt := ""
+	if !s.startedAt.IsZero() {
+		startedAt = s.startedAt.UTC().Format(time.RFC3339)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"service":       "slopguard",
 		"pid":           os.Getpid(),
 		"port":          s.port,
+		"instance_id":   s.instanceID,
+		"started_at":    startedAt,
 		"auth_required": true,
 	})
 }
@@ -260,11 +405,12 @@ func (s *Server) withSecurity(next http.Handler) http.Handler {
 				methodNotAllowed(w, http.MethodGet)
 				return
 			}
-			if qTok := strings.TrimSpace(r.URL.Query().Get("token")); qTok != "" {
-				if constantTimeTokenMatch(s.AuthToken(), qTok) {
+			if ticket := strings.TrimSpace(r.URL.Query().Get("ticket")); ticket != "" {
+				if s.consumeAuthTicket(ticket) {
+					session, _ := s.issueAuthSession()
 					http.SetCookie(w, &http.Cookie{
 						Name:     uiSessionCookieName,
-						Value:    s.AuthToken(),
+						Value:    session,
 						Path:     "/",
 						HttpOnly: true,
 						SameSite: http.SameSiteStrictMode,
@@ -318,7 +464,7 @@ func (s *Server) withSecurity(next http.Handler) http.Handler {
 func writeUnauthorizedHTML(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusUnauthorized)
-	_, _ = w.Write([]byte(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>SlopGuard · 本地鉴权</title></head><body style="font-family:-apple-system,sans-serif;padding:48px;color:#1d1d1f;"><h2>需要本地会话授权</h2><p>请通过 <code>SlopGuard.app</code> 或执行 <code>slopguard ui</code> 打开控制台，以携带本地一次性授权令牌（<code>~/.slopguard/ui-token</code>）。</p></body></html>`))
+	_, _ = w.Write([]byte(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>SlopGuard · 本地鉴权</title></head><body style="font-family:-apple-system,sans-serif;padding:48px;color:#1d1d1f;"><h2>需要本地会话授权</h2><p>请通过 <code>SlopGuard.app</code> 或执行 <code>slopguard ui</code> 打开控制台；浏览器会使用一次性授权 ticket 建立本地会话。</p></body></html>`))
 }
 
 func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, allowEmpty bool) bool {

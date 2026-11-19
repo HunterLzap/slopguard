@@ -595,6 +595,9 @@ func installGitPostCommitHook(backupsDir, project, binaryPath string) (string, e
 	if err := writeFileAtomic(hookPath, []byte(updated), 0o755); err != nil {
 		return "", fmt.Errorf("写入 post-commit 钩子失败: %w", err)
 	}
+	if err := recordBackupInstalled(backupsDir, backupTarget{Kind: "hook", ID: "post-commit", Scope: "project", Path: hookPath}, []byte(updated), 0o755); err != nil {
+		return "", fmt.Errorf("记录 post-commit 钩子快照失败: %w", err)
+	}
 	return hookPath, nil
 }
 
@@ -610,39 +613,40 @@ func uninstallGitPostCommitHook(backupsDir, project string) (string, error) {
 		}
 		return hookPath, err
 	}
-	stripped := stripHookMarkerBlock(string(data))
-	trimmed := strings.TrimSpace(stripped)
-
-	backupPath, rec, hasBackup, checkErr := lookupBackupChecked(backupsDir, "hook", "post-commit", hookPath)
+	target := backupTarget{Kind: "hook", ID: "post-commit", Scope: "project", Path: hookPath}
+	_, rec, hasBackup, checkErr := lookupBackupChecked(backupsDir, "hook", "post-commit", hookPath)
 	if checkErr != nil {
 		return hookPath, checkErr
 	}
 	if hasBackup {
-		if !rec.Existed && (trimmed == "" || trimmed == "#!/bin/sh" || trimmed == "#!/usr/bin/env sh") {
-			_, _, restoreErr := restoreFromBackup(backupsDir, "hook", "post-commit", hookPath)
-			return hookPath, restoreErr
+		plan, planErr := planManagedUninstall(backupsDir, target, rec)
+		if planErr != nil {
+			return hookPath, planErr
 		}
-		if rec.Existed && stripped == string(rec.OriginalBytes) {
-			_, _, restoreErr := restoreFromBackup(backupsDir, "hook", "post-commit", hookPath)
-			return hookPath, restoreErr
+		if plan.Action == uninstallNoop {
+			_ = removeBackupRecord(backupsDir, target)
+			return hookPath, nil
 		}
+		if applyErr := applyManagedUninstall(backupsDir, target, plan); applyErr != nil {
+			return hookPath, applyErr
+		}
+		return hookPath, nil
 	}
 
+	stripped := stripHookMarkerBlock(string(data))
+	trimmed := strings.TrimSpace(stripped)
 	if trimmed == "" || trimmed == "#!/bin/sh" || trimmed == "#!/usr/bin/env sh" {
 		if err := os.Remove(hookPath); err != nil && !os.IsNotExist(err) {
 			return hookPath, err
 		}
-	} else {
-		mode := os.FileMode(0o755)
-		if info, statErr := os.Stat(hookPath); statErr == nil && info.Mode().Perm() != 0 {
-			mode = info.Mode().Perm()
-		}
-		if err := writeFileAtomic(hookPath, []byte(stripped), mode); err != nil {
-			return hookPath, err
-		}
+		return hookPath, nil
 	}
-	if hasBackup {
-		_ = os.Remove(backupPath)
+	mode := os.FileMode(0o755)
+	if info, statErr := os.Stat(hookPath); statErr == nil && info.Mode().Perm() != 0 {
+		mode = info.Mode().Perm()
+	}
+	if err := writeFileAtomic(hookPath, []byte(stripped), mode); err != nil {
+		return hookPath, err
 	}
 	return hookPath, nil
 }

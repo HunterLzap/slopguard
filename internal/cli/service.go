@@ -202,21 +202,54 @@ func buildLaunchAgentPlist(exe string, port int, logPath string) string {
 `, esc(launchAgentLabel), esc(exe), strconv.Itoa(port), esc(logPath), esc(logPath))
 }
 
-func isLocalDashboardResponding(port int) bool {
+type dashboardIdentity struct {
+	Service    string `json:"service"`
+	InstanceID string `json:"instance_id"`
+	PID        int    `json:"pid"`
+	Port       int    `json:"port"`
+}
+
+func readDashboardIdentity(port int) (dashboardIdentity, bool) {
 	client := &http.Client{Timeout: 500 * time.Millisecond}
 	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/identity", port))
 	if err != nil {
-		return false
+		return dashboardIdentity{}, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return false
+		return dashboardIdentity{}, false
 	}
-	var identity struct {
-		Service string `json:"service"`
-	}
+	var identity dashboardIdentity
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&identity); err != nil {
+		return dashboardIdentity{}, false
+	}
+	return identity, identity.Service == "slopguard"
+}
+
+func isLocalDashboardResponding(port int) bool {
+	_, ok := readDashboardIdentity(port)
+	return ok
+}
+
+// isTrustedDashboardResponding accepts a running dashboard only when its
+// /api/identity instance_id matches the user's local ui.lock record. This
+// prevents another local process from impersonating the dashboard on the port.
+func isTrustedDashboardResponding(port int) bool {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
 		return false
 	}
-	return identity.Service == "slopguard"
+	raw, err := os.ReadFile(filepath.Join(home, ".slopguard", "ui.lock"))
+	if err != nil {
+		return false
+	}
+	var lock struct {
+		Port       int    `json:"port"`
+		InstanceID string `json:"instance_id"`
+	}
+	if err := json.Unmarshal(raw, &lock); err != nil || lock.Port != port || strings.TrimSpace(lock.InstanceID) == "" {
+		return false
+	}
+	identity, ok := readDashboardIdentity(port)
+	return ok && identity.InstanceID == lock.InstanceID
 }

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -337,6 +338,9 @@ func TestDashboardEmbeddedAssets(t *testing.T) {
 func TestDashboardRunLoopbackAndGracefulShutdown(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", home)
+	}
 	db := openDashboardStore(t)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -757,6 +761,8 @@ func TestDashboardSecurityMiddlewareAndTrustBoundary(t *testing.T) {
 	s := NewServer(db, nil)
 	s.homeDir = t.TempDir()
 	s.port = 7788
+	s.instanceID = "test-instance"
+	s.startedAt = time.Now().UTC()
 	handler := s.Handler()
 
 	// 1. Public discovery endpoint (/api/identity) works on loopback host without token.
@@ -768,8 +774,13 @@ func TestDashboardSecurityMiddlewareAndTrustBoundary(t *testing.T) {
 		t.Fatalf("GET /api/identity = %d: %s", idRec.Code, idRec.Body.String())
 	}
 	idJSON := decodeDashboardJSON(t, idRec.Body.Bytes())
-	if idJSON["service"] != "slopguard" || idJSON["auth_required"] != true {
+	if idJSON["service"] != "slopguard" || idJSON["auth_required"] != true || idJSON["instance_id"] != "test-instance" {
 		t.Fatalf("unexpected identity payload: %v", idJSON)
+	}
+	for _, secretKey := range []string{"token", "auth_token", "ui_token"} {
+		if _, leaked := idJSON[secretKey]; leaked {
+			t.Fatalf("identity leaked %q: %v", secretKey, idJSON)
+		}
 	}
 
 	// 2. Protected /api/* rejects missing or invalid session token with 401.
@@ -823,13 +834,30 @@ func TestDashboardSecurityMiddlewareAndTrustBoundary(t *testing.T) {
 		t.Fatalf("cross-site = %d, want 403", crossSiteRec.Code)
 	}
 
-	// 4. Browser bootstrap via /?token=... issues HttpOnly SameSite=Strict cookie & enforces X-Requested-With + Content-Type.
-	bootReq := httptest.NewRequest(http.MethodGet, "/?token="+url.QueryEscape(s.AuthToken()), nil)
+	// 4. Browser bootstrap uses a short-lived one-time ticket; a long-term token in the URL is rejected.
+	if bootCode, _, _ := dashboardRequest(t, handler, http.MethodGet, "/?token="+url.QueryEscape(s.AuthToken())); bootCode != http.StatusUnauthorized {
+		t.Fatalf("GET /?token=... = %d, want 401", bootCode)
+	}
+	ticketReq := httptest.NewRequest(http.MethodPost, "/api/auth/ticket", nil)
+	ticketReq.Host = "127.0.0.1:7788"
+	ticketReq.Header.Set(uiTokenHeaderName, s.AuthToken())
+	ticketRec := httptest.NewRecorder()
+	handler.ServeHTTP(ticketRec, ticketReq)
+	if ticketRec.Code != http.StatusOK {
+		t.Fatalf("POST /api/auth/ticket = %d: %s", ticketRec.Code, ticketRec.Body.String())
+	}
+	var ticketPayload struct {
+		Ticket string `json:"ticket"`
+	}
+	if err := json.Unmarshal(ticketRec.Body.Bytes(), &ticketPayload); err != nil || ticketPayload.Ticket == "" {
+		t.Fatalf("ticket payload invalid: %v err=%v", ticketRec.Body.String(), err)
+	}
+	bootReq := httptest.NewRequest(http.MethodGet, "/?ticket="+url.QueryEscape(ticketPayload.Ticket), nil)
 	bootReq.Host = "127.0.0.1:7788"
 	bootRec := httptest.NewRecorder()
 	handler.ServeHTTP(bootRec, bootReq)
 	if bootRec.Code != http.StatusFound {
-		t.Fatalf("GET /?token=... = %d, want 302", bootRec.Code)
+		t.Fatalf("GET /?ticket=... = %d, want 302", bootRec.Code)
 	}
 	cookies := bootRec.Result().Cookies()
 	var sessCookie *http.Cookie
@@ -841,6 +869,13 @@ func TestDashboardSecurityMiddlewareAndTrustBoundary(t *testing.T) {
 	}
 	if sessCookie == nil || !sessCookie.HttpOnly || sessCookie.SameSite != http.SameSiteStrictMode {
 		t.Fatalf("expected HttpOnly SameSite=Strict cookie, got %+v", sessCookie)
+	}
+	replayReq := httptest.NewRequest(http.MethodGet, "/?ticket="+url.QueryEscape(ticketPayload.Ticket), nil)
+	replayReq.Host = "127.0.0.1:7788"
+	replayRec := httptest.NewRecorder()
+	handler.ServeHTTP(replayRec, replayReq)
+	if replayRec.Code != http.StatusUnauthorized {
+		t.Fatalf("replayed ticket = %d, want 401", replayRec.Code)
 	}
 
 	// Cookie POST without X-Requested-With must be rejected with 403.

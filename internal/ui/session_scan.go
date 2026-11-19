@@ -645,23 +645,31 @@ func scanAntigravityTranscript(path, targetProject string, knownProjects []strin
 	inferredProject := targetProject
 
 	for _, line := range lines {
+		// The transcript is JSONL; project paths in JSON strings are encoded with
+		// backslash escapes (e.g. E:\\repo on Windows). Match against decoded
+		// values instead of the raw line so Windows paths are found reliably.
+		var obj map[string]any
+		parsed := json.Unmarshal([]byte(line), &obj) == nil
+		matchText := line
+		if parsed {
+			matchText = jsonSearchText(obj)
+		}
 		if targetProject != "" {
-			if strings.Contains(line, targetProject) {
+			if strings.Contains(matchText, targetProject) {
 				projectSeen = true
 			}
 		} else if inferredProject == "" {
 			for _, kp := range knownProjects {
-				if kp != "" && strings.Contains(line, kp) {
+				if kp != "" && strings.Contains(matchText, kp) {
 					inferredProject = kp
 					break
 				}
 			}
 		}
-		if !strings.Contains(line, `"ERROR"`) && !hasErrorIndicator(line) {
+		if !strings.Contains(matchText, `"ERROR"`) && !hasErrorIndicator(matchText) {
 			continue
 		}
-		var obj map[string]any
-		if err := json.Unmarshal([]byte(line), &obj); err != nil {
+		if !parsed {
 			continue
 		}
 		status, _ := obj["status"].(string)
@@ -699,6 +707,31 @@ func buildCandidatesFromHits(hits []sessionHit, project, source, origin string) 
 		})
 	}
 	return out
+}
+
+func jsonSearchText(val any) string {
+	switch v := val.(type) {
+	case string:
+		return v
+	case []any:
+		var parts []string
+		for _, item := range v {
+			if s := jsonSearchText(item); s != "" {
+				parts = append(parts, s)
+			}
+		}
+		return strings.Join(parts, "\n")
+	case map[string]any:
+		var parts []string
+		for _, item := range v {
+			if s := jsonSearchText(item); s != "" {
+				parts = append(parts, s)
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		return fmt.Sprint(v)
+	}
 }
 
 func extractAnyText(val any) string {
@@ -757,8 +790,8 @@ var (
 		{category: "test", re: regexp.MustCompile(`^---\s+FAIL:\s+\S+.*`)},
 		{category: "type", re: regexp.MustCompile(`error\[E\d{4}\]:\s*.+`)},
 	}
-	noisePattern        = regexp.MustCompile(`(?i)(permission denied|econnrefused|timed out|timeout|rate limit|404 not found|canceled|cancelled|encountered error in step execution|declaring permissions:|invalid line range:|target content not found)`)
-	lineColNormPattern  = regexp.MustCompile(`:\d+(?::\d+)?`)
+	noisePattern       = regexp.MustCompile(`(?i)(permission denied|econnrefused|timed out|timeout|rate limit|404 not found|canceled|cancelled|encountered error in step execution|declaring permissions:|invalid line range:|target content not found)`)
+	lineColNormPattern = regexp.MustCompile(`:\d+(?::\d+)?`)
 )
 
 func extractHighSignalError(text string) (category, summary, snippet string) {

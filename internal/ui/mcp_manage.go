@@ -49,16 +49,63 @@ type skillTargetStatus struct {
 }
 
 type configBackupRecord struct {
+	SchemaVersion   int    `json:"schema_version,omitempty"`
 	ID              string `json:"id"`
 	Kind            string `json:"kind"`
+	Scope           string `json:"scope,omitempty"`
 	TargetPath      string `json:"target_path"`
+	TargetRealPath  string `json:"target_real_path,omitempty"`
 	Existed         bool   `json:"existed"`
 	OriginalMode    uint32 `json:"original_mode"`
 	OriginalSHA256  string `json:"original_sha256,omitempty"`
+	InstalledMode   uint32 `json:"installed_mode,omitempty"`
 	InstalledSHA256 string `json:"installed_sha256,omitempty"`
 	OriginalBytes   []byte `json:"original_bytes,omitempty"`
+	InstalledBytes  []byte `json:"installed_bytes,omitempty"`
+	InstalledAt     string `json:"installed_at,omitempty"`
 	BackupAt        string `json:"backup_at"`
 }
+
+const backupRecordSchemaVersion = 2
+
+// backupTarget 描述一个受管配置目标的所有权信息。
+type backupTarget struct {
+	Kind  string
+	ID    string
+	Scope string
+	Path  string
+}
+
+type uninstallAction string
+
+const (
+	uninstallNoop            uninstallAction = "noop"
+	uninstallRestoreOriginal uninstallAction = "restore_original"
+	uninstallDeleteFile      uninstallAction = "delete_file"
+	uninstallWriteMerged     uninstallAction = "write_merged"
+)
+
+// uninstallPlan 是安全卸载的纯数据预览结果；不包含任何写入副作用。
+type uninstallPlan struct {
+	Action  uninstallAction
+	NewData []byte
+	NewMode os.FileMode
+	Diff    string
+	Reason  string
+
+	upgradedRecord *configBackupRecord
+}
+
+var (
+	// ErrBackupMetadataMismatch 表示备份记录与目标/用途不匹配，不能信任该备份。
+	ErrBackupMetadataMismatch = errors.New("备份元数据与目标不匹配")
+	// ErrLegacyBackupNeedsReview 表示旧备份缺少可证明的安装快照，必须人工确认或重新安装。
+	ErrLegacyBackupNeedsReview = errors.New("旧版本备份缺少安装快照，已阻止覆盖或删除")
+	// ErrManagedConfigModified 表示用户修改了 SlopGuard 受管配置，必须保留现场并停止自动化操作。
+	ErrManagedConfigModified = errors.New("SlopGuard 受管配置已被用户修改")
+	// ErrManagedTargetMissing 表示目标文件在卸载时消失，不能盲目重建原始内容。
+	ErrManagedTargetMissing = errors.New("受管目标文件已不存在")
+)
 
 func sanitizeBackupToken(raw string) string {
 	var b strings.Builder
@@ -121,6 +168,9 @@ func lookupBackupChecked(backupsDir, kind, id, targetPath string) (string, confi
 		return "", configBackupRecord{}, false, nil
 	}
 	path := backupRecordPath(backupsDir, kind, id, targetPath)
+	if err := hardenBackupFilePermissions(path, false); err != nil {
+		return path, configBackupRecord{}, false, err
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -132,8 +182,22 @@ func lookupBackupChecked(backupsDir, kind, id, targetPath string) (string, confi
 	if err := json.Unmarshal(data, &rec); err != nil {
 		return path, configBackupRecord{}, false, fmt.Errorf("备份记录已损坏 (%s)，已阻止盲目还原或删除: %w", path, err)
 	}
+	if rec.Kind != "" && !strings.EqualFold(rec.Kind, kind) {
+		return path, configBackupRecord{}, false, fmt.Errorf("%w: 备份 kind=%q，请求 kind=%q", ErrBackupMetadataMismatch, rec.Kind, kind)
+	}
+	if rec.ID != "" && strings.TrimSpace(rec.ID) != strings.TrimSpace(id) {
+		return path, configBackupRecord{}, false, fmt.Errorf("%w: 备份 id=%q，请求 id=%q", ErrBackupMetadataMismatch, rec.ID, id)
+	}
 	if rec.TargetPath != "" && filepath.Clean(rec.TargetPath) != filepath.Clean(targetPath) {
-		return path, configBackupRecord{}, false, fmt.Errorf("备份目标路径校验不一致 (%s != %s)", rec.TargetPath, targetPath)
+		return path, configBackupRecord{}, false, fmt.Errorf("%w: 备份目标路径校验不一致 (%s != %s)", ErrBackupMetadataMismatch, rec.TargetPath, targetPath)
+	}
+	if rec.TargetRealPath != "" {
+		if currentReal := resolveTargetRealPath(targetPath); currentReal != "" && filepath.Clean(currentReal) != filepath.Clean(rec.TargetRealPath) {
+			return path, configBackupRecord{}, false, fmt.Errorf("%w: 目标真实路径已变化 (%s != %s)", ErrBackupMetadataMismatch, rec.TargetRealPath, currentReal)
+		}
+	}
+	if rec.SchemaVersion > backupRecordSchemaVersion {
+		return path, configBackupRecord{}, false, fmt.Errorf("%w: 不支持的备份版本 %d", ErrBackupMetadataMismatch, rec.SchemaVersion)
 	}
 	return path, rec, true, nil
 }
@@ -156,7 +220,9 @@ func ensureBackup(backupsDir, kind, id, targetPath string) (string, configBackup
 	if err := os.MkdirAll(backupsDir, 0o700); err != nil {
 		return "", configBackupRecord{}, fmt.Errorf("创建备份目录失败: %w", err)
 	}
-	_ = os.Chmod(backupsDir, 0o700)
+	if err := hardenBackupDirPermissions(backupsDir); err != nil {
+		return "", configBackupRecord{}, err
+	}
 
 	if existingPath, existingRec, ok, checkErr := lookupBackupChecked(backupsDir, kind, id, targetPath); checkErr != nil {
 		return "", configBackupRecord{}, checkErr
@@ -165,10 +231,13 @@ func ensureBackup(backupsDir, kind, id, targetPath string) (string, configBackup
 		return existingPath, existingRec, nil
 	}
 	rec := configBackupRecord{
-		ID:         id,
-		Kind:       kind,
-		TargetPath: filepath.Clean(targetPath),
-		BackupAt:   time.Now().UTC().Format(time.RFC3339),
+		SchemaVersion:  backupRecordSchemaVersion,
+		ID:             id,
+		Kind:           kind,
+		Scope:          inferBackupScope(targetPath),
+		TargetPath:     filepath.Clean(targetPath),
+		TargetRealPath: resolveTargetRealPath(targetPath),
+		BackupAt:       time.Now().UTC().Format(time.RFC3339),
 	}
 	info, err := os.Stat(targetPath)
 	switch {
@@ -197,30 +266,66 @@ func ensureBackup(backupsDir, kind, id, targetPath string) (string, configBackup
 	if err := writeFileAtomicWithDirMode(backupPath, encoded, 0o600, 0o700); err != nil {
 		return "", configBackupRecord{}, fmt.Errorf("保存备份文件失败: %w", err)
 	}
+	if err := hardenBackupFilePermissions(backupPath, true); err != nil {
+		return "", configBackupRecord{}, err
+	}
 	return backupPath, rec, nil
 }
 
 func recordBackupInstalledHash(backupsDir, kind, id, targetPath string, installedBytes []byte) error {
-	backupPath, rec, ok, err := lookupBackupChecked(backupsDir, kind, id, targetPath)
+	return recordBackupInstalled(backupsDir, backupTarget{Kind: kind, ID: id, Path: targetPath}, installedBytes, 0)
+}
+
+// recordBackupInstalled 记录安装后的完整快照。它同时把旧版备份升级为 v2：
+// 旧记录只保留 OriginalBytes 时，下一次成功安装后即可建立可信的 InstalledBytes/Hash。
+func recordBackupInstalled(backupsDir string, target backupTarget, installedBytes []byte, mode os.FileMode) error {
+	backupPath, rec, ok, err := lookupBackupChecked(backupsDir, target.Kind, target.ID, target.Path)
 	if err != nil || !ok {
 		return err
 	}
+	rec.SchemaVersion = backupRecordSchemaVersion
+	rec.Kind = target.Kind
+	rec.ID = target.ID
+	if strings.TrimSpace(target.Scope) != "" {
+		rec.Scope = target.Scope
+	}
+	rec.TargetPath = filepath.Clean(target.Path)
+	rec.TargetRealPath = resolveTargetRealPath(target.Path)
 	rec.InstalledSHA256 = fileSHA256Hex(installedBytes)
+	rec.InstalledBytes = append([]byte(nil), installedBytes...)
+	if mode != 0 {
+		rec.InstalledMode = uint32(mode.Perm())
+	}
+	rec.InstalledAt = time.Now().UTC().Format(time.RFC3339)
 	encoded, mErr := json.MarshalIndent(rec, "", "  ")
 	if mErr != nil {
 		return mErr
 	}
 	encoded = append(encoded, '\n')
-	return writeFileAtomicWithDirMode(backupPath, encoded, 0o600, 0o700)
+	if err := writeFileAtomicWithDirMode(backupPath, encoded, 0o600, 0o700); err != nil {
+		return err
+	}
+	return hardenBackupFilePermissions(backupPath, true)
 }
 
 func targetExternallyModifiedSinceInstall(rec configBackupRecord, targetPath string) (modified bool, currentExisted bool, err error) {
-	if strings.TrimSpace(rec.InstalledSHA256) == "" {
-		return false, true, nil
-	}
 	currHash, existed, err := currentFileSHA256(targetPath)
 	if err != nil {
 		return false, false, err
+	}
+	if strings.TrimSpace(rec.InstalledSHA256) == "" {
+		// 旧版备份没有安装后快照：绝不能再默认视为“未修改”。
+		upgraded, migrateErr := migrateLegacyBackup(backupTarget{Kind: rec.Kind, ID: rec.ID, Path: targetPath}, rec)
+		if migrateErr != nil {
+			return true, existed, nil
+		}
+		rec = upgraded
+		if strings.TrimSpace(rec.InstalledSHA256) == "" {
+			if rec.OriginalSHA256 != "" && currHash == rec.OriginalSHA256 && existed {
+				return false, true, nil
+			}
+			return true, existed, nil
+		}
 	}
 	if !existed {
 		return true, false, nil
@@ -236,33 +341,19 @@ func restoreFromBackup(backupsDir, kind, id, targetPath string) (restoredFromBac
 	if !ok {
 		return false, false, nil
 	}
-	extMod, existed, modErr := targetExternallyModifiedSinceInstall(rec, targetPath)
-	if modErr != nil {
-		return false, false, modErr
+	target := backupTarget{Kind: kind, ID: id, Scope: inferBackupScope(targetPath), Path: targetPath}
+	plan, err := planManagedUninstall(backupsDir, target, rec)
+	if err != nil {
+		return false, false, err
 	}
-	if extMod && existed {
-		return false, false, fmt.Errorf("目标文件 %s 在接入 SlopGuard 后已被外部修改，已阻止快照覆盖（请使用安全卸载或先预览确认）", targetPath)
+	if plan.Action == uninstallNoop {
+		_ = os.Remove(backupPath)
+		return false, false, nil
 	}
-
-	if rec.Existed {
-		mode := os.FileMode(rec.OriginalMode)
-		if mode == 0 {
-			mode = 0o644
-		}
-		if err := writeFileAtomic(targetPath, rec.OriginalBytes, mode); err != nil {
-			return false, false, fmt.Errorf("还原原文件失败: %w", err)
-		}
-	} else if !extMod {
-		if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
-			return false, false, fmt.Errorf("删除新建配置文件失败: %w", err)
-		}
-		removedFile = true
-		cleanupEmptySkillLeafDir(kind, targetPath)
+	if err := applyManagedUninstall(backupsDir, target, plan); err != nil {
+		return false, false, err
 	}
-	if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
-		return true, removedFile, fmt.Errorf("清理备份元数据失败: %w", err)
-	}
-	return true, removedFile, nil
+	return true, plan.Action == uninstallDeleteFile, nil
 }
 
 // uninstallManagedTarget safely removes SlopGuard's own entries when disabling.
@@ -270,74 +361,27 @@ func restoreFromBackup(backupsDir, kind, id, targetPath string) (restoredFromBac
 // original snapshot (or removes the newly created file). If external additions exist, it
 // performs a targeted removal of SlopGuard entries only so user edits are never lost.
 func uninstallManagedTarget(backupsDir, kind, id, targetPath, scope string) (restoredFromBackup bool, removedFile bool, err error) {
-	backupPath, rec, hasBackup, checkErr := lookupBackupChecked(backupsDir, kind, id, targetPath)
+	target := backupTarget{Kind: kind, ID: id, Scope: scope, Path: targetPath}
+	_, rec, hasBackup, checkErr := lookupBackupChecked(backupsDir, kind, id, targetPath)
 	if checkErr != nil {
 		return false, false, checkErr
 	}
-	if hasBackup {
-		extMod, existed, modErr := targetExternallyModifiedSinceInstall(rec, targetPath)
-		if modErr != nil {
-			return false, false, modErr
-		}
-		if !extMod {
-			return restoreFromBackup(backupsDir, kind, id, targetPath)
-		}
-		// File was modified after SlopGuard install: never blindly overwrite or delete it.
-		if !existed {
-			_ = os.Remove(backupPath)
-			return false, false, nil
-		}
-		if kind == "skill" {
-			return false, false, fmt.Errorf("护栏规则文件 %s 在接入后被手动修改过，已保留你的自定义内容（如需移除请手动删除或确认预览）", targetPath)
-		}
-		// Targeted MCP field removal preserves all user additions made after SlopGuard install.
-		_, newText, shouldRemove, remErr := renderMCPRemove(targetPath)
-		if remErr != nil {
-			return false, false, remErr
-		}
-		if shouldRemove {
-			if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
-				return false, false, err
-			}
-			removedFile = true
-		} else {
-			mode := existingFileModeOrDefault(targetPath, defaultModeForTarget(scope, kind))
-			if err := writeFileAtomic(targetPath, []byte(newText), mode); err != nil {
-				return false, false, err
-			}
-		}
-		_ = os.Remove(backupPath)
-		return false, removedFile, nil
+	if !hasBackup {
+		// 没有备份就无法证明目标中的 SlopGuard 内容属于我们，安全停止而不删除用户文件。
+		return false, false, fmt.Errorf("%w: %s", ErrLegacyBackupNeedsReview, targetPath)
 	}
-
-	// No backup exists: only remove SlopGuard's own fields (never delete unknown content).
-	if kind == "skill" {
-		if isSkillConfigured(targetPath) {
-			if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
-				return false, false, err
-			}
-			cleanupEmptySkillLeafDir("skill", targetPath)
-			return false, true, nil
-		}
+	plan, planErr := planManagedUninstall(backupsDir, target, rec)
+	if planErr != nil {
+		return false, false, planErr
+	}
+	if plan.Action == uninstallNoop {
+		_ = removeBackupRecord(backupsDir, target)
 		return false, false, nil
 	}
-	_, newText, shouldRemove, remErr := renderMCPRemove(targetPath)
-	if remErr != nil {
-		return false, false, remErr
+	if applyErr := applyManagedUninstall(backupsDir, target, plan); applyErr != nil {
+		return false, false, applyErr
 	}
-	if shouldRemove {
-		if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
-			return false, false, err
-		}
-		return false, true, nil
-	}
-	if newText != "" {
-		mode := existingFileModeOrDefault(targetPath, defaultModeForTarget(scope, kind))
-		if err := writeFileAtomic(targetPath, []byte(newText), mode); err != nil {
-			return false, false, err
-		}
-	}
-	return false, false, nil
+	return plan.Action == uninstallRestoreOriginal, plan.Action == uninstallDeleteFile, nil
 }
 
 func cleanupEmptySkillLeafDir(kind, targetPath string) {
@@ -967,14 +1011,28 @@ func renderSkillContent(home, targetID string) string {
 	}
 	if targetID == "project_cursor_rule" {
 		if strings.HasPrefix(doc, "---\n") {
-			return doc + "\n"
+			return wrapSkillManagedBlock(doc + "\n")
 		}
-		return "---\ndescription: SlopGuard deterministic code-quality guardrail MCP workflow\nalwaysApply: false\n---\n\n" + doc + "\n"
+		return wrapSkillManagedBlock("---\ndescription: SlopGuard deterministic code-quality guardrail MCP workflow\nalwaysApply: false\n---\n\n" + doc + "\n")
 	}
 	if strings.HasPrefix(doc, "---\n") {
-		return doc + "\n"
+		return wrapSkillManagedBlock(doc + "\n")
 	}
-	return "---\nname: slopguard\ndescription: SlopGuard deterministic code-quality guardrail MCP workflow and mistake inbox analysis guide.\n---\n\n" + doc + "\n"
+	return wrapSkillManagedBlock("---\nname: slopguard\ndescription: SlopGuard deterministic code-quality guardrail MCP workflow and mistake inbox analysis guide.\n---\n\n" + doc + "\n")
+}
+
+// wrapSkillManagedBlock 把 SlopGuard 生成内容放进受管块；YAML frontmatter 必须留在文件最开头。
+func wrapSkillManagedBlock(content string) string {
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	if strings.HasPrefix(content, "---\n") {
+		if end := strings.Index(content[4:], "\n---\n"); end >= 0 {
+			frontEnd := 4 + end + len("\n---\n")
+			front := content[:frontEnd]
+			body := strings.TrimRight(content[frontEnd:], "\n")
+			return front + "\n" + skillManagedStartMarker + "\n" + body + "\n" + skillManagedEndMarker + "\n"
+		}
+	}
+	return skillManagedStartMarker + "\n" + strings.TrimRight(content, "\n") + "\n" + skillManagedEndMarker + "\n"
 }
 
 type agentProfile struct {

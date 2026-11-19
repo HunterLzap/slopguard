@@ -2,17 +2,21 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"net/url"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/HunterLzap/slopguard/internal/contract"
+	"github.com/HunterLzap/slopguard/internal/ui"
 )
 
 type dashboardOptions struct {
@@ -24,7 +28,7 @@ type dashboardOptions struct {
 var runDashboard func(ctx context.Context, runner contract.Runner, opts dashboardOptions, stdout io.Writer) error
 
 var (
-	checkDashboardRunning = isLocalDashboardResponding
+	checkDashboardRunning = isTrustedDashboardResponding
 	openDashboardWindow   = defaultOpenDashboardWindow
 )
 
@@ -47,7 +51,11 @@ func runUI(args []string, stdout, stderr io.Writer) int {
 	if checkDashboardRunning != nil && checkDashboardRunning(*port) {
 		displayURL := fmt.Sprintf("http://127.0.0.1:%d", *port)
 		if !*noOpen && openDashboardWindow != nil {
-			if err := openDashboardWindow(appendLocalUIToken(displayURL)); err != nil {
+			targetURL := displayURL
+			if ticketURL, err := requestDashboardTicket(displayURL); err == nil && ticketURL != "" {
+				targetURL = ticketURL
+			}
+			if err := openDashboardWindow(targetURL); err != nil {
 				fmt.Fprintf(stderr, "slopguard: warning: open dashboard window: %v\n", err)
 			}
 		}
@@ -65,32 +73,76 @@ func runUI(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := newCommandContext(deps.engine)
 	defer stop()
 	if err := runDashboard(ctx, deps.runner, dashboardOptions{port: *port, noOpen: *noOpen}, stdout); err != nil {
+		var already *ui.AlreadyRunningError
+		if errors.As(err, &already) {
+			displayURL := already.URL
+			if strings.TrimSpace(displayURL) == "" {
+				displayURL = fmt.Sprintf("http://127.0.0.1:%d", already.Port)
+			}
+			if !*noOpen && openDashboardWindow != nil {
+				targetURL := displayURL
+				if ticketURL, ticketErr := requestDashboardTicket(displayURL); ticketErr == nil && ticketURL != "" {
+					targetURL = ticketURL
+				}
+				if openErr := openDashboardWindow(targetURL); openErr != nil {
+					fmt.Fprintf(stderr, "slopguard: warning: open dashboard window: %v\n", openErr)
+				}
+			}
+			fmt.Fprintf(stdout, "SlopGuard dashboard already running at %s\n", displayURL)
+			return ExitOK
+		}
 		return commandError(stderr, "dashboard: %v", err)
 	}
 	return ExitOK
 }
 
-func appendLocalUIToken(rawURL string) string {
+// requestDashboardTicket uses the local long-term token only in an HTTP header
+// and obtains a short-lived, one-time browser bootstrap URL. The long-term token
+// is never appended to a URL or passed to a browser process.
+func requestDashboardTicket(baseURL string) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil || strings.TrimSpace(home) == "" {
-		return rawURL
+		return "", errors.New("locate user home")
 	}
 	raw, err := os.ReadFile(filepath.Join(home, ".slopguard", "ui-token"))
 	if err != nil {
-		return rawURL
+		return "", err
 	}
-	tok := strings.TrimSpace(string(raw))
-	if tok == "" {
-		return rawURL
+	token := strings.TrimSpace(string(raw))
+	if token == "" {
+		return "", errors.New("empty local UI token")
 	}
-	u, err := url.Parse(rawURL)
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(baseURL, "/")+"/api/auth/ticket", nil)
 	if err != nil {
-		return rawURL
+		return "", err
 	}
-	q := u.Query()
-	q.Set("token", tok)
-	u.RawQuery = q.Encode()
-	return u.String()
+	req.Header.Set("X-SlopGuard-Token", token)
+	client := &http.Client{Timeout: 1500 * time.Millisecond}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("ticket endpoint returned %d", resp.StatusCode)
+	}
+	var payload struct {
+		Ticket string `json:"ticket"`
+		URL    string `json:"url"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&payload); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(payload.Ticket) == "" {
+		return "", errors.New("empty dashboard ticket")
+	}
+	if strings.TrimSpace(payload.URL) != "" {
+		if strings.HasPrefix(payload.URL, "http://") || strings.HasPrefix(payload.URL, "https://") {
+			return payload.URL, nil
+		}
+		return strings.TrimRight(baseURL, "/") + "/" + strings.TrimLeft(payload.URL, "/"), nil
+	}
+	return strings.TrimRight(baseURL, "/") + "/?ticket=" + payload.Ticket, nil
 }
 
 func defaultOpenDashboardWindow(targetURL string) error {

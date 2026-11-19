@@ -28,13 +28,15 @@ func (s *Server) registerActionRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/skills/install", s.handleInstallSkill)
 	mux.HandleFunc("/api/skills/restore", s.handleRestoreSkill)
 	mux.HandleFunc("/api/shared-skill", s.handleSharedSkill)
+	mux.HandleFunc("/api/shared-skill/preview", s.handlePreviewSharedSkill)
 	mux.HandleFunc("/api/agents", s.handleAgents)
 	mux.HandleFunc("/api/agents/preview", s.handlePreviewAgent)
 	mux.HandleFunc("/api/agents/toggle", s.handleToggleAgent)
 	mux.HandleFunc("/api/agents/verify", s.handleVerifyAgents)
 	mux.HandleFunc("/api/ai/config", s.handleAIConfig)
 	mux.HandleFunc("/api/guard/status", s.handleGuardStatus)
-	mux.HandleFunc("/api/guard/toggle", s.handleGuardToggle)
+	mux.HandleFunc("/api/guard/toggle", s.handleGuardToggleSecure)
+	mux.HandleFunc("/api/guard/hook/preview", s.handlePreviewGuardHook)
 	mux.HandleFunc("/api/sessions/scan", s.handleScanSessions)
 	mux.HandleFunc("/api/mistakes/analyze-all", s.handleAnalyzeAllMistakes)
 	mux.HandleFunc("/api/mistakes/apply-recommendations", s.handleApplyAIRecommendations)
@@ -169,17 +171,10 @@ func (s *Server) handleAddProject(w http.ResponseWriter, r *http.Request) {
 	var guardSt *GuardProjectStatus
 	if s.guard != nil {
 		enableTrue := true
-		var hookPtr *bool
-		if _, isGitRepo := resolveGitHookPath(absPath); isGitRepo {
-			hookTrue := true
-			hookPtr = &hookTrue
-		}
-		if st, guardErr := s.guard.SetProjectConfig(absPath, &enableTrue, hookPtr, defaultGuardDebounceSec); guardErr == nil {
+		// Git Hook installation is a configuration mutation and must be previewed
+		// separately; project onboarding only enables the background watcher.
+		if st, guardErr := s.guard.SetProjectConfig(absPath, &enableTrue, nil, defaultGuardDebounceSec); guardErr == nil {
 			guardSt = &st
-		} else if hookPtr != nil {
-			if st, guardErr := s.guard.SetProjectConfig(absPath, &enableTrue, nil, defaultGuardDebounceSec); guardErr == nil {
-				guardSt = &st
-			}
 		}
 	}
 
@@ -279,6 +274,7 @@ type targetMutationRequest struct {
 	TargetID       string            `json:"target_id"`
 	Project        string            `json:"project"`
 	Action         string            `json:"action"`
+	PreviewID      string            `json:"preview_id"`
 	Confirmed      bool              `json:"confirmed"`
 	ExpectedHashes map[string]string `json:"expected_hashes,omitempty"`
 }
@@ -374,10 +370,59 @@ type targetDiffSummary struct {
 	Action     string `json:"action"`
 	Existed    bool   `json:"existed"`
 	BaseSHA256 string `json:"base_sha256,omitempty"`
+	NewSHA256  string `json:"new_sha256,omitempty"`
+	PreviewID  string `json:"preview_id,omitempty"`
+	ExpiresAt  string `json:"expires_at,omitempty"`
 	HasChanges bool   `json:"has_changes"`
 	HasBackup  bool   `json:"has_backup"`
 	BackupAt   string `json:"backup_at,omitempty"`
 	Diff       string `json:"diff"`
+}
+
+func backupTargetForMCP(target mcpClientStatus) backupTarget {
+	return backupTarget{Kind: "mcp", ID: target.ID, Scope: target.Scope, Path: target.ConfigPath}
+}
+
+func backupTargetForSkill(target skillTargetStatus) backupTarget {
+	return backupTarget{Kind: "skill", ID: target.ID, Scope: target.Scope, Path: target.ConfigPath}
+}
+
+func (s *Server) attachPreview(d targetDiffSummary, kind, targetID, project, scope, action string) (targetDiffSummary, error) {
+	rec, err := s.createPreview(previewRecord{
+		Kind:      kind,
+		TargetID:  targetID,
+		Project:   project,
+		Scope:     scope,
+		Action:    action,
+		Paths:     map[string]string{d.ConfigPath: d.BaseSHA256},
+		NewHashes: map[string]string{d.ConfigPath: d.NewSHA256},
+	})
+	if err != nil {
+		return d, err
+	}
+	d.PreviewID = rec.ID
+	d.ExpiresAt = rec.ExpiresAt.UTC().Format(time.RFC3339)
+	return d, nil
+}
+
+func mutationStatus(status int, err error) int {
+	if err == nil {
+		return status
+	}
+	switch {
+	case errors.Is(err, ErrPreviewRequired),
+		errors.Is(err, ErrPreviewExpired),
+		errors.Is(err, ErrPreviewUsed),
+		errors.Is(err, ErrPreviewScopeMismatch),
+		errors.Is(err, ErrPreviewConflict),
+		errors.Is(err, ErrPreviewContentChanged),
+		errors.Is(err, ErrManagedConfigModified),
+		errors.Is(err, ErrLegacyBackupNeedsReview),
+		errors.Is(err, ErrManagedTargetMissing),
+		errors.Is(err, ErrBackupMetadataMismatch):
+		return http.StatusConflict
+	}
+	return status
 }
 
 func (s *Server) previewMCPTarget(target mcpClientStatus, project, action string) (targetDiffSummary, int, error) {
@@ -396,22 +441,23 @@ func (s *Server) previewMCPTarget(target mcpClientStatus, project, action string
 		if err == nil {
 			_, rec, ok, checkErr := lookupBackupChecked(s.backupsDir(), "mcp", target.ID, target.ConfigPath)
 			if checkErr != nil {
-				return targetDiffSummary{}, http.StatusInternalServerError, checkErr
+				return targetDiffSummary{}, mutationStatus(http.StatusConflict, checkErr), checkErr
 			}
-			extMod := false
 			if ok {
-				extMod, _, err = targetExternallyModifiedSinceInstall(rec, target.ConfigPath)
-			}
-			if err == nil {
-				if ok && !extMod {
-					if rec.Existed {
-						newText = string(rec.OriginalBytes)
-					} else {
-						newText = ""
-					}
-				} else {
-					_, newText, _, err = renderMCPRemove(target.ConfigPath)
+				plan, planErr := planManagedUninstall(s.backupsDir(), backupTargetForMCP(target), rec)
+				if planErr != nil {
+					return targetDiffSummary{}, mutationStatus(http.StatusConflict, planErr), planErr
 				}
+				switch plan.Action {
+				case uninstallDeleteFile:
+					newText = ""
+				case uninstallNoop:
+					newText = oldText
+				default:
+					newText = string(plan.NewData)
+				}
+			} else {
+				_, newText, _, err = renderMCPRemove(target.ConfigPath)
 			}
 		}
 	default:
@@ -424,6 +470,10 @@ func (s *Server) previewMCPTarget(target mcpClientStatus, project, action string
 	if existed {
 		baseHash = fileSHA256Hex([]byte(oldText))
 	}
+	newHash := ""
+	if newText != "" {
+		newHash = fileSHA256Hex([]byte(newText))
+	}
 	diff := buildUnifiedDiff(target.ConfigPath, oldText, newText, 3)
 	return targetDiffSummary{
 		Kind:       "mcp",
@@ -434,6 +484,7 @@ func (s *Server) previewMCPTarget(target mcpClientStatus, project, action string
 		Action:     action,
 		Existed:    existed,
 		BaseSHA256: baseHash,
+		NewSHA256:  newHash,
 		HasChanges: diff != "",
 		HasBackup:  target.HasBackup,
 		BackupAt:   target.BackupAt,
@@ -453,12 +504,28 @@ func (s *Server) previewSkillTarget(home string, target skillTargetStatus, actio
 	case "restore":
 		_, rec, ok, checkErr := lookupBackupChecked(s.backupsDir(), "skill", target.ID, target.ConfigPath)
 		if checkErr != nil {
-			return targetDiffSummary{}, http.StatusInternalServerError, checkErr
+			return targetDiffSummary{}, mutationStatus(http.StatusConflict, checkErr), checkErr
 		}
-		if ok && rec.Existed {
-			newText = string(rec.OriginalBytes)
-		} else {
-			newText = ""
+		if ok {
+			plan, planErr := planManagedUninstall(s.backupsDir(), backupTargetForSkill(target), rec)
+			if planErr != nil {
+				return targetDiffSummary{}, mutationStatus(http.StatusConflict, planErr), planErr
+			}
+			switch plan.Action {
+			case uninstallDeleteFile:
+				newText = ""
+			case uninstallNoop:
+				newText = oldText
+			default:
+				newText = string(plan.NewData)
+			}
+		} else if strings.TrimSpace(oldText) != "" {
+			// Without a trustworthy backup, only remove a managed block if it is
+			// explicitly present; never delete an unknown user-owned file.
+			if extractSkillManagedBlock(oldText) == "" {
+				return targetDiffSummary{}, http.StatusConflict, ErrLegacyBackupNeedsReview
+			}
+			newText = removeSkillManagedBlock(oldText)
 		}
 	default:
 		return targetDiffSummary{}, http.StatusBadRequest, errors.New("不支持的预览操作类型")
@@ -466,6 +533,10 @@ func (s *Server) previewSkillTarget(home string, target skillTargetStatus, actio
 	baseHash := ""
 	if existed {
 		baseHash = fileSHA256Hex([]byte(oldText))
+	}
+	newHash := ""
+	if newText != "" {
+		newHash = fileSHA256Hex([]byte(newText))
 	}
 	diff := buildUnifiedDiff(target.ConfigPath, oldText, newText, 3)
 	return targetDiffSummary{
@@ -477,6 +548,7 @@ func (s *Server) previewSkillTarget(home string, target skillTargetStatus, actio
 		Action:     action,
 		Existed:    existed,
 		BaseSHA256: baseHash,
+		NewSHA256:  newHash,
 		HasChanges: diff != "",
 		HasBackup:  target.HasBackup,
 		BackupAt:   target.BackupAt,
@@ -484,11 +556,61 @@ func (s *Server) previewSkillTarget(home string, target skillTargetStatus, actio
 	}, http.StatusOK, nil
 }
 
-func (s *Server) applyMCPTarget(target mcpClientStatus, project, action string) (map[string]any, int, error) {
+func (s *Server) applyMCPTarget(target mcpClientStatus, project, action string, lease *applyLease) (map[string]any, int, error) {
 	if action == "restore" {
-		restoredFromBackup, removedFile, err := uninstallManagedTarget(s.backupsDir(), "mcp", target.ID, target.ConfigPath, target.Scope)
-		if err != nil {
-			return nil, http.StatusConflict, err
+		_, rec, hasBackup, checkErr := lookupBackupChecked(s.backupsDir(), "mcp", target.ID, target.ConfigPath)
+		if checkErr != nil {
+			return nil, mutationStatus(http.StatusConflict, checkErr), checkErr
+		}
+		removedFile := false
+		restoredFromBackup := false
+		if hasBackup {
+			plan, planErr := planManagedUninstall(s.backupsDir(), backupTargetForMCP(target), rec)
+			if planErr != nil {
+				return nil, mutationStatus(http.StatusConflict, planErr), planErr
+			}
+			if lease != nil {
+				if plan.Action == uninstallDeleteFile {
+					if err := lease.checkDeletion(target.ConfigPath); err != nil {
+						return nil, mutationStatus(http.StatusConflict, err), err
+					}
+				} else if len(plan.NewData) > 0 {
+					if err := lease.checkNewContent(target.ConfigPath, plan.NewData); err != nil {
+						return nil, mutationStatus(http.StatusConflict, err), err
+					}
+				}
+			}
+			if err := applyManagedUninstall(s.backupsDir(), backupTargetForMCP(target), plan); err != nil {
+				return nil, mutationStatus(http.StatusConflict, err), err
+			}
+			restoredFromBackup = true
+			removedFile = plan.Action == uninstallDeleteFile
+		} else {
+			oldText, newText, shouldRemove, remErr := renderMCPRemove(target.ConfigPath)
+			if remErr != nil {
+				return nil, mutationStatus(http.StatusConflict, remErr), remErr
+			}
+			if shouldRemove {
+				if lease != nil {
+					if err := lease.checkDeletion(target.ConfigPath); err != nil {
+						return nil, mutationStatus(http.StatusConflict, err), err
+					}
+				}
+				if err := os.Remove(target.ConfigPath); err != nil && !os.IsNotExist(err) {
+					return nil, http.StatusInternalServerError, err
+				}
+				removedFile = true
+			} else if newText != oldText {
+				if lease != nil {
+					if err := lease.checkNewContent(target.ConfigPath, []byte(newText)); err != nil {
+						return nil, mutationStatus(http.StatusConflict, err), err
+					}
+				}
+				mode := existingFileModeOrDefault(target.ConfigPath, defaultModeForTarget(target.Scope, "mcp"))
+				if err := writeFileAtomic(target.ConfigPath, []byte(newText), mode); err != nil {
+					return nil, http.StatusInternalServerError, err
+				}
+			}
 		}
 		if target.ID == "antigravity" && strings.TrimSpace(s.homeDir) == "" {
 			if syncErr := syncAgyMCPRegistry(s.resolveHomeDir(), "", false); syncErr != nil {
@@ -513,15 +635,20 @@ func (s *Server) applyMCPTarget(target mcpClientStatus, project, action string) 
 	if err != nil {
 		return nil, http.StatusBadRequest, fmt.Errorf("生成 MCP 配置失败: %v", err)
 	}
+	if lease != nil {
+		if err := lease.checkNewContent(target.ConfigPath, []byte(newText)); err != nil {
+			return nil, mutationStatus(http.StatusConflict, err), err
+		}
+	}
 	backupPath, _, err := ensureBackup(s.backupsDir(), "mcp", target.ID, target.ConfigPath)
 	if err != nil {
-		return nil, http.StatusInternalServerError, fmt.Errorf("备份原配置失败: %v", err)
+		return nil, mutationStatus(http.StatusConflict, err), fmt.Errorf("备份原配置失败: %v", err)
 	}
 	mode := existingFileModeOrDefault(target.ConfigPath, defaultModeForTarget(target.Scope, "mcp"))
 	if err := writeFileAtomic(target.ConfigPath, []byte(newText), mode); err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("写入 MCP 配置失败: %v", err)
 	}
-	if err := recordBackupInstalledHash(s.backupsDir(), "mcp", target.ID, target.ConfigPath, []byte(newText)); err != nil {
+	if err := recordBackupInstalled(s.backupsDir(), backupTargetForMCP(target), []byte(newText), mode); err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("记录配置摘要失败: %v", err)
 	}
 	if target.ID == "antigravity" && strings.TrimSpace(s.homeDir) == "" {
@@ -539,11 +666,63 @@ func (s *Server) applyMCPTarget(target mcpClientStatus, project, action string) 
 	}, http.StatusOK, nil
 }
 
-func (s *Server) applySkillTarget(home string, target skillTargetStatus, action string) (map[string]any, int, error) {
+func (s *Server) applySkillTarget(home string, target skillTargetStatus, action string, lease *applyLease) (map[string]any, int, error) {
 	if action == "restore" {
-		restoredFromBackup, removedFile, err := uninstallManagedTarget(s.backupsDir(), "skill", target.ID, target.ConfigPath, target.Scope)
-		if err != nil {
-			return nil, http.StatusConflict, err
+		_, rec, hasBackup, checkErr := lookupBackupChecked(s.backupsDir(), "skill", target.ID, target.ConfigPath)
+		if checkErr != nil {
+			return nil, mutationStatus(http.StatusConflict, checkErr), checkErr
+		}
+		removedFile := false
+		restoredFromBackup := false
+		if hasBackup {
+			plan, planErr := planManagedUninstall(s.backupsDir(), backupTargetForSkill(target), rec)
+			if planErr != nil {
+				return nil, mutationStatus(http.StatusConflict, planErr), planErr
+			}
+			if lease != nil {
+				if plan.Action == uninstallDeleteFile {
+					if err := lease.checkDeletion(target.ConfigPath); err != nil {
+						return nil, mutationStatus(http.StatusConflict, err), err
+					}
+				} else if len(plan.NewData) > 0 {
+					if err := lease.checkNewContent(target.ConfigPath, plan.NewData); err != nil {
+						return nil, mutationStatus(http.StatusConflict, err), err
+					}
+				}
+			}
+			if err := applyManagedUninstall(s.backupsDir(), backupTargetForSkill(target), plan); err != nil {
+				return nil, mutationStatus(http.StatusConflict, err), err
+			}
+			restoredFromBackup = true
+			removedFile = plan.Action == uninstallDeleteFile
+		} else {
+			oldText, _, readErr := readFileTextOrEmpty(target.ConfigPath)
+			if readErr != nil {
+				return nil, http.StatusInternalServerError, readErr
+			}
+			if strings.TrimSpace(oldText) != "" {
+				if extractSkillManagedBlock(oldText) == "" {
+					return nil, http.StatusConflict, ErrLegacyBackupNeedsReview
+				}
+				newText := removeSkillManagedBlock(oldText)
+				if lease != nil {
+					if err := lease.checkNewContent(target.ConfigPath, []byte(newText)); err != nil {
+						return nil, mutationStatus(http.StatusConflict, err), err
+					}
+				}
+				if strings.TrimSpace(newText) == "" {
+					if err := os.Remove(target.ConfigPath); err != nil && !os.IsNotExist(err) {
+						return nil, http.StatusInternalServerError, err
+					}
+					removedFile = true
+					cleanupEmptySkillLeafDir("skill", target.ConfigPath)
+				} else {
+					mode := existingFileModeOrDefault(target.ConfigPath, defaultModeForTarget(target.Scope, "skill"))
+					if err := writeFileAtomic(target.ConfigPath, []byte(newText), mode); err != nil {
+						return nil, http.StatusInternalServerError, err
+					}
+				}
+			}
 		}
 		return map[string]any{
 			"ok":                   true,
@@ -560,15 +739,20 @@ func (s *Server) applySkillTarget(home string, target skillTargetStatus, action 
 		return nil, http.StatusInternalServerError, err
 	}
 	newText := renderSkillContent(home, target.ID)
+	if lease != nil {
+		if err := lease.checkNewContent(target.ConfigPath, []byte(newText)); err != nil {
+			return nil, mutationStatus(http.StatusConflict, err), err
+		}
+	}
 	backupPath, _, err := ensureBackup(s.backupsDir(), "skill", target.ID, target.ConfigPath)
 	if err != nil {
-		return nil, http.StatusInternalServerError, fmt.Errorf("备份原 Skill 失败: %v", err)
+		return nil, mutationStatus(http.StatusConflict, err), fmt.Errorf("备份原 Skill 失败: %v", err)
 	}
 	mode := existingFileModeOrDefault(target.ConfigPath, defaultModeForTarget(target.Scope, "skill"))
 	if err := writeFileAtomic(target.ConfigPath, []byte(newText), mode); err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("写入 Skill 失败: %v", err)
 	}
-	if err := recordBackupInstalledHash(s.backupsDir(), "skill", target.ID, target.ConfigPath, []byte(newText)); err != nil {
+	if err := recordBackupInstalled(s.backupsDir(), backupTargetForSkill(target), []byte(newText), mode); err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("记录 Skill 摘要失败: %v", err)
 	}
 	return map[string]any{
@@ -594,6 +778,9 @@ func writeTargetDiffJSON(w http.ResponseWriter, d targetDiffSummary) {
 		"existed":     d.Existed,
 		"base_sha256": d.BaseSHA256,
 		"base_hashes": map[string]string{d.ConfigPath: d.BaseSHA256},
+		"new_sha256":  d.NewSHA256,
+		"preview_id":  d.PreviewID,
+		"expires_at":  d.ExpiresAt,
 		"has_changes": d.HasChanges,
 		"has_backup":  d.HasBackup,
 		"backup_at":   d.BackupAt,
@@ -625,41 +812,23 @@ func (s *Server) handlePreviewMCPClient(w http.ResponseWriter, r *http.Request) 
 		writeError(w, status, err.Error())
 		return
 	}
+	d, err = s.attachPreview(d, "mcp", target.ID, project, target.Scope, action)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	writeTargetDiffJSON(w, d)
 }
 
 func (s *Server) handleInstallMCPClient(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodNotAllowed(w, http.MethodPost)
-		return
-	}
-	var req targetMutationRequest
-	if !decodeJSONBody(w, r, &req, false) {
-		return
-	}
-	project := strings.TrimSpace(req.Project)
-	target := findMCPClientTarget(s.resolveHomeDir(), project, req.effectiveID())
-	if target == nil {
-		writeError(w, http.StatusBadRequest, "未知的 Agent 客户端标识")
-		return
-	}
-	if target.Scope == "global" && !req.Confirmed {
-		writeError(w, http.StatusBadRequest, "修改全局配置前必须先预览 Diff 并确认")
-		return
-	}
-	if err := verifyExpectedHashes(req.ExpectedHashes, target.ConfigPath); err != nil {
-		writeError(w, http.StatusConflict, err.Error())
-		return
-	}
-	res, status, err := s.applyMCPTarget(*target, project, "install")
-	if err != nil {
-		writeError(w, status, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, res)
+	s.handleMCPMutation(w, r, "install")
 }
 
 func (s *Server) handleRestoreMCPClient(w http.ResponseWriter, r *http.Request) {
+	s.handleMCPMutation(w, r, "restore")
+}
+
+func (s *Server) handleMCPMutation(w http.ResponseWriter, r *http.Request, action string) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w, http.MethodPost)
 		return
@@ -674,11 +843,25 @@ func (s *Server) handleRestoreMCPClient(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "未知的 Agent 客户端标识")
 		return
 	}
-	if err := verifyExpectedHashes(req.ExpectedHashes, target.ConfigPath); err != nil {
-		writeError(w, http.StatusConflict, err.Error())
+	if !req.Confirmed || strings.TrimSpace(req.PreviewID) == "" {
+		writeError(w, http.StatusConflict, ErrPreviewRequired.Error())
 		return
 	}
-	res, status, err := s.applyMCPTarget(*target, project, "restore")
+	lease, err := s.beginApply(req.PreviewID, previewExpectation{
+		Kind:           "mcp",
+		TargetID:       target.ID,
+		Project:        project,
+		Scope:          target.Scope,
+		Action:         action,
+		Paths:          []string{target.ConfigPath},
+		ExpectedHashes: req.ExpectedHashes,
+	})
+	if err != nil {
+		writeError(w, mutationStatus(http.StatusConflict, err), err.Error())
+		return
+	}
+	defer lease.Close()
+	res, status, err := s.applyMCPTarget(*target, project, action, lease)
 	if err != nil {
 		writeError(w, status, err.Error())
 		return
@@ -711,42 +894,23 @@ func (s *Server) handlePreviewSkill(w http.ResponseWriter, r *http.Request) {
 		writeError(w, status, err.Error())
 		return
 	}
+	d, err = s.attachPreview(d, "skill", target.ID, project, target.Scope, action)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	writeTargetDiffJSON(w, d)
 }
 
 func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodNotAllowed(w, http.MethodPost)
-		return
-	}
-	var req targetMutationRequest
-	if !decodeJSONBody(w, r, &req, false) {
-		return
-	}
-	home := s.resolveHomeDir()
-	project := strings.TrimSpace(req.Project)
-	target := findSkillTarget(home, project, req.effectiveID())
-	if target == nil {
-		writeError(w, http.StatusBadRequest, "未知的 Skill 目标标识")
-		return
-	}
-	if target.Scope == "global" && !req.Confirmed {
-		writeError(w, http.StatusBadRequest, "修改全局规则前必须先预览 Diff 并确认")
-		return
-	}
-	if err := verifyExpectedHashes(req.ExpectedHashes, target.ConfigPath); err != nil {
-		writeError(w, http.StatusConflict, err.Error())
-		return
-	}
-	res, status, err := s.applySkillTarget(home, *target, "install")
-	if err != nil {
-		writeError(w, status, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, res)
+	s.handleSkillMutation(w, r, "install")
 }
 
 func (s *Server) handleRestoreSkill(w http.ResponseWriter, r *http.Request) {
+	s.handleSkillMutation(w, r, "restore")
+}
+
+func (s *Server) handleSkillMutation(w http.ResponseWriter, r *http.Request, action string) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w, http.MethodPost)
 		return
@@ -762,11 +926,25 @@ func (s *Server) handleRestoreSkill(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "未知的 Skill 目标标识")
 		return
 	}
-	if err := verifyExpectedHashes(req.ExpectedHashes, target.ConfigPath); err != nil {
-		writeError(w, http.StatusConflict, err.Error())
+	if !req.Confirmed || strings.TrimSpace(req.PreviewID) == "" {
+		writeError(w, http.StatusConflict, ErrPreviewRequired.Error())
 		return
 	}
-	res, status, err := s.applySkillTarget(home, *target, "restore")
+	lease, err := s.beginApply(req.PreviewID, previewExpectation{
+		Kind:           "skill",
+		TargetID:       target.ID,
+		Project:        project,
+		Scope:          target.Scope,
+		Action:         action,
+		Paths:          []string{target.ConfigPath},
+		ExpectedHashes: req.ExpectedHashes,
+	})
+	if err != nil {
+		writeError(w, mutationStatus(http.StatusConflict, err), err.Error())
+		return
+	}
+	defer lease.Close()
+	res, status, err := s.applySkillTarget(home, *target, action, lease)
 	if err != nil {
 		writeError(w, status, err.Error())
 		return
@@ -782,6 +960,380 @@ func findAgentProfileByID(home, project, agentID string) *agentProfile {
 		}
 	}
 	return nil
+}
+
+func renderSkillContentWithDoc(targetID, doc string) string {
+	doc = strings.TrimSpace(doc)
+	if doc == "" {
+		doc = "# SlopGuard\n\nUse sg_verify before finishing edits."
+	}
+	if targetID == "project_cursor_rule" {
+		if strings.HasPrefix(doc, "---\n") {
+			return wrapSkillManagedBlock(doc + "\n")
+		}
+		return wrapSkillManagedBlock("---\ndescription: SlopGuard deterministic code-quality guardrail MCP workflow\nalwaysApply: false\n---\n\n" + doc + "\n")
+	}
+	if strings.HasPrefix(doc, "---\n") {
+		return wrapSkillManagedBlock(doc + "\n")
+	}
+	return wrapSkillManagedBlock("---\nname: slopguard\ndescription: SlopGuard deterministic code-quality guardrail MCP workflow and mistake inbox analysis guide.\n---\n\n" + doc + "\n")
+}
+
+type sharedSkillPreviewRequest struct {
+	Content     string `json:"content"`
+	Reset       bool   `json:"reset"`
+	SyncEnabled *bool  `json:"sync_enabled"`
+	Project     string `json:"project"`
+}
+
+func sharedSkillPreviewPlan(home string, req sharedSkillPreviewRequest) (targetDiffSummary, map[string]string, map[string]string, []string, string, error) {
+	path := sharedSkillPath(home)
+	if path == "" {
+		return targetDiffSummary{}, nil, nil, nil, "", errors.New("无法定位用户主目录")
+	}
+	oldText, existed, err := readFileTextOrEmpty(path)
+	if err != nil {
+		return targetDiffSummary{}, nil, nil, nil, "", err
+	}
+	newText := ""
+	if req.Reset {
+		newText = ""
+	} else {
+		trimmed := strings.TrimSpace(req.Content)
+		if trimmed == "" {
+			return targetDiffSummary{}, nil, nil, nil, "", errors.New("护栏指令内容不能为空")
+		}
+		newText = trimmed + "\n"
+	}
+	docForSkills := newText
+	if req.Reset {
+		docForSkills = defaultSharedSkillContent()
+	}
+
+	baseHashes := map[string]string{path: hashIfText(oldText, existed)}
+	newHashes := map[string]string{path: hashIfNewText(newText)}
+	paths := []string{path}
+	diffs := []string{buildUnifiedDiff(path, oldText, newText, 3)}
+	syncEnabled := true
+	if req.SyncEnabled != nil {
+		syncEnabled = *req.SyncEnabled
+	}
+	if syncEnabled {
+		for _, sk := range discoverSkillTargets(home, strings.TrimSpace(req.Project)) {
+			if !sk.Configured {
+				continue
+			}
+			oldSkill, skillExisted, readErr := readFileTextOrEmpty(sk.ConfigPath)
+			if readErr != nil {
+				return targetDiffSummary{}, nil, nil, nil, "", readErr
+			}
+			newSkill := renderSkillContentWithDoc(sk.ID, docForSkills)
+			baseHashes[sk.ConfigPath] = hashIfText(oldSkill, skillExisted)
+			newHashes[sk.ConfigPath] = fileSHA256Hex([]byte(newSkill))
+			paths = append(paths, sk.ConfigPath)
+			diffs = append(diffs, buildUnifiedDiff(sk.ConfigPath, oldSkill, newSkill, 3))
+		}
+	}
+	action := "install"
+	if req.Reset {
+		action = "restore"
+	}
+	diff := strings.Join(diffs, "\n")
+	return targetDiffSummary{
+		Kind:       "shared_skill",
+		ID:         "shared-skill",
+		Name:       "共享护栏指令",
+		Scope:      "global",
+		ConfigPath: strings.Join(paths, " + "),
+		Action:     action,
+		Existed:    existed,
+		BaseSHA256: baseHashes[path],
+		NewSHA256:  newHashes[path],
+		HasChanges: diff != "",
+		Diff:       diff,
+	}, baseHashes, newHashes, paths, newText, nil
+}
+
+func hashIfText(text string, existed bool) string {
+	if !existed {
+		return ""
+	}
+	return fileSHA256Hex([]byte(text))
+}
+
+func hashIfNewText(text string) string {
+	if text == "" {
+		return ""
+	}
+	return fileSHA256Hex([]byte(text))
+}
+
+func (s *Server) handlePreviewSharedSkill(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	var req sharedSkillPreviewRequest
+	if !decodeJSONBody(w, r, &req, false) {
+		return
+	}
+	home := s.resolveHomeDir()
+	project := strings.TrimSpace(req.Project)
+	d, baseHashes, newHashes, paths, newText, err := sharedSkillPreviewPlan(home, req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	action := "install"
+	if req.Reset {
+		action = "restore"
+	}
+	rec, err := s.createPreview(previewRecord{
+		Kind:      "shared_skill",
+		TargetID:  "shared-skill",
+		Project:   project,
+		Scope:     "global",
+		Action:    action,
+		Paths:     baseHashes,
+		NewHashes: newHashes,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	syncEnabled := true
+	if req.SyncEnabled != nil {
+		syncEnabled = *req.SyncEnabled
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":           true,
+		"kind":         d.Kind,
+		"target_id":    d.ID,
+		"name":         d.Name,
+		"scope":        d.Scope,
+		"action":       d.Action,
+		"config_path":  d.ConfigPath,
+		"existed":      d.Existed,
+		"base_sha256":  d.BaseSHA256,
+		"new_sha256":   d.NewSHA256,
+		"base_hashes":  baseHashes,
+		"new_hashes":   newHashes,
+		"preview_id":   rec.ID,
+		"expires_at":   rec.ExpiresAt.UTC().Format(time.RFC3339),
+		"has_changes":  d.HasChanges,
+		"has_backup":   false,
+		"diff":         d.Diff,
+		"content":      newText,
+		"reset":        req.Reset,
+		"sync_enabled": syncEnabled,
+		"project":      project,
+		"paths":        paths,
+	})
+}
+
+type guardHookPreviewRequest struct {
+	Project     string `json:"project"`
+	HookEnabled bool   `json:"hook_enabled"`
+}
+
+func (s *Server) guardHookPreviewPlan(project string, hookEnabled bool) (targetDiffSummary, map[string]string, map[string]string, string, string, error) {
+	absProject, err := filepath.Abs(strings.TrimSpace(project))
+	if err != nil {
+		return targetDiffSummary{}, nil, nil, "", "", err
+	}
+	hookPath, isGit := resolveGitHookPath(absProject)
+	if !isGit || hookPath == "" {
+		return targetDiffSummary{}, nil, nil, "", "", errors.New("当前目录不是 Git 仓库，无法修改 post-commit 钩子")
+	}
+	oldText, existed, err := readFileTextOrEmpty(hookPath)
+	if err != nil {
+		return targetDiffSummary{}, nil, nil, "", "", err
+	}
+	newText := oldText
+	if hookEnabled {
+		exe, exeErr := resolveSelfBinary()
+		if exeErr != nil {
+			exe = "slopguard"
+		}
+		newText = upsertHookMarkerBlock(oldText, buildGitHookBlock(exe))
+	} else {
+		backupsDir := s.backupsDir()
+		_, rec, ok, checkErr := lookupBackupChecked(backupsDir, "hook", "post-commit", hookPath)
+		if checkErr != nil {
+			return targetDiffSummary{}, nil, nil, "", "", checkErr
+		}
+		if ok {
+			plan, planErr := planManagedUninstall(backupsDir, backupTarget{Kind: "hook", ID: "post-commit", Scope: "project", Path: hookPath}, rec)
+			if planErr != nil {
+				return targetDiffSummary{}, nil, nil, "", "", planErr
+			}
+			switch plan.Action {
+			case uninstallDeleteFile:
+				newText = ""
+			case uninstallNoop:
+				newText = oldText
+			default:
+				newText = string(plan.NewData)
+			}
+		} else {
+			newText = stripHookMarkerBlock(oldText)
+			if strings.TrimSpace(newText) == "" {
+				newText = ""
+			}
+		}
+	}
+	baseHashes := map[string]string{hookPath: hashIfText(oldText, existed)}
+	newHashes := map[string]string{hookPath: hashIfNewText(newText)}
+	diff := buildUnifiedDiff(hookPath, oldText, newText, 3)
+	action := "install"
+	if !hookEnabled {
+		action = "restore"
+	}
+	return targetDiffSummary{
+		Kind:       "guard_hook",
+		ID:         "post-commit",
+		Name:       "Git post-commit hook",
+		Scope:      "project",
+		ConfigPath: hookPath,
+		Action:     action,
+		Existed:    existed,
+		BaseSHA256: baseHashes[hookPath],
+		NewSHA256:  newHashes[hookPath],
+		HasChanges: diff != "",
+		Diff:       diff,
+	}, baseHashes, newHashes, hookPath, newText, nil
+}
+
+func (s *Server) handlePreviewGuardHook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	var req guardHookPreviewRequest
+	if !decodeJSONBody(w, r, &req, false) {
+		return
+	}
+	d, baseHashes, newHashes, _, _, err := s.guardHookPreviewPlan(req.Project, req.HookEnabled)
+	if err != nil {
+		writeError(w, mutationStatus(http.StatusConflict, err), err.Error())
+		return
+	}
+	project := normalizePreviewProject(req.Project)
+	action := "install"
+	if !req.HookEnabled {
+		action = "restore"
+	}
+	rec, err := s.createPreview(previewRecord{
+		Kind:      "guard_hook",
+		TargetID:  "post-commit",
+		Project:   project,
+		Scope:     "project",
+		Action:    action,
+		Paths:     baseHashes,
+		NewHashes: newHashes,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":          true,
+		"kind":        d.Kind,
+		"target_id":   d.ID,
+		"name":        d.Name,
+		"scope":       d.Scope,
+		"action":      d.Action,
+		"config_path": d.ConfigPath,
+		"existed":     d.Existed,
+		"base_sha256": d.BaseSHA256,
+		"new_sha256":  d.NewSHA256,
+		"base_hashes": baseHashes,
+		"new_hashes":  newHashes,
+		"preview_id":  rec.ID,
+		"expires_at":  rec.ExpiresAt.UTC().Format(time.RFC3339),
+		"has_changes": d.HasChanges,
+		"has_backup":  false,
+		"diff":        d.Diff,
+		"project":     project,
+	})
+}
+
+func (s *Server) handleGuardToggleSecure(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	var req struct {
+		Project     string `json:"project"`
+		Enabled     *bool  `json:"enabled"`
+		HookEnabled *bool  `json:"hook_enabled"`
+		DebounceSec int    `json:"debounce_sec"`
+		PreviewID   string `json:"preview_id"`
+		Confirmed   bool   `json:"confirmed"`
+	}
+	if !decodeJSONBody(w, r, &req, false) {
+		return
+	}
+	if req.HookEnabled != nil {
+		if !req.Confirmed || strings.TrimSpace(req.PreviewID) == "" {
+			writeError(w, http.StatusConflict, ErrPreviewRequired.Error())
+			return
+		}
+		absProject, err := filepath.Abs(strings.TrimSpace(req.Project))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		hookPath, isGit := resolveGitHookPath(absProject)
+		if !isGit || hookPath == "" {
+			writeError(w, http.StatusBadRequest, "当前目录不是 Git 仓库，无法修改 post-commit 钩子")
+			return
+		}
+		d, _, _, _, newText, planErr := s.guardHookPreviewPlan(absProject, *req.HookEnabled)
+		if planErr != nil {
+			writeError(w, mutationStatus(http.StatusConflict, planErr), planErr.Error())
+			return
+		}
+		action := "install"
+		if !*req.HookEnabled {
+			action = "restore"
+		}
+		lease, err := s.beginApply(req.PreviewID, previewExpectation{
+			Kind:     "guard_hook",
+			TargetID: "post-commit",
+			Project:  absProject,
+			Scope:    "project",
+			Action:   action,
+			Paths:    []string{hookPath},
+		})
+		if err != nil {
+			writeError(w, mutationStatus(http.StatusConflict, err), err.Error())
+			return
+		}
+		defer lease.Close()
+		st, err := s.guard.SetProjectConfig(absProject, req.Enabled, req.HookEnabled, req.DebounceSec)
+		if err != nil {
+			writeError(w, mutationStatus(http.StatusConflict, err), err.Error())
+			return
+		}
+		if newText == "" {
+			if _, statErr := os.Stat(hookPath); statErr == nil {
+				writeError(w, http.StatusConflict, "钩子预览结果与实际删除状态不一致，请重新预览")
+				return
+			}
+		} else if raw, readErr := os.ReadFile(hookPath); readErr != nil || fileSHA256Hex(raw) != fileSHA256Hex([]byte(newText)) {
+			writeError(w, http.StatusConflict, "钩子写入内容与预览不一致，请重新预览")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": st, "diff": d.Diff})
+		return
+	}
+	st, err := s.guard.SetProjectConfig(req.Project, req.Enabled, nil, req.DebounceSec)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": st})
 }
 
 func (s *Server) handleSharedSkill(w http.ResponseWriter, r *http.Request) {
@@ -804,6 +1356,8 @@ func (s *Server) handleSharedSkill(w http.ResponseWriter, r *http.Request) {
 			Reset       bool   `json:"reset"`
 			SyncEnabled *bool  `json:"sync_enabled"`
 			Project     string `json:"project"`
+			PreviewID   string `json:"preview_id"`
+			Confirmed   bool   `json:"confirmed"`
 		}
 		if !decodeJSONBody(w, r, &req, false) {
 			return
@@ -812,18 +1366,53 @@ func (s *Server) handleSharedSkill(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "无法定位用户主目录")
 			return
 		}
+		if !req.Confirmed || strings.TrimSpace(req.PreviewID) == "" {
+			writeError(w, http.StatusConflict, ErrPreviewRequired.Error())
+			return
+		}
+		previewReq := sharedSkillPreviewRequest{
+			Content:     req.Content,
+			Reset:       req.Reset,
+			SyncEnabled: req.SyncEnabled,
+			Project:     strings.TrimSpace(req.Project),
+		}
+		_, _, _, previewPaths, newText, planErr := sharedSkillPreviewPlan(home, previewReq)
+		if planErr != nil {
+			writeError(w, http.StatusBadRequest, planErr.Error())
+			return
+		}
+		action := "install"
 		if req.Reset {
+			action = "restore"
+		}
+		lease, err := s.beginApply(req.PreviewID, previewExpectation{
+			Kind:     "shared_skill",
+			TargetID: "shared-skill",
+			Project:  strings.TrimSpace(req.Project),
+			Scope:    "global",
+			Action:   action,
+			Paths:    previewPaths,
+		})
+		if err != nil {
+			writeError(w, mutationStatus(http.StatusConflict, err), err.Error())
+			return
+		}
+		defer lease.Close()
+		if req.Reset {
+			if err := lease.checkDeletion(path); err != nil {
+				writeError(w, mutationStatus(http.StatusConflict, err), err.Error())
+				return
+			}
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 				writeError(w, http.StatusInternalServerError, fmt.Sprintf("恢复默认指令失败: %v", err))
 				return
 			}
 		} else {
-			trimmed := strings.TrimSpace(req.Content)
-			if trimmed == "" {
-				writeError(w, http.StatusBadRequest, "护栏指令内容不能为空")
+			if err := lease.checkNewContent(path, []byte(newText)); err != nil {
+				writeError(w, mutationStatus(http.StatusConflict, err), err.Error())
 				return
 			}
-			if err := writeFileAtomic(path, []byte(trimmed+"\n"), 0o644); err != nil {
+			if err := writeFileAtomic(path, []byte(newText), 0o644); err != nil {
 				writeError(w, http.StatusInternalServerError, fmt.Sprintf("保存共享护栏指令失败: %v", err))
 				return
 			}
@@ -839,8 +1428,11 @@ func (s *Server) handleSharedSkill(w http.ResponseWriter, r *http.Request) {
 				if !sk.Configured {
 					continue
 				}
-				if _, _, err := s.applySkillTarget(home, sk, "install"); err == nil {
+				if _, _, err := s.applySkillTarget(home, sk, "install", lease); err == nil {
 					synced = append(synced, sk.ConfigPath)
+				} else {
+					writeError(w, mutationStatus(http.StatusConflict, err), err.Error())
+					return
 				}
 			}
 		}
@@ -1034,6 +1626,7 @@ func (s *Server) handlePreviewAgent(w http.ResponseWriter, r *http.Request) {
 	var combined []string
 	var paths []string
 	baseHashes := make(map[string]string, 2)
+	newHashes := make(map[string]string, 2)
 	var anyChanges, anyBackup bool
 	var backupAt string
 
@@ -1046,6 +1639,7 @@ func (s *Server) handlePreviewAgent(w http.ResponseWriter, r *http.Request) {
 		diffs = append(diffs, d)
 		paths = append(paths, d.ConfigPath)
 		baseHashes[d.ConfigPath] = d.BaseSHA256
+		newHashes[d.ConfigPath] = d.NewSHA256
 		if d.HasChanges {
 			anyChanges = true
 		}
@@ -1068,6 +1662,7 @@ func (s *Server) handlePreviewAgent(w http.ResponseWriter, r *http.Request) {
 		diffs = append(diffs, d)
 		paths = append(paths, d.ConfigPath)
 		baseHashes[d.ConfigPath] = d.BaseSHA256
+		newHashes[d.ConfigPath] = d.NewSHA256
 		if d.HasChanges {
 			anyChanges = true
 		}
@@ -1082,6 +1677,19 @@ func (s *Server) handlePreviewAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	rec, err := s.createPreview(previewRecord{
+		Kind:      "agent",
+		TargetID:  prof.ID,
+		Project:   project,
+		Scope:     prof.Scope,
+		Action:    action,
+		Paths:     baseHashes,
+		NewHashes: newHashes,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":          true,
 		"kind":        "agent",
@@ -1093,6 +1701,9 @@ func (s *Server) handlePreviewAgent(w http.ResponseWriter, r *http.Request) {
 		"action":      action,
 		"config_path": strings.Join(paths, " + "),
 		"base_hashes": baseHashes,
+		"new_hashes":  newHashes,
+		"preview_id":  rec.ID,
+		"expires_at":  rec.ExpiresAt.UTC().Format(time.RFC3339),
 		"has_changes": anyChanges,
 		"has_backup":  anyBackup,
 		"backup_at":   backupAt,
@@ -1110,6 +1721,7 @@ func (s *Server) handleToggleAgent(w http.ResponseWriter, r *http.Request) {
 		AgentID        string            `json:"agent_id"`
 		Project        string            `json:"project"`
 		Enable         *bool             `json:"enable"`
+		PreviewID      string            `json:"preview_id"`
 		Confirmed      bool              `json:"confirmed"`
 		ExpectedHashes map[string]string `json:"expected_hashes,omitempty"`
 	}
@@ -1132,8 +1744,8 @@ func (s *Server) handleToggleAgent(w http.ResponseWriter, r *http.Request) {
 	if req.Enable != nil {
 		enable = *req.Enable
 	}
-	if prof.Scope == "global" && !req.Confirmed {
-		writeError(w, http.StatusBadRequest, "修改全局 Agent 配置前必须先预览 Diff 并确认")
+	if !req.Confirmed || strings.TrimSpace(req.PreviewID) == "" {
+		writeError(w, http.StatusConflict, ErrPreviewRequired.Error())
 		return
 	}
 	var expectedPaths []string
@@ -1143,19 +1755,30 @@ func (s *Server) handleToggleAgent(w http.ResponseWriter, r *http.Request) {
 	if prof.SkillTarget != nil {
 		expectedPaths = append(expectedPaths, prof.SkillTarget.ConfigPath)
 	}
-	if err := verifyExpectedHashes(req.ExpectedHashes, expectedPaths...); err != nil {
-		writeError(w, http.StatusConflict, err.Error())
-		return
-	}
 
 	action := "restore"
 	if enable {
 		action = "install"
 	}
+	lease, err := s.beginApply(req.PreviewID, previewExpectation{
+		Kind:           "agent",
+		TargetID:       prof.ID,
+		Project:        project,
+		Scope:          prof.Scope,
+		Action:         action,
+		Paths:          expectedPaths,
+		ExpectedHashes: req.ExpectedHashes,
+	})
+	if err != nil {
+		writeError(w, mutationStatus(http.StatusConflict, err), err.Error())
+		return
+	}
+	defer lease.Close()
+
 	results := make([]map[string]any, 0, 2)
 	wroteMCP := false
 	if prof.MCPTarget != nil {
-		res, status, err := s.applyMCPTarget(*prof.MCPTarget, project, action)
+		res, status, err := s.applyMCPTarget(*prof.MCPTarget, project, action, lease)
 		if err != nil {
 			writeError(w, status, err.Error())
 			return
@@ -1164,10 +1787,10 @@ func (s *Server) handleToggleAgent(w http.ResponseWriter, r *http.Request) {
 		results = append(results, res)
 	}
 	if prof.SkillTarget != nil {
-		res, status, err := s.applySkillTarget(home, *prof.SkillTarget, action)
+		res, status, err := s.applySkillTarget(home, *prof.SkillTarget, action, lease)
 		if err != nil {
 			if wroteMCP && action == "install" && prof.MCPTarget != nil {
-				_, _, _ = s.applyMCPTarget(*prof.MCPTarget, project, "restore")
+				_, _, _ = s.applyMCPTarget(*prof.MCPTarget, project, "restore", nil)
 			}
 			writeError(w, status, err.Error())
 			return

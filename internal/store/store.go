@@ -20,7 +20,7 @@ import (
 
 const (
 	driverName     = "sqlite"
-	schemaVersion  = 4
+	schemaVersion  = 5
 	defaultDirName = ".slopguard"
 	defaultDBName  = "slopguard.db"
 )
@@ -168,6 +168,7 @@ type migration struct {
 	preStatements []string
 	columns       []columnMigration
 	statements    []string
+	postFunc      func(ctx context.Context, tx *sql.Tx) error
 }
 
 var migrations = []migration{
@@ -277,6 +278,29 @@ var migrations = []migration{
 				ON rules(scope, project_path, engine, LOWER(rule_key))`,
 		},
 	},
+	{
+		version: 5,
+		preStatements: []string{
+			`CREATE TABLE IF NOT EXISTS project_path_migrations (
+				table_name TEXT NOT NULL,
+				row_id TEXT NOT NULL,
+				old_path TEXT NOT NULL,
+				new_path TEXT NOT NULL DEFAULT '',
+				status TEXT NOT NULL,
+				detail TEXT NOT NULL DEFAULT '',
+				created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				PRIMARY KEY (table_name, row_id, old_path)
+			)`,
+			`CREATE TABLE IF NOT EXISTS project_path_migration_backup (
+				table_name TEXT NOT NULL,
+				row_id TEXT NOT NULL,
+				old_path TEXT NOT NULL,
+				backed_up_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				PRIMARY KEY (table_name, row_id, old_path)
+			)`,
+		},
+		postFunc: normalizeHistoricalProjectPathsTx,
+	},
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -317,6 +341,12 @@ func (s *Store) migrate(ctx context.Context) error {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
 				_ = tx.Rollback()
 				return fmt.Errorf("store: apply migration %d: %w", m.version, err)
+			}
+		}
+		if m.postFunc != nil {
+			if err := m.postFunc(ctx, tx); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("store: apply migration %d post step: %w", m.version, err)
 			}
 		}
 		if _, err := tx.ExecContext(ctx,

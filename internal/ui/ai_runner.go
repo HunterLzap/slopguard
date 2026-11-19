@@ -745,11 +745,11 @@ func parseAgentAnalysisOutput(raw []byte) ([]AIAnalysisItem, error) {
 	}
 
 	var envelope struct {
-		Status           string          `json:"status"`
-		Error            string          `json:"error"`
-		StructuredOutput json.RawMessage `json:"structured_output"`
-		Response         string          `json:"response"`
-		Result           string          `json:"result"`
+		Status           string           `json:"status"`
+		Error            string           `json:"error"`
+		StructuredOutput json.RawMessage  `json:"structured_output"`
+		Response         string           `json:"response"`
+		Result           string           `json:"result"`
 		Items            []AIAnalysisItem `json:"items"`
 	}
 	if err := json.Unmarshal(trimmed, &envelope); err == nil {

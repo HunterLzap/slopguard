@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -53,12 +54,19 @@ func TestUnifiedDiffAndBackupRestore(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b1, _, err := ensureBackup(backupsDir, "mcp", "claude", existingPath)
+	b1, firstRec, err := ensureBackup(backupsDir, "mcp", "claude", existingPath)
 	if err != nil {
 		t.Fatalf("first ensureBackup: %v", err)
 	}
-	if err := os.WriteFile(existingPath, []byte("{\"existing\": false}\n"), 0o644); err != nil {
+	if firstRec.OriginalSHA256 != fileSHA256Hex(original) {
+		t.Fatalf("first backup original sha = %q, want %q", firstRec.OriginalSHA256, fileSHA256Hex(original))
+	}
+	installed := []byte("{\"existing\": false}\n")
+	if err := os.WriteFile(existingPath, installed, 0o644); err != nil {
 		t.Fatal(err)
+	}
+	if err := recordBackupInstalled(backupsDir, backupTarget{Kind: "mcp", ID: "claude", Path: existingPath}, installed, 0o644); err != nil {
+		t.Fatalf("record installed snapshot: %v", err)
 	}
 	// Second ensureBackup must preserve original backup contents, not overwrite it.
 	b2, rec, err := ensureBackup(backupsDir, "mcp", "claude", existingPath)
@@ -67,6 +75,9 @@ func TestUnifiedDiffAndBackupRestore(t *testing.T) {
 	}
 	if b1 != b2 || string(rec.OriginalBytes) != string(original) {
 		t.Fatalf("backup overwritten: b1=%s b2=%s rec=%q", b1, b2, rec.OriginalBytes)
+	}
+	if rec.InstalledSHA256 != fileSHA256Hex(installed) {
+		t.Fatalf("installed sha = %q, want %q", rec.InstalledSHA256, fileSHA256Hex(installed))
 	}
 
 	restored, removed, err := restoreFromBackup(backupsDir, "mcp", "claude", existingPath)
@@ -83,8 +94,12 @@ func TestUnifiedDiffAndBackupRestore(t *testing.T) {
 	if _, _, err := ensureBackup(backupsDir, "skill", "project_claude_skill", newSkillPath); err != nil {
 		t.Fatalf("ensureBackup new file: %v", err)
 	}
-	if err := writeFileAtomic(newSkillPath, []byte("# skill\n"), 0o644); err != nil {
+	newSkillContent := []byte("# skill\n")
+	if err := writeFileAtomic(newSkillPath, newSkillContent, 0o644); err != nil {
 		t.Fatal(err)
+	}
+	if err := recordBackupInstalled(backupsDir, backupTarget{Kind: "skill", ID: "project_claude_skill", Path: newSkillPath}, newSkillContent, 0o644); err != nil {
+		t.Fatalf("record installed skill snapshot: %v", err)
 	}
 	restored, removed, err = restoreFromBackup(backupsDir, "skill", "project_claude_skill", newSkillPath)
 	if err != nil || !restored || !removed {
@@ -146,26 +161,41 @@ func TestMCPClientsPriorityPreviewInstallRestore(t *testing.T) {
 	if prevJSON["has_changes"] != true || !strings.Contains(diffText, `"slopguard"`) {
 		t.Fatalf("preview diff missing slopguard: %v", prevJSON)
 	}
+	previewID, _ := prevJSON["preview_id"].(string)
+	if previewID == "" {
+		t.Fatalf("preview missing preview_id: %v", prevJSON)
+	}
 	afterPreview, _ := os.ReadFile(globalClaudePath)
 	if string(afterPreview) != originalClaude {
 		t.Fatalf("preview mutated disk: %s", afterPreview)
 	}
 
-	// 3. Global install without confirmed=true must fail with 400.
+	// 3. Mutations require both confirmed=true and a matching preview_id.
 	code, errBody := postDashboardJSON(t, handler, "/api/mcp-clients/install", map[string]any{
+		"client_id":  "claude_code",
+		"project":    project,
+		"preview_id": previewID,
+		"confirmed":  false,
+	})
+	if code != http.StatusConflict {
+		t.Fatalf("unconfirmed global install = %d, want 409: %s", code, errBody)
+	}
+	code, errBody = postDashboardJSON(t, handler, "/api/mcp-clients/install", map[string]any{
 		"client_id": "claude_code",
 		"project":   project,
-		"confirmed": false,
+		"confirmed": true,
 	})
-	if code != http.StatusBadRequest {
-		t.Fatalf("unconfirmed global install = %d, want 400: %s", code, errBody)
+	if code != http.StatusConflict {
+		t.Fatalf("install without preview_id = %d, want 409: %s", code, errBody)
 	}
 
 	// 4. Global install with confirmed=true writes slopguard while preserving other servers + backup.
 	code, instBody := postDashboardJSON(t, handler, "/api/mcp-clients/install", map[string]any{
-		"client_id": "claude_code",
-		"project":   project,
-		"confirmed": true,
+		"client_id":       "claude_code",
+		"project":         project,
+		"preview_id":      previewID,
+		"confirmed":       true,
+		"expected_hashes": prevJSON["base_hashes"],
 	})
 	if code != http.StatusOK {
 		t.Fatalf("confirmed global install = %d: %s", code, instBody)
@@ -176,9 +206,22 @@ func TestMCPClientsPriorityPreviewInstallRestore(t *testing.T) {
 	}
 
 	// 5. Restore should revert exact original contents.
-	code, restBody := postDashboardJSON(t, handler, "/api/mcp-clients/restore", map[string]any{
+	_, restorePrevBody := postDashboardJSON(t, handler, "/api/mcp-clients/preview", map[string]any{
 		"client_id": "claude_code",
 		"project":   project,
+		"action":    "restore",
+	})
+	restorePrev := decodeDashboardJSON(t, restorePrevBody)
+	restoreID, _ := restorePrev["preview_id"].(string)
+	if restoreID == "" {
+		t.Fatalf("restore preview missing preview_id: %v", restorePrev)
+	}
+	code, restBody := postDashboardJSON(t, handler, "/api/mcp-clients/restore", map[string]any{
+		"client_id":       "claude_code",
+		"project":         project,
+		"preview_id":      restoreID,
+		"confirmed":       true,
+		"expected_hashes": restorePrev["base_hashes"],
 	})
 	if code != http.StatusOK {
 		t.Fatalf("restore = %d: %s", code, restBody)
@@ -219,15 +262,21 @@ func TestSkillTargetsPreviewInstallRestore(t *testing.T) {
 	if prevJSON["has_changes"] != true || !strings.Contains(fmtStr(prevJSON["diff"]), "sg_verify") {
 		t.Fatalf("unexpected skill preview = %v", prevJSON)
 	}
+	previewID, _ := prevJSON["preview_id"].(string)
+	if previewID == "" {
+		t.Fatalf("skill preview missing preview_id: %v", prevJSON)
+	}
 	if _, err := os.Stat(skillPath); !os.IsNotExist(err) {
 		t.Fatalf("preview created file unexpectedly")
 	}
 
 	// Install project skill.
 	code, instBody := postDashboardJSON(t, handler, "/api/skills/install", map[string]any{
-		"target_id": "project_claude_skill",
-		"project":   project,
-		"confirmed": true,
+		"target_id":       "project_claude_skill",
+		"project":         project,
+		"preview_id":      previewID,
+		"confirmed":       true,
+		"expected_hashes": prevJSON["base_hashes"],
 	})
 	if code != http.StatusOK {
 		t.Fatalf("skill install = %d: %s", code, instBody)
@@ -237,9 +286,22 @@ func TestSkillTargetsPreviewInstallRestore(t *testing.T) {
 	}
 
 	// Restore removes newly created skill file cleanly.
-	code, restBody := postDashboardJSON(t, handler, "/api/skills/restore", map[string]any{
+	_, restorePrevBody := postDashboardJSON(t, handler, "/api/skills/preview", map[string]any{
 		"target_id": "project_claude_skill",
 		"project":   project,
+		"action":    "restore",
+	})
+	restorePrev := decodeDashboardJSON(t, restorePrevBody)
+	restoreID, _ := restorePrev["preview_id"].(string)
+	if restoreID == "" {
+		t.Fatalf("skill restore preview missing preview_id: %v", restorePrev)
+	}
+	code, restBody := postDashboardJSON(t, handler, "/api/skills/restore", map[string]any{
+		"target_id":       "project_claude_skill",
+		"project":         project,
+		"preview_id":      restoreID,
+		"confirmed":       true,
+		"expected_hashes": restorePrev["base_hashes"],
 	})
 	if code != http.StatusOK {
 		t.Fatalf("skill restore = %d: %s", code, restBody)
@@ -283,11 +345,17 @@ func TestGuardToggleGitHookAndDebounceWatcher(t *testing.T) {
 	handler := authedTestHandler(s)
 
 	// 1. Enable guard + hook and verify existing post-commit content is preserved.
+	hookPreview := mustPreview(t, handler, "/api/guard/hook/preview", map[string]any{
+		"project":      project,
+		"hook_enabled": true,
+	})
 	code, body := postDashboardJSON(t, handler, "/api/guard/toggle", map[string]any{
 		"project":      project,
 		"enabled":      true,
 		"hook_enabled": true,
 		"debounce_sec": 1,
+		"preview_id":   previewIDOf(t, hookPreview),
+		"confirmed":    true,
 	})
 	if code != http.StatusOK {
 		t.Fatalf("guard toggle on = %d: %s", code, body)
@@ -330,9 +398,15 @@ func TestGuardToggleGitHookAndDebounceWatcher(t *testing.T) {
 	}
 
 	// 3. Uninstall hook and verify original hook restored verbatim.
+	hookOffPreview := mustPreview(t, handler, "/api/guard/hook/preview", map[string]any{
+		"project":      project,
+		"hook_enabled": false,
+	})
 	code, body = postDashboardJSON(t, handler, "/api/guard/toggle", map[string]any{
 		"project":      project,
 		"hook_enabled": false,
+		"preview_id":   previewIDOf(t, hookOffPreview),
+		"confirmed":    true,
 	})
 	if code != http.StatusOK {
 		t.Fatalf("guard toggle hook off = %d: %s", code, body)
@@ -496,6 +570,24 @@ func jsonQuote(s string) string {
 	return string(b)
 }
 
+func mustPreview(t *testing.T, handler http.Handler, path string, payload map[string]any) map[string]any {
+	t.Helper()
+	code, body := postDashboardJSON(t, handler, path, payload)
+	if code != http.StatusOK {
+		t.Fatalf("POST %s = %d: %s", path, code, body)
+	}
+	return decodeDashboardJSON(t, body)
+}
+
+func previewIDOf(t *testing.T, preview map[string]any) string {
+	t.Helper()
+	id, _ := preview["preview_id"].(string)
+	if id == "" {
+		t.Fatalf("preview missing preview_id: %v", preview)
+	}
+	return id
+}
+
 func TestSharedSkillAndUnifiedAgentsWorkflow(t *testing.T) {
 	home := t.TempDir()
 	db := openDashboardStore(t)
@@ -525,36 +617,41 @@ func TestSharedSkillAndUnifiedAgentsWorkflow(t *testing.T) {
 
 	// 2. Customize shared skill before enabling Antigravity.
 	customDoc := "# SlopGuard Custom Guardrail\n\nAlways run sg_verify and sg_submit_analysis.\n"
+	sharedPreview := mustPreview(t, handler, "/api/shared-skill/preview", map[string]any{
+		"content":      customDoc,
+		"sync_enabled": true,
+		"project":      project,
+	})
 	cCode, cBody := postDashboardJSON(t, handler, "/api/shared-skill", map[string]any{
 		"content":      customDoc,
 		"sync_enabled": true,
 		"project":      project,
+		"preview_id":   previewIDOf(t, sharedPreview),
+		"confirmed":    true,
 	})
 	if cCode != http.StatusOK {
 		t.Fatalf("POST /api/shared-skill = %d: %s", cCode, cBody)
 	}
 
-	// 3. Global agent toggle rejects unconfirmed mutation.
-	unCode, _ := postDashboardJSON(t, handler, "/api/agents/toggle", map[string]any{
-		"agent_id":  "antigravity",
-		"project":   project,
-		"enable":    true,
-		"confirmed": false,
-	})
-	if unCode != http.StatusBadRequest {
-		t.Fatalf("expected 400 without confirmation for global agent, got %d", unCode)
-	}
-
-	// 4. Preview returns combined diff without touching disk.
-	pCode, pBody := postDashboardJSON(t, handler, "/api/agents/preview", map[string]any{
+	// 3. Global agent toggle rejects missing confirmation even with a valid preview.
+	agentPreview := mustPreview(t, handler, "/api/agents/preview", map[string]any{
 		"agent_id": "antigravity",
 		"project":  project,
 		"action":   "install",
 	})
-	if pCode != http.StatusOK {
-		t.Fatalf("POST /api/agents/preview = %d: %s", pCode, pBody)
+	unCode, _ := postDashboardJSON(t, handler, "/api/agents/toggle", map[string]any{
+		"agent_id":   "antigravity",
+		"project":    project,
+		"enable":     true,
+		"preview_id": previewIDOf(t, agentPreview),
+		"confirmed":  false,
+	})
+	if unCode != http.StatusConflict {
+		t.Fatalf("expected 409 without confirmation for global agent, got %d", unCode)
 	}
-	pJSON := decodeDashboardJSON(t, pBody)
+
+	// 4. Preview returns combined diff without touching disk.
+	pJSON := agentPreview
 	if pJSON["has_changes"] != true || !strings.Contains(fmtStr(pJSON["diff"]), "SlopGuard Custom Guardrail") {
 		t.Fatalf("unexpected agent preview: %v", pJSON)
 	}
@@ -564,10 +661,12 @@ func TestSharedSkillAndUnifiedAgentsWorkflow(t *testing.T) {
 
 	// 5. Confirmed toggle enables both MCP + custom shared Skill, preserving custom MCP.
 	tCode, tBody := postDashboardJSON(t, handler, "/api/agents/toggle", map[string]any{
-		"agent_id":  "antigravity",
-		"project":   project,
-		"enable":    true,
-		"confirmed": true,
+		"agent_id":        "antigravity",
+		"project":         project,
+		"enable":          true,
+		"preview_id":      previewIDOf(t, agentPreview),
+		"confirmed":       true,
+		"expected_hashes": agentPreview["base_hashes"],
 	})
 	if tCode != http.StatusOK {
 		t.Fatalf("POST /api/agents/toggle enable = %d: %s", tCode, tBody)
@@ -599,10 +698,17 @@ func TestSharedSkillAndUnifiedAgentsWorkflow(t *testing.T) {
 	}
 
 	// 7. Resetting shared skill syncs back default text to already-enabled agent.
+	resetPreview := mustPreview(t, handler, "/api/shared-skill/preview", map[string]any{
+		"reset":        true,
+		"sync_enabled": true,
+		"project":      project,
+	})
 	rCode, rBody := postDashboardJSON(t, handler, "/api/shared-skill", map[string]any{
 		"reset":        true,
 		"sync_enabled": true,
 		"project":      project,
+		"preview_id":   previewIDOf(t, resetPreview),
+		"confirmed":    true,
 	})
 	if rCode != http.StatusOK {
 		t.Fatalf("reset shared skill = %d: %s", rCode, rBody)
@@ -617,11 +723,18 @@ func TestSharedSkillAndUnifiedAgentsWorkflow(t *testing.T) {
 	}
 
 	// 8. Disabling antigravity restores original MCP config and removes created skill file.
+	disablePreview := mustPreview(t, handler, "/api/agents/preview", map[string]any{
+		"agent_id": "antigravity",
+		"project":  project,
+		"action":   "restore",
+	})
 	dCode, dBody := postDashboardJSON(t, handler, "/api/agents/toggle", map[string]any{
-		"agent_id":  "antigravity",
-		"project":   project,
-		"enable":    false,
-		"confirmed": true,
+		"agent_id":        "antigravity",
+		"project":         project,
+		"enable":          false,
+		"preview_id":      previewIDOf(t, disablePreview),
+		"confirmed":       true,
+		"expected_hashes": disablePreview["base_hashes"],
 	})
 	if dCode != http.StatusOK {
 		t.Fatalf("POST /api/agents/toggle disable = %d: %s", dCode, dBody)
@@ -863,10 +976,16 @@ func TestParseAgentAnalysisOutputAndCodexTOMLVerify(t *testing.T) {
 	handler := authedTestHandler(s)
 
 	// Enable Codex (MCP TOML + Skill).
+	codexPreview := mustPreview(t, handler, "/api/agents/preview", map[string]any{
+		"agent_id": "codex",
+		"action":   "install",
+	})
 	cCode, cBody := postDashboardJSON(t, handler, "/api/agents/toggle", map[string]any{
-		"agent_id":  "codex",
-		"enable":    true,
-		"confirmed": true,
+		"agent_id":        "codex",
+		"enable":          true,
+		"preview_id":      previewIDOf(t, codexPreview),
+		"confirmed":       true,
+		"expected_hashes": codexPreview["base_hashes"],
 	})
 	if cCode != http.StatusOK {
 		t.Fatalf("toggle codex on = %d: %s", cCode, cBody)
@@ -897,10 +1016,16 @@ func TestParseAgentAnalysisOutputAndCodexTOMLVerify(t *testing.T) {
 	}
 
 	// Restore Codex reverts TOML cleanly.
+	codexOffPreview := mustPreview(t, handler, "/api/agents/preview", map[string]any{
+		"agent_id": "codex",
+		"action":   "restore",
+	})
 	rCode, rBody := postDashboardJSON(t, handler, "/api/agents/toggle", map[string]any{
-		"agent_id":  "codex",
-		"enable":    false,
-		"confirmed": true,
+		"agent_id":        "codex",
+		"enable":          false,
+		"preview_id":      previewIDOf(t, codexOffPreview),
+		"confirmed":       true,
+		"expected_hashes": codexOffPreview["base_hashes"],
 	})
 	if rCode != http.StatusOK {
 		t.Fatalf("toggle codex off = %d: %s", rCode, rBody)
@@ -933,7 +1058,7 @@ func TestP0AgentTrustEnvWhitelistAndAISafety(t *testing.T) {
 	// P0-02: Untrusted MCP command or invalid args must fail verification without executing.
 	markerPath := filepath.Join(home, "pwned.marker")
 	writeDashboardFile(t, filepath.Join(home, ".cursor", "mcp.json"),
-		`{"mcpServers":{"slopguard":{"command":"/bin/sh","args":["-c","touch `+markerPath+`"]}}}`)
+		`{"mcpServers":{"slopguard":{"command":"/bin/sh","args":["-c",`+jsonQuote("touch "+markerPath)+`]}}}`)
 	writeDashboardFile(t, filepath.Join(home, ".codex", "config.toml"),
 		"[mcp_servers.slopguard]\ncommand = \"/bin/echo\"\nargs = [\"mcp\"]\n")
 
@@ -1041,12 +1166,17 @@ func TestP0SafeUninstallBackupPermissionsConflictAndTOML(t *testing.T) {
 	if len(baseHashes) == 0 {
 		t.Fatalf("expected non-empty base_hashes in preview: %v", pJSON)
 	}
+	previewID, _ := pJSON["preview_id"].(string)
+	if previewID == "" {
+		t.Fatalf("preview missing preview_id: %v", pJSON)
+	}
 	if err := os.WriteFile(claudePath, []byte(`{"mcpServers":{"other":{"command":"echo"},"racing":{}}}`+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	conflictCode, _ := postDashboardJSON(t, handler, "/api/agents/toggle", map[string]any{
 		"agent_id":        "claude_code",
 		"enable":          true,
+		"preview_id":      previewID,
 		"confirmed":       true,
 		"expected_hashes": baseHashes,
 	})
@@ -1060,24 +1190,43 @@ func TestP0SafeUninstallBackupPermissionsConflictAndTOML(t *testing.T) {
 		"action":   "install",
 	})
 	pJSON2 := decodeDashboardJSON(t, pBody2)
+	previewID2, _ := pJSON2["preview_id"].(string)
+	if previewID2 == "" {
+		t.Fatalf("second preview missing preview_id: %v", pJSON2)
+	}
 	okCode, okBody := postDashboardJSON(t, handler, "/api/agents/toggle", map[string]any{
 		"agent_id":        "claude_code",
 		"enable":          true,
+		"preview_id":      previewID2,
 		"confirmed":       true,
 		"expected_hashes": pJSON2["base_hashes"],
 	})
 	if okCode != http.StatusOK {
 		t.Fatalf("apply claude_code = %d: %s", okCode, okBody)
 	}
-	if dirInfo, err := os.Stat(s.backupsDir()); err != nil || dirInfo.Mode().Perm() != 0o700 {
-		t.Fatalf("backupsDir perm = %v (err=%v), want 0700", dirInfo.Mode().Perm(), err)
+	dirInfo, err := os.Stat(s.backupsDir())
+	if err != nil {
+		t.Fatalf("stat backupsDir: %v", err)
 	}
 	bPath := backupRecordPath(s.backupsDir(), "mcp", "claude_code", claudePath)
-	if bInfo, err := os.Stat(bPath); err != nil || bInfo.Mode().Perm() != 0o600 {
-		t.Fatalf("backup file perm = %v (err=%v), want 0600", bInfo.Mode().Perm(), err)
+	bInfo, err := os.Stat(bPath)
+	if err != nil {
+		t.Fatalf("stat backup file %s: %v", bPath, err)
 	}
-	if tgtInfo, err := os.Stat(claudePath); err != nil || tgtInfo.Mode().Perm() != 0o600 {
-		t.Fatalf("target ~/.claude.json perm = %v (err=%v), want preserved 0600", tgtInfo.Mode().Perm(), err)
+	tgtInfo, err := os.Stat(claudePath)
+	if err != nil {
+		t.Fatalf("stat target %s: %v", claudePath, err)
+	}
+	if runtime.GOOS != "windows" {
+		if dirInfo.Mode().Perm() != 0o700 {
+			t.Fatalf("backupsDir perm = %v, want 0700", dirInfo.Mode().Perm())
+		}
+		if bInfo.Mode().Perm() != 0o600 {
+			t.Fatalf("backup file perm = %v, want 0600", bInfo.Mode().Perm())
+		}
+		if tgtInfo.Mode().Perm() != 0o600 {
+			t.Fatalf("target ~/.claude.json perm = %v, want preserved 0600", tgtInfo.Mode().Perm())
+		}
 	}
 
 	// 3. Another tool adds "postgres" AFTER SlopGuard install; disabling SlopGuard must NOT wipe "postgres"!
@@ -1093,10 +1242,16 @@ func TestP0SafeUninstallBackupPermissionsConflictAndTOML(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	offPreview := mustPreview(t, handler, "/api/agents/preview", map[string]any{
+		"agent_id": "claude_code",
+		"action":   "restore",
+	})
 	offCode, offBody := postDashboardJSON(t, handler, "/api/agents/toggle", map[string]any{
-		"agent_id":  "claude_code",
-		"enable":    false,
-		"confirmed": true,
+		"agent_id":        "claude_code",
+		"enable":          false,
+		"preview_id":      previewIDOf(t, offPreview),
+		"confirmed":       true,
+		"expected_hashes": offPreview["base_hashes"],
 	})
 	if offCode != http.StatusOK {
 		t.Fatalf("disable claude_code = %d: %s", offCode, offBody)
@@ -1118,13 +1273,12 @@ func TestP0SafeUninstallBackupPermissionsConflictAndTOML(t *testing.T) {
 	if err := writeFileAtomic(corruptBak, []byte(`{not valid json`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cOffCode, _ := postDashboardJSON(t, handler, "/api/agents/toggle", map[string]any{
-		"agent_id":  "cursor",
-		"enable":    false,
-		"confirmed": true,
+	cOffCode, cOffBody := postDashboardJSON(t, handler, "/api/agents/preview", map[string]any{
+		"agent_id": "cursor",
+		"action":   "restore",
 	})
 	if cOffCode == http.StatusOK {
-		t.Fatalf("expected error on corrupt backup record, got 200")
+		t.Fatalf("expected error on corrupt backup record, got 200: %s", cOffBody)
 	}
 
 	// 5. Invalid non-object mcpServers JSON type must be rejected rather than overwritten.

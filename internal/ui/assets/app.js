@@ -1415,7 +1415,9 @@
     const isRestore = preview.action === "restore";
     const kindLabel = preview.kind === "agent"
       ? "Agent 接入（MCP + 护栏规则）"
-      : preview.kind === "skill" ? "Skill / 规则" : "MCP 配置";
+      : preview.kind === "skill" ? "Skill / 规则"
+        : preview.kind === "shared_skill" ? "共享护栏指令"
+          : preview.kind === "guard_hook" ? "Git Hook" : "MCP 配置";
     $("diff-preview-title").textContent = isRestore
       ? `预览撤销 / 还原 ${kindLabel}：${preview.name || preview.agent_id || preview.target_id}`
       : `预览写入 ${kindLabel}：${preview.name || preview.agent_id || preview.target_id}`;
@@ -1458,22 +1460,13 @@
   }
 
   async function applyAgentToggleDirect(agent, enable, checkbox) {
+    // Kept as a thin compatibility wrapper: all agent mutations now go through
+    // the same preview + preview_id confirmation path.
     if (checkbox) checkbox.disabled = true;
     try {
-      await api("/api/agents/toggle", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          agent_id: agent.id,
-          project: state.project || "",
-          enable: Boolean(enable),
-          confirmed: true,
-        }),
-      });
-      await loadAgents();
-      renderOnboardingCard();
+      await previewAgentChange(agent, enable ? "install" : "restore");
     } catch (error) {
-      alert(`操作失败：${error.message}`);
+      alert(`预览失败：${error.message}`);
       await loadAgents();
     } finally {
       if (checkbox) checkbox.disabled = false;
@@ -1499,8 +1492,33 @@
             agent_id: preview.agent_id,
             project: boundProject,
             enable: !isRestore,
+            preview_id: preview.preview_id,
             confirmed: true,
             expected_hashes: preview.base_hashes || undefined,
+          }),
+        });
+      } else if (preview.kind === "shared_skill") {
+        await api("/api/shared-skill", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            content: preview.reset ? "" : (preview.content || ""),
+            reset: Boolean(preview.reset),
+            sync_enabled: preview.sync_enabled !== false,
+            project: boundProject,
+            preview_id: preview.preview_id,
+            confirmed: true,
+          }),
+        });
+      } else if (preview.kind === "guard_hook") {
+        await api("/api/guard/toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            project: boundProject,
+            hook_enabled: !isRestore,
+            preview_id: preview.preview_id,
+            confirmed: true,
           }),
         });
       } else {
@@ -1514,6 +1532,7 @@
             client_id: preview.client_id || preview.target_id,
             target_id: preview.target_id || preview.client_id,
             project: boundProject,
+            preview_id: preview.preview_id,
             confirmed: true,
             expected_hashes: preview.base_hashes || undefined,
           }),
@@ -1814,7 +1833,7 @@
     if (saveBtn) saveBtn.disabled = true;
     if (resetBtn) resetBtn.disabled = true;
     try {
-      const res = await api("/api/shared-skill", {
+      const preview = await api("/api/shared-skill/preview", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1824,18 +1843,12 @@
           project: state.project || "",
         }),
       });
-      if (editor && res.content !== undefined) {
-        editor.value = res.content;
-      }
-      const syncedCount = Array.isArray(res.synced) ? res.synced.length : 0;
-      if (feedback) {
-        feedback.textContent = reset
-          ? `已恢复默认模板${syncedCount ? `并同步 ${syncedCount} 处规则文件` : ""}`
-          : `已保存自定义指令${syncedCount ? `并同步 ${syncedCount} 处规则文件` : ""}`;
-      }
-      await loadAgents();
+      preview.project = state.project || "";
+      preview.reset = reset;
+      openDiffModal(preview);
+      if (feedback) feedback.textContent = "已生成 Diff 预览，请在弹窗中确认写入。";
     } catch (error) {
-      if (feedback) feedback.textContent = `保存失败：${error.message}`;
+      if (feedback) feedback.textContent = `预览失败：${error.message}`;
     } finally {
       if (saveBtn) saveBtn.disabled = false;
       if (resetBtn) resetBtn.disabled = false;
@@ -2013,6 +2026,16 @@
     const switches = [$("guard-master-switch"), $("guard-watch-switch"), $("guard-hook-switch")].filter(Boolean);
     switches.forEach((s) => { s.disabled = true; });
     try {
+      if (Object.prototype.hasOwnProperty.call(patch, "hook_enabled")) {
+        const preview = await api("/api/guard/hook/preview", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ project: state.project, hook_enabled: Boolean(patch.hook_enabled) }),
+        });
+        preview.project = state.project;
+        openDiffModal(preview);
+        return;
+      }
       await api("/api/guard/toggle", {
         method: "POST",
         headers: { "Content-Type": "application/json" },

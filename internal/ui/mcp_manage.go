@@ -423,10 +423,39 @@ func isSkillConfigured(path string) bool {
 	return strings.Contains(text, "SlopGuard") && strings.Contains(text, "sg_verify")
 }
 
-func renderSkillContent(targetID string) string {
+func sharedSkillPath(home string) string {
+	home = strings.TrimSpace(home)
+	if home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".slopguard", "shared-skill.md")
+}
+
+func defaultSharedSkillContent() string {
 	doc := strings.TrimSpace(skills.Doc)
 	if doc == "" {
-		doc = "# SlopGuard\n\nUse sg_verify before finishing edits.\n"
+		doc = "# SlopGuard\n\nUse sg_verify before finishing edits."
+	}
+	return doc + "\n"
+}
+
+func loadSharedSkill(home string) (content string, isCustom bool, updatedAt string) {
+	path := sharedSkillPath(home)
+	if path != "" {
+		if info, err := os.Stat(path); err == nil {
+			if data, readErr := os.ReadFile(path); readErr == nil && strings.TrimSpace(string(data)) != "" {
+				return strings.TrimSpace(string(data)) + "\n", true, info.ModTime().UTC().Format(time.RFC3339)
+			}
+		}
+	}
+	return defaultSharedSkillContent(), false, ""
+}
+
+func renderSkillContent(home, targetID string) string {
+	doc, _, _ := loadSharedSkill(home)
+	doc = strings.TrimSpace(doc)
+	if doc == "" {
+		doc = "# SlopGuard\n\nUse sg_verify before finishing edits."
 	}
 	if targetID == "project_cursor_rule" {
 		if strings.HasPrefix(doc, "---\n") {
@@ -438,6 +467,94 @@ func renderSkillContent(targetID string) string {
 		return doc + "\n"
 	}
 	return "---\nname: slopguard\ndescription: SlopGuard deterministic code-quality guardrail MCP workflow and mistake inbox analysis guide.\n---\n\n" + doc + "\n"
+}
+
+type agentProfile struct {
+	ID           string             `json:"id"`
+	Name         string             `json:"name"`
+	Badge        string             `json:"badge"`
+	Scope        string             `json:"scope"`
+	Recommended  bool               `json:"recommended"`
+	Detected     bool               `json:"detected"`
+	Enabled      bool               `json:"enabled"`
+	Partial      bool               `json:"partial"`
+	HasBackup    bool               `json:"has_backup"`
+	NeedsProject bool               `json:"needs_project"`
+	PrimaryPath  string             `json:"primary_path"`
+	Note         string             `json:"note,omitempty"`
+	MCPTarget    *mcpClientStatus   `json:"mcp_target,omitempty"`
+	SkillTarget  *skillTargetStatus `json:"skill_target,omitempty"`
+}
+
+func discoverAgentProfiles(home, project string) []agentProfile {
+	mcpList := discoverMCPClients(home, project)
+	skillList := discoverSkillTargets(home, project)
+
+	mcpByID := make(map[string]mcpClientStatus, len(mcpList))
+	for _, m := range mcpList {
+		mcpByID[m.ID] = m
+	}
+	skillByID := make(map[string]skillTargetStatus, len(skillList))
+	for _, sk := range skillList {
+		skillByID[sk.ID] = sk
+	}
+
+	build := func(id, name, badge, scope string, recommended bool, mcpID, skillID, note string) agentProfile {
+		prof := agentProfile{
+			ID:          id,
+			Name:        name,
+			Badge:       badge,
+			Scope:       scope,
+			Recommended: recommended,
+			Note:        note,
+		}
+		var total, configured int
+		if mcpID != "" {
+			if m, ok := mcpByID[mcpID]; ok {
+				cp := m
+				prof.MCPTarget = &cp
+				total++
+				if m.Configured {
+					configured++
+				}
+				prof.Detected = prof.Detected || m.Detected
+				prof.HasBackup = prof.HasBackup || m.HasBackup
+				if prof.PrimaryPath == "" {
+					prof.PrimaryPath = m.ConfigPath
+				}
+			}
+		}
+		if skillID != "" {
+			if sk, ok := skillByID[skillID]; ok {
+				cp := sk
+				prof.SkillTarget = &cp
+				total++
+				if sk.Configured {
+					configured++
+				}
+				prof.Detected = prof.Detected || sk.Detected
+				prof.HasBackup = prof.HasBackup || sk.HasBackup
+				if prof.PrimaryPath == "" {
+					prof.PrimaryPath = sk.ConfigPath
+				}
+			}
+		}
+		if scope == "project" && strings.TrimSpace(project) == "" {
+			prof.NeedsProject = true
+			prof.PrimaryPath = "请先在左侧选择或添加项目"
+		}
+		prof.Enabled = total > 0 && configured == total
+		prof.Partial = configured > 0 && configured < total
+		return prof
+	}
+
+	return []agentProfile{
+		build("project", "当前项目", "PR", "project", true, "project_mcp", "project_claude_skill", "推荐 · 仅作用于当前仓库（.mcp.json + Skill）"),
+		build("antigravity", "Antigravity", "AG", "global", false, "antigravity", "global_antigravity_skill", "全局 MCP + Skill 护栏规则"),
+		build("claude_code", "Claude Code", "CC", "global", false, "claude_code", "global_claude_skill", "全局 MCP + Skill 护栏规则"),
+		build("cursor", "Cursor", "CU", "global", false, "cursor", "", "全局 MCP 服务（规则可在项目内单独管理）"),
+		build("codex", "Codex", "CX", "global", false, "", "global_codex_skill", "全局 Skill 护栏规则"),
+	}
 }
 
 type diffOpKind int

@@ -88,3 +88,48 @@ func TestMCPAuditAndInboxTools(t *testing.T) {
 		t.Fatalf("pendingUser = %+v", pendingUser)
 	}
 }
+
+func TestMCPVerifyReturnsPendingInboxAndNextAction(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "slopguard.db")
+	oldOpen := openMCPStore
+	openMCPStore = func() (*store.Store, error) {
+		return store.Open(dbPath)
+	}
+	t.Cleanup(func() { openMCPStore = oldOpen })
+
+	root := t.TempDir()
+	s, err := openMCPStore()
+	if err != nil {
+		t.Fatalf("open temp store: %v", err)
+	}
+	if _, err := s.RecordMistake(context.Background(), contract.Mistake{
+		ProjectPath: root,
+		Fingerprint: "fp-verify-inbox",
+		Category:    "type",
+		Summary:     "[pyright:reportOptionalMemberAccess] None access",
+		Source:      "auto_watch",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+
+	tools := buildMCPTools(root)
+	verifyTool := findMCPTool(t, tools, "sg_verify")
+	res, err := verifyTool.Handler(context.Background(), json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("sg_verify: %v", err)
+	}
+	payload, ok := res.(mcpVerifyResponse)
+	if !ok {
+		t.Fatalf("unexpected sg_verify response type %T", res)
+	}
+	if payload.PendingInboxCount != 1 || len(payload.PendingInbox) != 1 {
+		t.Fatalf("pending inbox = count %d items %+v", payload.PendingInboxCount, payload.PendingInbox)
+	}
+	if payload.PendingInbox[0].Fingerprint != "fp-verify-inbox" {
+		t.Fatalf("pending inbox fingerprint = %q", payload.PendingInbox[0].Fingerprint)
+	}
+	if payload.NextAction == "" {
+		t.Fatalf("expected non-empty NextAction guiding sg_submit_analysis")
+	}
+}

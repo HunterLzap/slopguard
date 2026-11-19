@@ -317,6 +317,51 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"events": events})
 }
 
+type mistakeResponse struct {
+	store.MistakeRecord
+	LocalHint string `json:"local_hint,omitempty"`
+}
+
+func buildLocalMistakeHint(m store.MistakeRecord) string {
+	hay := strings.ToLower(m.Summary + "\n" + m.BadSnippet)
+	switch {
+	case strings.Contains(hay, "ratchet:"):
+		return "新增了跳过检查的注释且超过当前基线上限，建议直接修复问题而不是继续绕过检查。"
+	case strings.Contains(hay, "reportoptionalmemberaccess") || strings.Contains(hay, `known attribute of "none"`) || strings.Contains(hay, "nonetype"):
+		return "对象可能为空（None），直接访问属性或方法会在运行时崩溃，建议先判空再访问。"
+	case strings.Contains(hay, "reportoptionalcall") || strings.Contains(hay, "reportoptionalsubscript"):
+		return "对象可能为空（None），直接调用或下标取值存在空指针崩溃风险。"
+	case strings.Contains(hay, "f401") || strings.Contains(hay, "imported but unused") || strings.Contains(hay, "no-unused-vars"):
+		return "存在未使用的导入或变量，清理后可减少代码噪音与循环依赖风险。"
+	case strings.Contains(hay, "f841") || strings.Contains(hay, "assigned to but never used"):
+		return "局部变量赋值后从未使用，请确认是否遗漏业务逻辑或清理多余变量。"
+	case strings.Contains(hay, "invalid `# noqa`") || strings.Contains(hay, "invalid `# type: ignore"):
+		return "忽略注释写法不规范，建议补充具体规则编号或直接修复源码问题。"
+	case strings.Contains(hay, "no-explicit-any") || strings.Contains(hay, "reportunknown"):
+		return "存在未收敛的 any 或未知类型，容易绕过静态类型保护，建议补全明确类型。"
+	case strings.Contains(hay, "no-console"):
+		return "代码保留了调试用 console 输出，建议清理或改用规范日志。"
+	case strings.Contains(hay, "ts2322") || strings.Contains(hay, "ts2345") || strings.Contains(hay, "is not assignable to type"):
+		return "变量或参数类型与声明不匹配，建议核对类型定义与实际传入结构。"
+	case strings.Contains(hay, "importerror") || strings.Contains(hay, "modulenotfounderror") || strings.Contains(hay, "cannot find module"):
+		return "模块或依赖路径无法解析，请检查依赖安装状态与导入路径。"
+	case strings.EqualFold(m.Source, "git_fix"):
+		return "来自近期 fix 提交的返工问题，建议评估是否提炼为自动防线规则避免再犯。"
+	}
+	switch strings.ToLower(strings.TrimSpace(m.Category)) {
+	case "lint":
+		return "代码风格或静态质量检查未通过，建议确认是否为高频坏习惯。"
+	case "type":
+		return "静态类型检查发现潜在类型安全隐患，修复可减少运行时异常。"
+	case "escape":
+		return "存在跳过静态检查的注释，建议收紧规则避免检查形同虚设。"
+	case "ast":
+		return "抽象语法树规则命中了不推荐的代码结构模式。"
+	default:
+		return "建议检查该问题是否具有普遍性，若多次出现可沉淀为自动规则。"
+	}
+}
+
 func (s *Server) handleMistakes(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w, http.MethodGet)
@@ -339,7 +384,14 @@ func (s *Server) handleMistakes(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"mistakes": records})
+	out := make([]mistakeResponse, 0, len(records))
+	for _, rec := range records {
+		out = append(out, mistakeResponse{
+			MistakeRecord: rec,
+			LocalHint:     buildLocalMistakeHint(rec),
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"mistakes": out})
 }
 
 func (s *Server) handleMistakeAction(w http.ResponseWriter, r *http.Request) {

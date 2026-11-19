@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/HunterLzap/slopguard/internal/contract"
+	"github.com/HunterLzap/slopguard/internal/engine"
 	"github.com/HunterLzap/slopguard/internal/store"
 )
 
@@ -492,4 +493,207 @@ func fmtStr(v any) string {
 func jsonQuote(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
+}
+
+func TestSharedSkillAndUnifiedAgentsWorkflow(t *testing.T) {
+	home := t.TempDir()
+	db := openDashboardStore(t)
+	project := filepath.Join(t.TempDir(), "agent-repo")
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	agMCPPath := filepath.Join(home, ".gemini", "antigravity", "mcp_config.json")
+	agSkillPath := filepath.Join(home, ".gemini", "antigravity", "skills", "slopguard", "SKILL.md")
+	originalMCP := "{\n  \"mcpServers\": {\n    \"custom\": {\"command\": \"echo\"}\n  }\n}\n"
+	writeDashboardFile(t, agMCPPath, originalMCP)
+
+	s := NewServer(db, nil)
+	s.homeDir = home
+	handler := s.Handler()
+
+	// 1. Default shared skill state.
+	stCode, stBody, _ := dashboardRequest(t, handler, http.MethodGet, "/api/shared-skill")
+	if stCode != http.StatusOK {
+		t.Fatalf("GET /api/shared-skill = %d: %s", stCode, stBody)
+	}
+	stJSON := decodeDashboardJSON(t, stBody)
+	if stJSON["is_custom"] != false || !strings.Contains(fmtStr(stJSON["content"]), "sg_verify") {
+		t.Fatalf("unexpected default shared skill response: %v", stJSON)
+	}
+
+	// 2. Customize shared skill before enabling Antigravity.
+	customDoc := "# SlopGuard Custom Guardrail\n\nAlways run sg_verify and sg_submit_analysis.\n"
+	cCode, cBody := postDashboardJSON(t, handler, "/api/shared-skill", map[string]any{
+		"content":      customDoc,
+		"sync_enabled": true,
+		"project":      project,
+	})
+	if cCode != http.StatusOK {
+		t.Fatalf("POST /api/shared-skill = %d: %s", cCode, cBody)
+	}
+
+	// 3. Global agent toggle rejects unconfirmed mutation.
+	unCode, _ := postDashboardJSON(t, handler, "/api/agents/toggle", map[string]any{
+		"agent_id":  "antigravity",
+		"project":   project,
+		"enable":    true,
+		"confirmed": false,
+	})
+	if unCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 without confirmation for global agent, got %d", unCode)
+	}
+
+	// 4. Preview returns combined diff without touching disk.
+	pCode, pBody := postDashboardJSON(t, handler, "/api/agents/preview", map[string]any{
+		"agent_id": "antigravity",
+		"project":  project,
+		"action":   "install",
+	})
+	if pCode != http.StatusOK {
+		t.Fatalf("POST /api/agents/preview = %d: %s", pCode, pBody)
+	}
+	pJSON := decodeDashboardJSON(t, pBody)
+	if pJSON["has_changes"] != true || !strings.Contains(fmtStr(pJSON["diff"]), "SlopGuard Custom Guardrail") {
+		t.Fatalf("unexpected agent preview: %v", pJSON)
+	}
+	if _, err := os.Stat(agSkillPath); !os.IsNotExist(err) {
+		t.Fatalf("preview unexpectedly created skill file")
+	}
+
+	// 5. Confirmed toggle enables both MCP + custom shared Skill, preserving custom MCP.
+	tCode, tBody := postDashboardJSON(t, handler, "/api/agents/toggle", map[string]any{
+		"agent_id":  "antigravity",
+		"project":   project,
+		"enable":    true,
+		"confirmed": true,
+	})
+	if tCode != http.StatusOK {
+		t.Fatalf("POST /api/agents/toggle enable = %d: %s", tCode, tBody)
+	}
+	if !isSlopGuardConfigured(agMCPPath) || !isSkillConfigured(agSkillPath) {
+		t.Fatalf("expected antigravity MCP + Skill configured")
+	}
+	skillBytes, _ := os.ReadFile(agSkillPath)
+	if !strings.Contains(string(skillBytes), "SlopGuard Custom Guardrail") {
+		t.Fatalf("expected custom shared skill synced, got:\n%s", string(skillBytes))
+	}
+
+	// 6. GET /api/agents reports antigravity enabled & project disabled until toggled.
+	aCode, aBody, _ := dashboardRequest(t, handler, http.MethodGet, "/api/agents?project="+url.QueryEscape(project))
+	if aCode != http.StatusOK {
+		t.Fatalf("GET /api/agents = %d: %s", aCode, aBody)
+	}
+	aJSON := decodeDashboardJSON(t, aBody)
+	agentsList, _ := aJSON["agents"].([]any)
+	foundAGEnabled := false
+	for _, raw := range agentsList {
+		m, _ := raw.(map[string]any)
+		if m["id"] == "antigravity" && m["enabled"] == true && m["has_backup"] == true {
+			foundAGEnabled = true
+		}
+	}
+	if !foundAGEnabled {
+		t.Fatalf("expected antigravity enabled=true has_backup=true in %v", agentsList)
+	}
+
+	// 7. Resetting shared skill syncs back default text to already-enabled agent.
+	rCode, rBody := postDashboardJSON(t, handler, "/api/shared-skill", map[string]any{
+		"reset":        true,
+		"sync_enabled": true,
+		"project":      project,
+	})
+	if rCode != http.StatusOK {
+		t.Fatalf("reset shared skill = %d: %s", rCode, rBody)
+	}
+	rJSON := decodeDashboardJSON(t, rBody)
+	if rJSON["is_custom"] != false {
+		t.Fatalf("expected is_custom=false after reset: %v", rJSON)
+	}
+	skillAfterReset, _ := os.ReadFile(agSkillPath)
+	if strings.Contains(string(skillAfterReset), "SlopGuard Custom Guardrail") || !strings.Contains(string(skillAfterReset), "sg_verify") {
+		t.Fatalf("expected synced skill reset to default, got:\n%s", string(skillAfterReset))
+	}
+
+	// 8. Disabling antigravity restores original MCP config and removes created skill file.
+	dCode, dBody := postDashboardJSON(t, handler, "/api/agents/toggle", map[string]any{
+		"agent_id":  "antigravity",
+		"project":   project,
+		"enable":    false,
+		"confirmed": true,
+	})
+	if dCode != http.StatusOK {
+		t.Fatalf("POST /api/agents/toggle disable = %d: %s", dCode, dBody)
+	}
+	restoredMCP, _ := os.ReadFile(agMCPPath)
+	if string(restoredMCP) != originalMCP {
+		t.Fatalf("expected restored original MCP config, got:\n%s", string(restoredMCP))
+	}
+	if _, err := os.Stat(agSkillPath); !os.IsNotExist(err) {
+		t.Fatalf("expected restored skill file removed, stat err=%v", err)
+	}
+}
+
+func TestMistakeLocalHintCacheExclusionAndSetProjectConfig(t *testing.T) {
+	home := t.TempDir()
+	db := openDashboardStore(t)
+	project := filepath.Join(t.TempDir(), "py-repo")
+	writeDashboardFile(t, filepath.Join(project, "app.py"), "x = 1\n")
+	writeDashboardFile(t, filepath.Join(project, ".cache", "uv", "pkg", "mod.py"), "y = 2 # noqa\n")
+	writeDashboardFile(t, filepath.Join(project, ".git", "HEAD"), "ref: refs/heads/main\n")
+	if err := os.MkdirAll(filepath.Join(project, ".git", "hooks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify ListFiles excludes .cache/uv third-party archives.
+	files, err := engine.ListFiles(project, nil)
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	for _, f := range files {
+		if strings.Contains(f, ".cache") {
+			t.Fatalf("expected .cache files to be excluded, found %s", f)
+		}
+	}
+
+	// Verify Mistake API adds local_hint.
+	if _, err := db.RecordMistake(context.Background(), contract.Mistake{
+		ProjectPath: project,
+		Fingerprint: "fp-none-member",
+		Category:    "type",
+		Summary:     `[pyright:reportOptionalMemberAccess] "auth" is not a known attribute of "None"`,
+		Source:      "auto_verify",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewServer(db, nil)
+	s.homeDir = home
+	handler := s.Handler()
+
+	// SetProjectConfig enables watch + git hook cleanly.
+	enTrue := true
+	hkTrue := true
+	st, err := s.guard.SetProjectConfig(project, &enTrue, &hkTrue, defaultGuardDebounceSec)
+	if err != nil {
+		t.Fatalf("SetProjectConfig: %v", err)
+	}
+	if !st.Enabled || !st.HookInstalled {
+		t.Fatalf("expected guard watch + hook active, got %+v", st)
+	}
+
+	code, body, _ := dashboardRequest(t, handler, http.MethodGet, "/api/mistakes?project="+url.QueryEscape(project))
+	if code != http.StatusOK {
+		t.Fatalf("GET /api/mistakes = %d: %s", code, body)
+	}
+	mJSON := decodeDashboardJSON(t, body)
+	items, _ := mJSON["mistakes"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 mistake, got %v", items)
+	}
+	first, _ := items[0].(map[string]any)
+	hint := fmtStr(first["local_hint"])
+	if !strings.Contains(hint, "None") {
+		t.Fatalf("expected Chinese local_hint explaining None access, got %q", hint)
+	}
 }

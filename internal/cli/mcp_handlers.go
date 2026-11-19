@@ -22,7 +22,7 @@ func buildMCPTools(root string) []mcp.Tool {
 	tools := []mcp.Tool{
 		{
 			Name:        "sg_verify",
-			Description: "Run the deterministic SlopGuard gate for the project.",
+			Description: "Run the deterministic SlopGuard gate for the project. Also returns any pending_inbox mistakes awaiting plain-language Chinese analysis via sg_submit_analysis.",
 			InputSchema: objectSchema(map[string]any{
 				"all":   map[string]any{"type": "boolean", "description": "scan all files instead of git-changed files"},
 				"paths": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "optional explicit file paths"},
@@ -37,7 +37,7 @@ func buildMCPTools(root string) []mcp.Tool {
 				if err := decodeMCPArgs(args, &a); err != nil {
 					return nil, err
 				}
-				return verifyForMCP(root, a.All, a.Paths, a.UI)
+				return verifyForMCP(ctx, root, a.All, a.Paths, a.UI)
 			},
 		},
 		{
@@ -199,6 +199,14 @@ func recordMCPAuditEvent(ctx context.Context, root, toolName string, args json.R
 		errorText = callErr.Error()
 	}
 	switch v := res.(type) {
+	case mcpVerifyResponse:
+		passed = passed && v.Passed
+		findingsCount = len(v.Findings)
+	case *mcpVerifyResponse:
+		if v != nil {
+			passed = passed && v.Passed
+			findingsCount = len(v.Findings)
+		}
 	case contract.VerifyResult:
 		passed = passed && v.Passed
 		findingsCount = len(v.Findings)
@@ -260,7 +268,22 @@ func decodeMCPArgs(raw json.RawMessage, target any) error {
 	return nil
 }
 
-func verifyForMCP(root string, all bool, paths []string, ui bool) (contract.VerifyResult, error) {
+type mcpInboxBriefItem struct {
+	Fingerprint string `json:"fingerprint"`
+	Category    string `json:"category"`
+	Summary     string `json:"summary"`
+	BadSnippet  string `json:"bad_snippet,omitempty"`
+	Count       int    `json:"count"`
+}
+
+type mcpVerifyResponse struct {
+	contract.VerifyResult
+	PendingInboxCount int                 `json:"pending_inbox_count,omitempty"`
+	PendingInbox      []mcpInboxBriefItem `json:"pending_inbox,omitempty"`
+	NextAction        string              `json:"next_action,omitempty"`
+}
+
+func verifyForMCP(ctx context.Context, root string, all bool, paths []string, ui bool) (mcpVerifyResponse, error) {
 	var stdout, stderr bytes.Buffer
 	code := runVerifyWith(verifyOptions{
 		root:        root,
@@ -275,13 +298,38 @@ func verifyForMCP(root string, all bool, paths []string, ui bool) (contract.Veri
 		if msg == "" {
 			msg = "verify failed"
 		}
-		return contract.VerifyResult{}, errors.New(msg)
+		return mcpVerifyResponse{}, errors.New(msg)
 	}
 	var result contract.VerifyResult
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
-		return contract.VerifyResult{}, fmt.Errorf("decode verify result: %w (output=%q)", err, strings.TrimSpace(stdout.String()))
+		return mcpVerifyResponse{}, fmt.Errorf("decode verify result: %w (output=%q)", err, strings.TrimSpace(stdout.String()))
 	}
-	return result, nil
+
+	out := mcpVerifyResponse{VerifyResult: result}
+	if db, err := openMCPStore(); err == nil {
+		defer db.Close()
+		qCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		if items, qErr := db.ListInboxMistakes(qCtx, root, "pending_ai"); qErr == nil && len(items) > 0 {
+			out.PendingInboxCount = len(items)
+			limit := len(items)
+			if limit > 5 {
+				limit = 5
+			}
+			out.PendingInbox = make([]mcpInboxBriefItem, 0, limit)
+			for i := 0; i < limit; i++ {
+				out.PendingInbox = append(out.PendingInbox, mcpInboxBriefItem{
+					Fingerprint: items[i].Fingerprint,
+					Category:    items[i].Category,
+					Summary:     items[i].Summary,
+					BadSnippet:  items[i].BadSnippet,
+					Count:       items[i].Count,
+				})
+			}
+			out.NextAction = "There are unanalyzed mistakes in pending_inbox. Please call sg_submit_analysis with a plain-language Chinese reason and recommend/skip decision so the user can review them in the SlopGuard dashboard."
+		}
+	}
+	return out, nil
 }
 
 func radarForMCP(ctx context.Context, root string, top int) (radarResult, error) {

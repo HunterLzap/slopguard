@@ -89,8 +89,8 @@
           </div>
         </div>
         <div class="topbar-actions">
-          <button id="btn-run-verify" class="btn btn-secondary" type="button">立即体检</button>
-          <button id="btn-run-verify-ui" class="btn btn-primary" type="button">体检 + UI</button>
+          <span id="topbar-verify-pill" class="topbar-status-pill" hidden></span>
+          <button id="btn-run-verify" class="btn btn-primary" type="button">立即体检</button>
           <button id="refresh-button" class="btn btn-ghost" type="button">刷新</button>
         </div>
       </header>
@@ -318,45 +318,69 @@
             <div class="card-header">
               <div class="title-with-tip">
                 <h2>自动守护</h2>
-                <button type="button" class="help-tip" data-tip="代码变更或 Git 提交时后台静默运行 verify，发现错误自动沉淀到「错题栏」，平时零打扰、不阻塞提交" aria-label="自动守护说明">?</button>
+                <button type="button" class="help-tip" data-tip="添加项目后默认开启；代码保存或提交时在后台静默检查，发现问题自动记入「错题栏」，不打断工作" aria-label="自动守护说明">?</button>
               </div>
               <span id="guard-project-badge" class="pill">全部项目</span>
             </div>
             <div class="card-body stack-list">
               <div id="guard-empty-project" class="quick-project-bar"></div>
               <div id="guard-controls" class="stack-list" hidden>
-                <div class="guard-row">
-                  <div class="mcp-client-info">
+                <div class="guard-master-row">
+                  <div class="guard-master-info">
                     <div class="mcp-client-title">
-                      <span>文件监听</span>
-                      <button type="button" class="help-tip" data-tip="检测到源码变更并稳定 5 秒后，在后台执行局部体检并自动记录错题" aria-label="文件监听说明">?</button>
-                      <span id="guard-watch-pill" class="pill">未开启</span>
+                      <span>后台无感自动守护</span>
+                      <span id="guard-master-pill" class="pill">未开启</span>
                     </div>
-                    <div id="guard-watch-detail" class="mcp-client-path muted" hidden></div>
+                    <div id="guard-master-detail" class="mcp-client-path muted">文件保存与 Git 提交时静默留痕错题</div>
                   </div>
-                  <button id="btn-toggle-guard-watch" class="btn btn-sm btn-primary" type="button">开启</button>
+                  <label class="switch" aria-label="后台无感自动守护总开关">
+                    <input id="guard-master-switch" type="checkbox">
+                    <span class="switch-slider"></span>
+                  </label>
                 </div>
-                <div class="guard-row">
-                  <div class="mcp-client-info">
-                    <div class="mcp-client-title">
-                      <span>Git 钩子</span>
-                      <button type="button" class="help-tip" data-tip="安装非阻塞 post-commit 钩子，每次提交后后台静默扫描该次提交文件；写入前自动备份原钩子" aria-label="Git 钩子说明">?</button>
-                      <span id="guard-hook-pill" class="pill">未安装</span>
+                <details class="inline-details">
+                  <summary>查看包含的守护功能（文件监听 · Git 钩子）</summary>
+                  <div class="guard-sub-list">
+                    <div class="guard-row">
+                      <div class="mcp-client-info">
+                        <div class="mcp-client-title">
+                          <span>文件监听</span>
+                          <button type="button" class="help-tip" data-tip="检测到源码变更并稳定 5 秒后，后台局部体检并自动沉淀错题" aria-label="文件监听说明">?</button>
+                          <span id="guard-watch-pill" class="pill">未开启</span>
+                        </div>
+                        <div id="guard-watch-detail" class="mcp-client-path muted" hidden></div>
+                      </div>
+                      <label class="switch switch-sm" aria-label="文件监听开关">
+                        <input id="guard-watch-switch" type="checkbox">
+                        <span class="switch-slider"></span>
+                      </label>
                     </div>
-                    <div id="guard-hook-detail" class="mcp-client-path muted" hidden></div>
+                    <div class="guard-row">
+                      <div class="mcp-client-info">
+                        <div class="mcp-client-title">
+                          <span>Git 钩子</span>
+                          <button type="button" class="help-tip" data-tip="在仓库安装非阻塞 post-commit 钩子，每次提交后后台静默扫描该次变更文件" aria-label="Git 钩子说明">?</button>
+                          <span id="guard-hook-pill" class="pill">未安装</span>
+                        </div>
+                        <div id="guard-hook-detail" class="mcp-client-path muted" hidden></div>
+                      </div>
+                      <label class="switch switch-sm" aria-label="Git 钩子开关">
+                        <input id="guard-hook-switch" type="checkbox">
+                        <span class="switch-slider"></span>
+                      </label>
+                    </div>
                   </div>
-                  <button id="btn-toggle-guard-hook" class="btn btn-sm btn-secondary" type="button">安装</button>
-                </div>
+                </details>
               </div>
             </div>
           </div>
 
-          <!-- 3. Agent 接入 -->
+          <!-- 3. Agent 接入（Magpie 风格：共享护栏指令 + Agent 开关列表） -->
           <div class="card" id="agent-connect-card">
             <div class="card-header">
               <div class="title-with-tip">
                 <h2>Agent 接入</h2>
-                <button type="button" class="help-tip" data-tip="优先接入当前项目 .mcp.json 与项目 Skill；每次写入前先预览完整 Diff 并自动备份到 ~/.slopguard/backups/，支持一键还原" aria-label="Agent 接入说明">?</button>
+                <button type="button" class="help-tip" data-tip="只需编辑一次共享护栏指令，勾选下方任意 Agent 即可自动接入 MCP 与规则（修改全局配置前先预览 Diff 并备份至 ~/.slopguard/backups/）" aria-label="Agent 接入说明">?</button>
               </div>
               <div class="card-header-actions">
                 <button id="btn-generic-mcp" class="btn btn-sm btn-secondary" type="button">通用配置</button>
@@ -365,106 +389,33 @@
             </div>
             <div class="card-body stack-list">
               <div id="mcp-project-hint" class="quick-project-bar subtle-bar" hidden></div>
-              <div class="title-with-tip">
-                <span class="section-subhead">MCP 服务</span>
-                <button type="button" class="help-tip" data-tip="让 AI 编程工具直接调用 sg_verify、sg_radar、sg_list_inbox 与 sg_submit_analysis" aria-label="MCP 服务说明">?</button>
-              </div>
-              <div id="mcp-clients-list" class="stack-list"></div>
-              <div class="title-with-tip" style="margin-top: 6px;">
-                <span class="section-subhead">规则文件</span>
-                <button type="button" class="help-tip" data-tip="部署 SKILL.md 或 Cursor Rule，告诉 Agent 什么时候调用体检、如何分析错题与提交规则草案" aria-label="规则文件说明">?</button>
-              </div>
-              <div id="skill-targets-list" class="stack-list"></div>
-            </div>
-          </div>
 
-          <!-- 4. 体检选项与结果 -->
-          <div class="card filter-bar" id="manual-verify-card">
-            <div class="filter-group">
-              <div class="title-with-tip">
-                <span class="section-inline-title">体检选项</span>
-                <button type="button" class="help-tip" data-tip="通过右上角「立即体检」或「体检 + UI」触发，此处控制扫描范围与是否入库" aria-label="体检选项说明">?</button>
-              </div>
-              <label class="checkbox-field">
-                <input id="verify-opt-all" type="checkbox">
-                <span>全量扫描</span>
-              </label>
-              <label class="checkbox-field">
-                <input id="verify-opt-record" type="checkbox" checked>
-                <span>写入记录</span>
-              </label>
-            </div>
-            <div id="verify-status-pill" class="pill">空闲</div>
-          </div>
-
-          <div id="verify-result-wrap" hidden>
-            <div class="stats stats-4">
-              <article class="stat-card">
-                <span class="stat-label">结果</span>
-                <strong id="verify-res-passed" class="stat-value">—</strong>
-              </article>
-              <article class="stat-card">
-                <div class="stat-label-row">
-                  <span class="stat-label">发现问题</span>
-                  <button type="button" class="help-tip" data-tip="本次检查命中的 Lint、类型报错或新增跳过注释数" aria-label="发现问题说明">?</button>
+              <div class="shared-skill-box">
+                <div class="shared-skill-row">
+                  <div class="shared-skill-meta">
+                    <span>📄 共享护栏指令</span>
+                    <span id="shared-skill-badge" class="pill accent">默认</span>
+                    <code id="shared-skill-path" class="mcp-client-path mono">SKILL.md</code>
+                  </div>
+                  <button id="btn-toggle-shared-skill" class="btn btn-sm btn-ghost" type="button">查看 / 编辑 ›</button>
                 </div>
-                <strong id="verify-res-findings" class="stat-value">0</strong>
-              </article>
-              <article class="stat-card">
-                <div class="stat-label-row">
-                  <span class="stat-label">跳过注释</span>
-                  <button type="button" class="help-tip" data-tip="项目内 # noqa、# type: ignore、@ts-ignore 存量总数；未超过基线即算通过" aria-label="跳过注释说明">?</button>
+                <div id="shared-skill-drawer" hidden>
+                  <textarea id="shared-skill-editor" class="code-editor" spellcheck="false" aria-label="共享护栏指令编辑框"></textarea>
+                  <div class="shared-skill-actions">
+                    <span id="shared-skill-feedback" class="muted" style="font-size:11px;">保存后将自动同步至已勾选的 Agent</span>
+                    <div class="card-header-actions">
+                      <button id="btn-reset-shared-skill" class="btn btn-sm btn-ghost" type="button">恢复默认</button>
+                      <button id="btn-save-shared-skill" class="btn btn-sm btn-primary" type="button">保存并同步</button>
+                    </div>
+                  </div>
                 </div>
-                <strong id="verify-res-escapes" class="stat-value">0</strong>
-              </article>
-              <article class="stat-card">
-                <span class="stat-label">耗时</span>
-                <strong id="verify-res-duration" class="stat-value">—</strong>
-                <span class="stat-sub">ms</span>
-              </article>
-            </div>
-
-            <div id="verify-skipped-banner" class="banner banner-warn" hidden></div>
-
-            <div class="card">
-              <div class="card-header">
-                <h2>检查发现</h2>
-                <span id="verify-findings-count" class="muted">0 项</span>
               </div>
-              <div class="table-wrap">
-                <table class="data-table">
-                  <thead>
-                    <tr>
-                      <th>级别</th>
-                      <th>规则</th>
-                      <th>位置</th>
-                      <th>详情</th>
-                    </tr>
-                  </thead>
-                  <tbody id="verify-findings-body"></tbody>
-                </table>
-                <p id="verify-findings-empty" class="empty-state" hidden>未发现问题</p>
-              </div>
-            </div>
 
-            <div id="verify-ui-card" class="card" hidden>
-              <div class="card-header">
-                <h2>UI 冒烟结果</h2>
-                <span id="verify-ui-pill" class="pill">—</span>
+              <div class="agent-section-head">
+                <span class="section-subhead">AGENT</span>
+                <span class="muted" style="font-size: 11px;">勾选即接入 MCP 与共享护栏规则 · 点击 › 查看变更详情或还原</span>
               </div>
-              <div id="verify-ui-body" class="card-body"></div>
-            </div>
-          </div>
-
-          <!-- 5. UI 截图（仅在存在截图时展示，避免空占位） -->
-          <div id="screenshots-card" class="card" hidden>
-            <div class="card-header">
-              <h2>UI 截图</h2>
-              <span id="screenshots-count" class="muted">0 张</span>
-            </div>
-            <div class="card-body">
-              <div id="screenshot-grid" class="screenshot-grid"></div>
-              <p id="screenshot-empty" class="empty-state" hidden>暂无截图</p>
+              <div id="agents-list" class="agent-list"></div>
             </div>
           </div>
         </section>
@@ -513,6 +464,7 @@
               </label>
             </div>
             <div class="filter-group">
+              <button id="btn-copy-batch-analyze" class="btn btn-secondary btn-sm" type="button" hidden>批量复制分析指令</button>
               <div class="title-with-tip">
                 <button id="btn-scan-sessions" class="btn btn-secondary btn-sm" type="button">嗅探会话</button>
                 <button type="button" class="help-tip" data-tip="纯只读扫描近 14 天本地 Claude / Codex / Antigravity 会话日志与 Git fix 提交，零配置修改" aria-label="嗅探说明">?</button>
@@ -762,20 +714,6 @@
           <button id="generic-mcp-cancel" class="btn btn-ghost" type="button">关闭</button>
           <button id="btn-copy-generic-mcp" class="btn btn-primary" type="button">复制配置</button>
         </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- 截图预览弹窗 -->
-  <div id="lightbox" class="lightbox" hidden role="dialog" aria-modal="true" aria-label="截图预览">
-    <div class="lightbox-backdrop" id="lightbox-backdrop"></div>
-    <div class="lightbox-dialog">
-      <div class="lightbox-header">
-        <code id="lightbox-caption" class="mono"></code>
-        <button id="lightbox-close" class="icon-btn" type="button" aria-label="关闭预览">✕</button>
-      </div>
-      <div class="lightbox-body">
-        <img id="lightbox-img" src="" alt="截图预览">
       </div>
     </div>
   </div>

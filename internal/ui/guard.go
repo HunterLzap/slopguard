@@ -453,7 +453,9 @@ func computeProjectSnapshot(root string) (treeHash, headHash string, err error) 
 
 func isGuardSkippedDir(name string) bool {
 	switch name {
-	case ".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build", "target",
+	case ".git", ".hg", ".svn", ".cache", ".pytest_cache", ".ruff_cache", ".mypy_cache",
+		".tox", ".nox", ".next", ".nuxt", ".turbo", "coverage",
+		"node_modules", "vendor", "dist", "build", "target",
 		"__pycache__", ".venv", "venv", ".idea", ".vscode", ".slopguard":
 		return true
 	default:
@@ -691,6 +693,74 @@ func (s *Server) handleGuardStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+var errGuardInvalidProject = errors.New("项目目录不存在")
+
+// SetProjectConfig validates a project directory, applies optional Git hook
+// changes and watch debounce settings, persists them, and returns live status.
+func (g *GuardManager) SetProjectConfig(project string, enabled *bool, hookEnabled *bool, debounceSec int) (GuardProjectStatus, error) {
+	rawProject := strings.TrimSpace(project)
+	if rawProject == "" {
+		return GuardProjectStatus{}, errors.New("请先选择一个项目")
+	}
+	absProject, err := filepath.Abs(rawProject)
+	if err != nil {
+		return GuardProjectStatus{}, fmt.Errorf("无效项目路径: %w", err)
+	}
+	info, err := os.Stat(absProject)
+	if err != nil || !info.IsDir() {
+		return GuardProjectStatus{}, errGuardInvalidProject
+	}
+
+	if hookEnabled != nil {
+		backupsDir := ""
+		if g.server != nil {
+			backupsDir = g.server.backupsDir()
+		}
+		if *hookEnabled {
+			exe, exeErr := resolveSelfBinary()
+			if exeErr != nil {
+				exe = "slopguard"
+			}
+			if _, err := installGitPostCommitHook(backupsDir, absProject, exe); err != nil {
+				return GuardProjectStatus{}, err
+			}
+		} else {
+			if _, err := uninstallGitPostCommitHook(backupsDir, absProject); err != nil {
+				return GuardProjectStatus{}, err
+			}
+		}
+	}
+
+	g.mu.Lock()
+	g.ensureLoadedLocked()
+	cfg := g.configs[absProject]
+	cfg.Project = absProject
+	if enabled != nil {
+		cfg.Enabled = *enabled
+		if *enabled {
+			// Prime initial snapshot so toggling on doesn't double-fire stale diffs.
+			delete(g.watch, absProject)
+		}
+	}
+	if hookEnabled != nil {
+		cfg.HookEnabled = *hookEnabled
+	}
+	if debounceSec > 0 {
+		cfg.DebounceSec = debounceSec
+	} else if cfg.DebounceSec <= 0 {
+		cfg.DebounceSec = defaultGuardDebounceSec
+	}
+	cfg.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	g.configs[absProject] = cfg
+	saveErr := g.saveLocked()
+	g.mu.Unlock()
+
+	if saveErr != nil {
+		return GuardProjectStatus{}, fmt.Errorf("保存守护配置失败: %w", saveErr)
+	}
+	return g.ProjectStatus(absProject), nil
+}
+
 func (s *Server) handleGuardToggle(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w, http.MethodPost)
@@ -706,70 +776,12 @@ func (s *Server) handleGuardToggle(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON payload")
 		return
 	}
-	rawProject := strings.TrimSpace(req.Project)
-	if rawProject == "" {
-		writeError(w, http.StatusBadRequest, "请先选择一个项目")
-		return
-	}
-	absProject, err := filepath.Abs(rawProject)
+
+	st, err := s.guard.SetProjectConfig(req.Project, req.Enabled, req.HookEnabled, req.DebounceSec)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("无效项目路径: %v", err))
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	info, err := os.Stat(absProject)
-	if err != nil || !info.IsDir() {
-		writeError(w, http.StatusBadRequest, "项目目录不存在")
-		return
-	}
-
-	if req.HookEnabled != nil {
-		if *req.HookEnabled {
-			exe, exeErr := resolveSelfBinary()
-			if exeErr != nil {
-				exe = "slopguard"
-			}
-			if _, err := installGitPostCommitHook(s.backupsDir(), absProject, exe); err != nil {
-				writeError(w, http.StatusBadRequest, err.Error())
-				return
-			}
-		} else {
-			if _, err := uninstallGitPostCommitHook(s.backupsDir(), absProject); err != nil {
-				writeError(w, http.StatusInternalServerError, err.Error())
-				return
-			}
-		}
-	}
-
-	s.guard.mu.Lock()
-	s.guard.ensureLoadedLocked()
-	cfg := s.guard.configs[absProject]
-	cfg.Project = absProject
-	if req.Enabled != nil {
-		cfg.Enabled = *req.Enabled
-		if *req.Enabled {
-			// Prime initial snapshot so toggling on doesn't double-fire stale diffs.
-			delete(s.guard.watch, absProject)
-		}
-	}
-	if req.HookEnabled != nil {
-		cfg.HookEnabled = *req.HookEnabled
-	}
-	if req.DebounceSec > 0 {
-		cfg.DebounceSec = req.DebounceSec
-	} else if cfg.DebounceSec <= 0 {
-		cfg.DebounceSec = defaultGuardDebounceSec
-	}
-	cfg.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-	s.guard.configs[absProject] = cfg
-	saveErr := s.guard.saveLocked()
-	s.guard.mu.Unlock()
-
-	if saveErr != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("保存守护配置失败: %v", saveErr))
-		return
-	}
-
-	st := s.guard.ProjectStatus(absProject)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":     true,
 		"status": st,

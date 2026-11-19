@@ -28,7 +28,8 @@ MCP 使用 stdio，传输为**换行分隔的 JSON-RPC 2.0**：每行一个 JSON
 ## 标准工作流
 
 1. **改完代码先验证**：调用 `sg_verify`。默认只检查 Git 变更文件；需要全量时传 `all: true`，需要定点检查时传 `paths`，需要 UI 烟雾验证时传 `ui: true`（未配置或未装 Playwright 会跳过，不影响 passed）。
-2. **失败先修复**：读取 `findings`，修复后再次 `sg_verify`，直到 `passed: true`。
+2. **顺手分析返回的新错题**：如果 `sg_verify` 返回的 `pending_inbox` 非空，请顺手结合上下文对这些错题调用 `sg_submit_analysis`（给出通俗中文原因、`recommend` 或 `skip` 建议及可选 `rule_draft`），让用户在看板直接看懂并一键确认。
+3. **失败先修复**：读取 `findings`，修复后再次 `sg_verify`，直到 `passed: true`。
 3. **记录重复错误**：若同一类 AI 错误再次出现，调用 `sg_record_mistake`，提供 `category`、`summary`，尽量附上 `bad_snippet` 与 `good_snippet`。相同指纹会累计 `count`。
 4. **主动巡检与分析错题收件箱**：定期或当用户要求分析错题时，调用 `sg_list_inbox`（如 `review_status: "pending_ai"`）获取自动捕获或待分析的错误模式；结合上下文判断是真实坏习惯（`recommend`）还是偶发误报（`skip`），用**通俗易懂的中文**说明“为什么建议入库 / 为什么建议忽略”（必要时附带 `rule_draft` 草案），调用 `sg_submit_analysis` 推送到看板「错题栏」等待用户一键确认。
 5. **召回候选**：当同类错误累计达到 2 次，也可调用 `sg_list_candidates` 获取待提炼错题簇。

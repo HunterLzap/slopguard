@@ -578,16 +578,64 @@
   }
 
   // 错题栏（含 Agent 分析建议 + 人工校验）
-  function populateSelectOptions(selectEl, values, currentVal) {
+  function populateSelectOptions(selectEl, values, currentVal, labelFn) {
     const existing = Array.from(new Set(values.filter(Boolean))).sort();
     selectEl.innerHTML = '<option value="">全部</option>';
     for (const val of existing) {
       const opt = document.createElement("option");
       opt.value = val;
-      opt.textContent = val;
+      opt.textContent = labelFn ? labelFn(val) : val;
       selectEl.appendChild(opt);
     }
     selectEl.value = existing.includes(currentVal) ? currentVal : "";
+  }
+
+  function formatCategoryLabel(cat) {
+    const map = {
+      lint: "代码规范",
+      type: "类型隐患",
+      escape: "跳过注释",
+      ast: "结构问题",
+      session: "会话返工",
+      runtime: "运行时隐患",
+      general: "常规",
+    };
+    return map[cat] || cat || "常规";
+  }
+
+  function formatToolLabel(tool) {
+    const map = {
+      sg_verify: "代码体检",
+      sg_radar: "坏样本雷达",
+      sg_list_inbox: "拉取待分析错题",
+      sg_submit_analysis: "提交分析建议",
+      sg_promote_rule: "规则入库",
+    };
+    return map[tool] ? `${map[tool]} (${tool})` : (tool || "—");
+  }
+
+  function formatRuleStatusLabel(status) {
+    const map = {
+      active: "已启用",
+      enabled: "已启用",
+      disabled: "已停用",
+      draft: "草稿",
+    };
+    return map[String(status || "").toLowerCase()] || status || "—";
+  }
+
+  function formatBaselineMetricLabel(name) {
+    const map = {
+      type_ignore_py: "Python 忽略类型 (# type: ignore)",
+      noqa: "Python 跳过规范 (# noqa)",
+      pyright_ignore: "Pyright 忽略 (# pyright: ignore)",
+      ts_ignore: "TS 单行忽略 (@ts-ignore)",
+      ts_expect_error: "TS 预期报错 (@ts-expect-error)",
+      ts_nocheck: "TS 整文件跳过 (@ts-nocheck)",
+      as_any: "任意类型强转 (as any)",
+      eslint_disable: "ESLint 跳过注释",
+    };
+    return map[name] || name;
   }
 
   function normalizeReviewStatus(m) {
@@ -655,8 +703,8 @@
       batchBtn.textContent = `批量复制分析指令 (${counts.pending_ai})`;
     }
 
-    populateSelectOptions($("mistakes-filter-category"), mistakes.map((m) => m.category), $("mistakes-filter-category").value);
-    populateSelectOptions($("mistakes-filter-source"), mistakes.map((m) => m.source), $("mistakes-filter-source").value);
+    populateSelectOptions($("mistakes-filter-category"), mistakes.map((m) => m.category), $("mistakes-filter-category").value, formatCategoryLabel);
+    populateSelectOptions($("mistakes-filter-source"), mistakes.map((m) => m.source), $("mistakes-filter-source").value, formatSourceLabel);
 
     if (!state.userPickedReviewTab && state.reviewStatus === "pending_user" && counts.pending_user === 0 && counts.pending_ai > 0) {
       selectReviewTab("pending_ai", false);
@@ -773,18 +821,16 @@
       }
 
       card.innerHTML = `
-        <div class="mistake-count" title="出现 ${count} 次">${count}</div>
+        <div class="mistake-count" data-tip="累计捕获 ${count} 次">${count}</div>
         <div class="mistake-main">
           <div class="mistake-title-row">
             <h3 class="mistake-title">${escapeHTML(m.summary || "未命名错题")}</h3>
             <span class="pill ${badgeInfo.cls}">${escapeHTML(badgeInfo.text)}</span>
-            ${isCandidate ? `<span class="pill warn">高频候选 &ge;2</span>` : ""}
+            ${isCandidate ? `<span class="pill warn" data-tip="该错题已重复出现至少 2 次，强烈建议「确认入库」防止反复踩坑">高频候选 &ge;2</span>` : ""}
           </div>
           <div class="mistake-meta">
-            <span>${escapeHTML(m.category || "general")}</span>
+            <span class="pill">${escapeHTML(formatCategoryLabel(m.category))}</span>
             <span class="pill">${escapeHTML(formatSourceLabel(m.source))}</span>
-            <span class="pill">出现 ${count} 次</span>
-            ${m.fingerprint ? `<code class="pill mono" title="${escapeHTML(m.fingerprint)}">${escapeHTML(m.fingerprint.slice(0, 12))}</code>` : ""}
             <span>${escapeHTML(shortProject(m.project_path))}</span>
             <span>${escapeHTML(formatDate(m.updated_at || m.created_at))}</span>
           </div>
@@ -835,7 +881,7 @@
     badge.textContent = String(events.length);
     badge.hidden = events.length === 0;
 
-    populateSelectOptions($("events-filter-tool"), events.map((e) => e.tool || e.tool_name), $("events-filter-tool").value);
+    populateSelectOptions($("events-filter-tool"), events.map((e) => e.tool || e.tool_name), $("events-filter-tool").value, formatToolLabel);
     applyEventFilters();
   }
 
@@ -875,7 +921,7 @@
       tr.innerHTML = `
         <td class="mono muted">${escapeHTML(formatShortTime(ev.created_at))}</td>
         <td class="mono" title="${escapeHTML(ev.project_path || "")}">${escapeHTML(shortProject(ev.project_path))}</td>
-        <td><code class="pill mono">${escapeHTML(tool)}</code></td>
+        <td><code class="pill mono" title="${escapeHTML(tool)}">${escapeHTML(formatToolLabel(tool))}</code></td>
         <td class="args-summary" title="${escapeHTML(detailText)}">${escapeHTML(detailText)}</td>
         <td><span class="pill ${passed ? "pass" : "fail"}">${passed ? "通过" : "已拦截"}</span></td>
         <td class="num">${findings}</td>
@@ -892,7 +938,7 @@
     badge.hidden = rules.length === 0;
 
     populateSelectOptions($("rules-filter-engine"), rules.map((r) => r.engine), $("rules-filter-engine").value);
-    populateSelectOptions($("rules-filter-status"), rules.map((r) => r.status), $("rules-filter-status").value);
+    populateSelectOptions($("rules-filter-status"), rules.map((r) => r.status), $("rules-filter-status").value, formatRuleStatusLabel);
 
     applyRuleFilters();
   }
@@ -961,8 +1007,8 @@
     const skipBanner = $("radar-skipped-banner");
     if (skipped.length) {
       skipBanner.hidden = false;
-      skipBanner.innerHTML = `<strong>跳过 ${skipped.length} 个维度：</strong> ` +
-        skipped.map((s) => `<span class="mono">${escapeHTML(s.dimension || "?")}/${escapeHTML(s.tool || "?")}</span> (${escapeHTML(s.reason || "不可用")})`).join(" · ");
+      skipBanner.innerHTML = `<strong>可选扫描工具未安装（不影响基础守护）：</strong> ` +
+        skipped.map((s) => `<span class="mono">${escapeHTML(s.tool || s.dimension || "?")}</span>`).join(" · ");
     } else {
       skipBanner.hidden = true;
     }
@@ -1013,7 +1059,7 @@
         const row = document.createElement("div");
         row.className = "metric-row";
         row.innerHTML = `
-          <span class="mono">${escapeHTML(m.name)}</span>
+          <span title="${escapeHTML(m.name)}">${escapeHTML(formatBaselineMetricLabel(m.name))}</span>
           <span class="metric-num muted">${base}</span>
           <span class="metric-num">${curr}</span>
           <span class="metric-num ${deltaCls}">${deltaStr}</span>
@@ -1433,10 +1479,14 @@
   }
 
   function renderSharedSkillBox(shared) {
+    const openBtn = $("btn-open-shared-skill");
     const badge = $("shared-skill-badge");
     const pathEl = $("shared-skill-path");
     const editor = $("shared-skill-editor");
     if (!shared) return;
+    if (openBtn) {
+      openBtn.textContent = shared.is_custom ? "共享护栏指令 · 已自定义" : "共享护栏指令";
+    }
     if (badge) {
       badge.textContent = shared.is_custom ? "已自定义" : "默认";
       badge.className = `pill ${shared.is_custom ? "pass" : "accent"}`;
@@ -1448,6 +1498,19 @@
     if (editor && document.activeElement !== editor) {
       editor.value = shared.content || "";
     }
+  }
+
+  function openSharedSkillModal() {
+    if (state.agentsData?.shared_skill) {
+      renderSharedSkillBox(state.agentsData.shared_skill);
+    }
+    const feedback = $("shared-skill-feedback");
+    if (feedback) feedback.textContent = "保存后将自动同步至已勾选的 Agent";
+    $("shared-skill-modal").hidden = false;
+  }
+
+  function closeSharedSkillModal() {
+    $("shared-skill-modal").hidden = true;
   }
 
   function renderAgentList(container, agents) {
@@ -2062,15 +2125,14 @@
     $("btn-baseline-tighten").addEventListener("click", () => runBaselineAction("tighten"));
     $("btn-baseline-reset").addEventListener("click", () => runBaselineAction("reset"));
     $("btn-refresh-mcp").addEventListener("click", loadAgents);
-    $("btn-toggle-shared-skill")?.addEventListener("click", () => {
-      const drawer = $("shared-skill-drawer");
-      const btn = $("btn-toggle-shared-skill");
-      if (!drawer) return;
-      drawer.hidden = !drawer.hidden;
-      if (btn) btn.textContent = drawer.hidden ? "查看 / 编辑 ›" : "收起编辑 ⌄";
-    });
+    $("btn-open-shared-skill")?.addEventListener("click", openSharedSkillModal);
+    $("shared-skill-close")?.addEventListener("click", closeSharedSkillModal);
+    $("shared-skill-cancel")?.addEventListener("click", closeSharedSkillModal);
+    $("shared-skill-backdrop")?.addEventListener("click", closeSharedSkillModal);
     $("btn-save-shared-skill")?.addEventListener("click", () => saveSharedSkill(false));
     $("btn-reset-shared-skill")?.addEventListener("click", () => saveSharedSkill(true));
+    $("btn-events-goto-connect")?.addEventListener("click", () => switchTab("verify"));
+    $("btn-rules-goto-mistakes")?.addEventListener("click", () => switchTab("mistakes"));
     $("btn-generic-mcp")?.addEventListener("click", openGenericMCPModal);
     $("generic-mcp-close")?.addEventListener("click", closeGenericMCPModal);
     $("generic-mcp-cancel")?.addEventListener("click", closeGenericMCPModal);
@@ -2108,6 +2170,8 @@
       if (e.key !== "Escape") return;
       if (!$("diff-preview-modal").hidden) {
         closeDiffModal();
+      } else if (!$("shared-skill-modal").hidden) {
+        closeSharedSkillModal();
       } else if (!$("generic-mcp-modal").hidden) {
         closeGenericMCPModal();
       } else if (!$("add-project-modal").hidden) {

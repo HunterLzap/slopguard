@@ -369,42 +369,21 @@
             </div>
           </div>
 
-          <!-- 3. Agent 接入（Magpie 风格：共享护栏指令 + Agent 开关列表） -->
+          <!-- 3. Agent 接入（Magpie 风格：顶部按钮弹窗编辑共享指令 + Agent 开关列表） -->
           <div class="card" id="agent-connect-card">
             <div class="card-header">
               <div class="title-with-tip">
                 <h2>Agent 接入</h2>
-                <button type="button" class="help-tip" data-tip="只需编辑一次共享护栏指令，勾选下方任意 Agent 即可自动接入 MCP 与规则（修改全局配置前先预览 Diff 并备份至 ~/.slopguard/backups/）" aria-label="Agent 接入说明">?</button>
+                <button type="button" class="help-tip" data-tip="勾选下方任意 Agent 即可自动接入 MCP 与共享护栏规则；修改全局配置前会先预览 Diff 并自动备份至 ~/.slopguard/backups/" aria-label="Agent 接入说明">?</button>
               </div>
               <div class="card-header-actions">
+                <button id="btn-open-shared-skill" class="btn btn-sm btn-secondary" type="button">共享护栏指令</button>
                 <button id="btn-generic-mcp" class="btn btn-sm btn-secondary" type="button">通用配置</button>
                 <button id="btn-refresh-mcp" class="btn btn-sm btn-ghost" type="button">刷新</button>
               </div>
             </div>
             <div class="card-body stack-list">
               <div id="mcp-project-hint" class="quick-project-bar subtle-bar" hidden></div>
-
-              <div class="shared-skill-box">
-                <div class="shared-skill-row">
-                  <div class="shared-skill-meta">
-                    <span>📄 共享护栏指令</span>
-                    <span id="shared-skill-badge" class="pill accent">默认</span>
-                    <code id="shared-skill-path" class="mcp-client-path mono">SKILL.md</code>
-                  </div>
-                  <button id="btn-toggle-shared-skill" class="btn btn-sm btn-ghost" type="button">查看 / 编辑 ›</button>
-                </div>
-                <div id="shared-skill-drawer" hidden>
-                  <textarea id="shared-skill-editor" class="code-editor" spellcheck="false" aria-label="共享护栏指令编辑框"></textarea>
-                  <div class="shared-skill-actions">
-                    <span id="shared-skill-feedback" class="muted" style="font-size:11px;">保存后将自动同步至已勾选的 Agent</span>
-                    <div class="card-header-actions">
-                      <button id="btn-reset-shared-skill" class="btn btn-sm btn-ghost" type="button">恢复默认</button>
-                      <button id="btn-save-shared-skill" class="btn btn-sm btn-primary" type="button">保存并同步</button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
               <div class="agent-section-head">
                 <span class="section-subhead">AGENT</span>
               </div>
@@ -417,11 +396,11 @@
         <section id="tab-mistakes" class="tab-panel" hidden>
           <div class="card filter-bar">
             <div class="review-pills" id="mistakes-review-tabs" role="tablist" aria-label="错题审核状态">
-              <button class="review-pill active" data-review-status="pending_user" type="button">
+              <button class="review-pill active" data-review-status="pending_user" type="button" data-tip="Agent 已给出分析建议，确认无误后点击「确认入库」即可转为自动防线规则">
                 <span>待我校验</span>
                 <span class="pill-count" id="count-pending-user">0</span>
               </button>
-              <button class="review-pill" data-review-status="pending_ai" type="button">
+              <button class="review-pill" data-review-status="pending_ai" type="button" data-tip="自动守护或体检捕获的原始报错；配合 Agent 体检会自动分析，也可手动批量复制指令">
                 <span>待分析</span>
                 <span class="pill-count" id="count-pending-ai">0</span>
               </button>
@@ -429,7 +408,7 @@
                 <span>全部</span>
                 <span class="pill-count" id="count-all-mistakes">0</span>
               </button>
-              <button class="review-pill" data-review-status="approved" type="button">
+              <button class="review-pill" data-review-status="approved" type="button" data-tip="已转化为自动拦截规则，可在「规则台账」查看">
                 <span>已入库</span>
                 <span class="pill-count" id="count-approved">0</span>
               </button>
@@ -453,11 +432,11 @@
               </label>
               <label class="filter-field search-field">
                 <span>搜索</span>
-                <input id="mistakes-filter-q" type="search" placeholder="关键词 / 指纹">
+                <input id="mistakes-filter-q" type="search" placeholder="搜索报错描述或代码片段">
               </label>
             </div>
             <div class="filter-group">
-              <button id="btn-copy-batch-analyze" class="btn btn-secondary btn-sm" type="button" hidden>批量复制分析指令</button>
+              <button id="btn-copy-batch-analyze" class="btn btn-secondary btn-sm" type="button" hidden data-tip="复制全部待分析错题，一次性粘贴给你的 AI Agent 完成评估并推送至「待我校验」">批量复制分析指令</button>
               <div class="title-with-tip">
                 <button id="btn-scan-sessions" class="btn btn-secondary btn-sm" type="button">嗅探会话</button>
                 <button type="button" class="help-tip" data-tip="纯只读扫描近 14 天本地 Claude / Codex / Antigravity 会话日志与 Git fix 提交，零配置修改" aria-label="嗅探说明">?</button>
@@ -469,13 +448,17 @@
           <div id="session-scan-banner" class="banner banner-info" hidden></div>
 
           <div id="mistakes-list" class="stack-list"></div>
-          <p id="mistakes-empty" class="empty-state card" hidden>暂无错题</p>
+          <p id="mistakes-empty" class="empty-state card" hidden>当前分类暂无错题 · 可点击右上「立即体检」或「嗅探会话」自动捕获</p>
         </section>
 
         <!-- TAB: AGENT 活动 -->
         <section id="tab-events" class="tab-panel" hidden>
           <div class="card filter-bar">
             <div class="filter-group">
+              <div class="title-with-tip">
+                <span class="section-inline-title">MCP 审计日志</span>
+                <button type="button" class="help-tip" data-tip="实时记录 Cursor、Antigravity、Claude Code 等 AI 工具通过 MCP 调用 SlopGuard 的每次检查与结果" aria-label="Agent 活动说明">?</button>
+              </div>
               <label class="filter-field">
                 <span>工具</span>
                 <select id="events-filter-tool">
@@ -497,18 +480,18 @@
                   <tr>
                     <th>时间</th>
                     <th>项目</th>
-                    <th>工具</th>
-                    <th>参数</th>
-                    <th>结果</th>
-                    <th class="num">发现</th>
+                    <th>调用动作</th>
+                    <th>详情</th>
+                    <th>结果 <button type="button" class="help-tip" data-tip="「通过」表示未违反门禁；「已拦截」表示发现问题并提示 AI 修复" aria-label="结果说明">?</button></th>
+                    <th class="num">发现问题</th>
                     <th class="num">耗时</th>
                   </tr>
                 </thead>
                 <tbody id="events-body"></tbody>
               </table>
               <div id="events-empty" class="empty-action-row" hidden>
-                <span class="muted">暂无活动记录</span>
-                <button type="button" class="help-tip" data-tip="Agent 通过 MCP 调用 sg_verify、sg_radar、sg_list_inbox 等工具后将在此实时显示" aria-label="活动说明">?</button>
+                <span class="muted">暂无 Agent 调用记录 · 开启对应 Agent 接入开关后，AI 每次写代码都会在此留下检查轨迹</span>
+                <button id="btn-events-goto-connect" class="btn btn-sm btn-secondary" type="button">去接入 Agent ›</button>
               </div>
             </div>
           </div>
@@ -518,14 +501,18 @@
         <section id="tab-rules" class="tab-panel" hidden>
           <div class="card filter-bar">
             <div class="filter-group">
+              <div class="title-with-tip">
+                <span class="section-inline-title">已生效规则</span>
+                <button type="button" class="help-tip" data-tip="在「错题栏」点击「确认入库」的错题会自动沉淀到这里，此后后台守护与体检都会自动拦截" aria-label="规则台账说明">?</button>
+              </div>
               <label class="filter-field">
-                <span>引擎</span>
+                <span>检查工具</span>
                 <select id="rules-filter-engine">
                   <option value="">全部</option>
                 </select>
               </label>
               <label class="filter-field">
-                <span>作用域</span>
+                <span>生效范围</span>
                 <select id="rules-filter-scope">
                   <option value="">全部</option>
                   <option value="project">项目级</option>
@@ -547,19 +534,22 @@
               <table class="data-table">
                 <thead>
                   <tr>
-                    <th>作用域</th>
-                    <th>引擎</th>
-                    <th>规则</th>
-                    <th>说明</th>
+                    <th>生效范围</th>
+                    <th>检查工具</th>
+                    <th>规则名</th>
+                    <th>拦截原因</th>
                     <th>来源</th>
-                    <th>时间</th>
-                    <th class="num">命中</th>
-                    <th class="num">载荷</th>
+                    <th>入库时间</th>
+                    <th class="num">拦截次数</th>
+                    <th class="num">规则内容</th>
                   </tr>
                 </thead>
                 <tbody id="rules-body"></tbody>
               </table>
-              <p id="rules-empty" class="empty-state" hidden>暂无规则</p>
+              <div id="rules-empty" class="empty-action-row" hidden>
+                <span class="muted">暂无已入库规则 · 在「错题栏」确认一条高频错题即可自动沉淀为拦截规则</span>
+                <button id="btn-rules-goto-mistakes" class="btn btn-sm btn-secondary" type="button">去错题栏 ›</button>
+              </div>
             </div>
           </div>
         </section>
@@ -569,6 +559,7 @@
           <div class="card filter-bar">
             <div class="filter-group">
               <span id="radar-project-badge" class="pill">未选项目</span>
+              <span class="muted" style="font-size:12px;">追踪项目跳过注释水位与高风险文件</span>
             </div>
             <div class="filter-group">
               <label class="filter-field">
@@ -582,19 +573,19 @@
             </div>
           </div>
 
-          <div id="radar-skipped-banner" class="banner banner-warn" hidden></div>
+          <div id="radar-skipped-banner" class="banner banner-info" hidden></div>
 
           <div class="radar-layout">
             <div class="card">
               <div class="card-header">
                 <div class="title-with-tip">
-                  <h2>基线棘轮</h2>
-                  <button type="button" class="help-tip" data-tip="限制跳过注释（如 # type: ignore / # noqa / @ts-ignore）只减不增；清理后可点「收紧」锁定更严上限" aria-label="基线说明">?</button>
+                  <h2>跳过注释基线</h2>
+                  <button type="button" class="help-tip" data-tip="允许保留历史存量，但只准减少不准新增（如 # type: ignore / # noqa / @ts-ignore），防止 AI 靠加跳过注释偷懒绕过检查" aria-label="基线说明">?</button>
                   <span id="baseline-updated" class="muted mono"></span>
                 </div>
                 <div class="card-header-actions">
-                  <button id="btn-baseline-tighten" class="btn btn-sm btn-secondary" type="button">收紧</button>
-                  <button id="btn-baseline-reset" class="btn btn-sm btn-ghost" type="button">重置</button>
+                  <button id="btn-baseline-tighten" class="btn btn-sm btn-secondary" type="button" data-tip="若当前跳过注释已比上次减少，点击「收紧」把上限锁定到更低的当前数量，防止反弹">收紧</button>
+                  <button id="btn-baseline-reset" class="btn btn-sm btn-ghost" type="button" data-tip="以项目当前实际数量重新设立基准上限（适合首次接管项目或集中清理历史债务后）">重置</button>
                   <span id="baseline-state" class="pill">—</span>
                 </div>
               </div>
@@ -614,7 +605,7 @@
               <div class="card-header">
                 <div class="title-with-tip">
                   <h2>热点文件</h2>
-                  <button type="button" class="help-tip" data-tip="综合被引用、复杂度、跳过注释、返工、死代码、重复度 6 维计算传染风险分" aria-label="热点说明">?</button>
+                  <button type="button" class="help-tip" data-tip="综合以下 6 个指标计算文件的失控传染风险，数值越高越值得优先重构" aria-label="热点说明">?</button>
                 </div>
                 <span id="hotspots-count" class="muted">0 个</span>
               </div>
@@ -623,18 +614,18 @@
                   <thead>
                     <tr>
                       <th>文件</th>
-                      <th class="num">风险分</th>
-                      <th class="num">引用</th>
-                      <th class="num">复杂度</th>
-                      <th class="num">跳过注释</th>
-                      <th class="num">返工</th>
-                      <th class="num">死代码</th>
-                      <th class="num">重复</th>
+                      <th class="num">风险分 <button type="button" class="help-tip" data-tip="综合传染风险总分：≥15 高风险（红），7~14 中风险（橙）" aria-label="风险分说明">?</button></th>
+                      <th class="num">引用 <button type="button" class="help-tip" data-tip="被其他文件 import 引用的次数，越高说明改坏后波及面越大" aria-label="引用说明">?</button></th>
+                      <th class="num">复杂度 <button type="button" class="help-tip" data-tip="函数分支与嵌套深度指标，越高越难维护" aria-label="复杂度说明">?</button></th>
+                      <th class="num">跳过注释 <button type="button" class="help-tip" data-tip="该文件内 # type: ignore / # noqa / @ts-ignore 等跳过检查注释数量" aria-label="跳过注释说明">?</button></th>
+                      <th class="num">返工 <button type="button" class="help-tip" data-tip="近期 Git 频繁修补（fix/revert）的次数，越高说明该文件容易反复出错" aria-label="返工说明">?</button></th>
+                      <th class="num">死代码 <button type="button" class="help-tip" data-tip="静态检测出的疑似未使用函数、变量或不可达分支" aria-label="死代码说明">?</button></th>
+                      <th class="num">重复 <button type="button" class="help-tip" data-tip="与其他文件存在重复粘贴代码块的命中数" aria-label="重复说明">?</button></th>
                     </tr>
                   </thead>
                   <tbody id="hotspot-body"></tbody>
                 </table>
-                <p id="hotspot-empty" class="empty-state" hidden>暂无热点数据</p>
+                <p id="hotspot-empty" class="empty-state" hidden>暂无高风险热点文件</p>
               </div>
             </div>
           </div>
@@ -687,6 +678,33 @@
         <div class="modal-actions">
           <button id="diff-preview-cancel" class="btn btn-ghost" type="button">取消</button>
           <button id="btn-confirm-diff-apply" class="btn btn-primary" type="button">确认写入</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 共享护栏指令编辑弹窗 -->
+  <div id="shared-skill-modal" class="lightbox" hidden role="dialog" aria-modal="true" aria-label="共享护栏指令">
+    <div class="lightbox-backdrop" id="shared-skill-backdrop"></div>
+    <div class="modal-dialog modal-wide">
+      <div class="lightbox-header">
+        <div class="title-with-tip">
+          <strong>共享护栏指令</strong>
+          <span id="shared-skill-badge" class="pill accent">默认</span>
+          <button type="button" class="help-tip" data-tip="只写这一份护栏规则（SKILL.md）；保存后会自动同步至已开启开关的所有 Agent" aria-label="共享护栏指令说明">?</button>
+        </div>
+        <button id="shared-skill-close" class="icon-btn" type="button" aria-label="关闭">✕</button>
+      </div>
+      <div class="modal-body">
+        <code id="shared-skill-path" class="mcp-client-path mono">~/.slopguard/shared-skill.md</code>
+        <textarea id="shared-skill-editor" class="code-editor" spellcheck="false" aria-label="共享护栏指令编辑框"></textarea>
+        <p id="shared-skill-feedback" class="modal-feedback muted">保存后将自动同步至已勾选的 Agent</p>
+        <div class="shared-skill-actions" style="margin-top:0;">
+          <button id="btn-reset-shared-skill" class="btn btn-sm btn-ghost" type="button">恢复默认</button>
+          <div class="card-header-actions">
+            <button id="shared-skill-cancel" class="btn btn-ghost" type="button">关闭</button>
+            <button id="btn-save-shared-skill" class="btn btn-primary" type="button">保存并同步</button>
+          </div>
         </div>
       </div>
     </div>

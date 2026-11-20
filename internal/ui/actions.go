@@ -2,12 +2,14 @@ package ui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 func (s *Server) registerActionRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/pick-folder", s.handlePickFolder)
 	mux.HandleFunc("/api/projects/add", s.handleAddProject)
+	mux.HandleFunc("/api/projects/remove", s.handleRemoveProject)
 	mux.HandleFunc("/api/service/toggle", s.handleServiceToggle)
 	mux.HandleFunc("/api/baseline/tighten", s.handleBaselineTighten)
 	mux.HandleFunc("/api/baseline/reset", s.handleBaselineReset)
@@ -144,6 +147,7 @@ func (s *Server) handleAddProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "所选路径不存在或不是目录")
 		return
 	}
+	_ = setProjectHidden(s.resolveHomeDir(), absPath, false)
 
 	initOut, initCode, initErr := runSelfCLI(r.Context(), "init", "--yes", "--root", absPath)
 	if initErr != nil || initCode != 0 {
@@ -182,6 +186,242 @@ func (s *Server) handleAddProject(w http.ResponseWriter, r *http.Request) {
 		"init_output":   initOut,
 		"verify_output": verifyOut,
 		"guard":         guardSt,
+	})
+}
+
+func hiddenProjectsFilePath(home string) string {
+	if strings.TrimSpace(home) == "" {
+		return ""
+	}
+	return filepath.Join(home, ".slopguard", "hidden-projects.json")
+}
+
+func projectAliasKeys(raw string) []string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil
+	}
+	seen := make(map[string]struct{}, 4)
+	out := make([]string, 0, 4)
+	add := func(v string) {
+		v = filepath.Clean(strings.TrimSpace(v))
+		if v == "" {
+			return
+		}
+		if _, ok := seen[v]; !ok {
+			seen[v] = struct{}{}
+			out = append(out, v)
+		}
+	}
+	add(trimmed)
+	if abs, err := filepath.Abs(trimmed); err == nil {
+		add(abs)
+	}
+	if realPath := resolveTargetRealPath(trimmed); realPath != "" {
+		add(realPath)
+	}
+	if runtime.GOOS == "darwin" {
+		for _, item := range append([]string(nil), out...) {
+			if strings.HasPrefix(item, "/private/var/") {
+				add("/var/" + strings.TrimPrefix(item, "/private/var/"))
+			} else if strings.HasPrefix(item, "/var/") {
+				add("/private/var/" + strings.TrimPrefix(item, "/var/"))
+			} else if strings.HasPrefix(item, "/private/tmp/") {
+				add("/tmp/" + strings.TrimPrefix(item, "/private/tmp/"))
+			} else if strings.HasPrefix(item, "/tmp/") {
+				add("/private/tmp/" + strings.TrimPrefix(item, "/tmp/"))
+			}
+		}
+	}
+	return out
+}
+
+func loadHiddenProjects(home string) map[string]struct{} {
+	out := make(map[string]struct{})
+	path := hiddenProjectsFilePath(home)
+	if path == "" {
+		return out
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	var list []string
+	if err := json.Unmarshal(data, &list); err != nil {
+		return out
+	}
+	for _, item := range list {
+		for _, alias := range projectAliasKeys(item) {
+			out[alias] = struct{}{}
+		}
+	}
+	return out
+}
+
+func isProjectHidden(hidden map[string]struct{}, project string) bool {
+	if len(hidden) == 0 {
+		return false
+	}
+	for _, alias := range projectAliasKeys(project) {
+		if _, ok := hidden[alias]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func setProjectHidden(home, project string, hide bool) error {
+	path := hiddenProjectsFilePath(home)
+	if path == "" {
+		return nil
+	}
+	aliases := projectAliasKeys(project)
+	if len(aliases) == 0 {
+		return nil
+	}
+	aliasSet := make(map[string]struct{}, len(aliases))
+	for _, a := range aliases {
+		aliasSet[a] = struct{}{}
+	}
+
+	var existing []string
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &existing)
+	}
+	kept := make([]string, 0, len(existing)+1)
+	seen := make(map[string]struct{}, len(existing)+1)
+	for _, item := range existing {
+		clean := filepath.Clean(strings.TrimSpace(item))
+		if clean == "" {
+			continue
+		}
+		if _, match := aliasSet[clean]; match {
+			continue
+		}
+		if _, dup := seen[clean]; !dup {
+			seen[clean] = struct{}{}
+			kept = append(kept, clean)
+		}
+	}
+	if hide {
+		canonical := aliases[0]
+		if resolved := resolveTargetRealPath(canonical); resolved != "" {
+			canonical = resolved
+		}
+		if _, dup := seen[canonical]; !dup {
+			kept = append(kept, canonical)
+		}
+	}
+	sort.Strings(kept)
+	encoded, err := json.MarshalIndent(kept, "", "  ")
+	if err != nil {
+		return err
+	}
+	encoded = append(encoded, '\n')
+	return writeFileAtomicWithDirMode(path, encoded, 0o600, 0o700)
+}
+
+func (s *Server) handleRemoveProject(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	var req struct {
+		Project string `json:"project"`
+		Mode    string `json:"mode"` // "keep" | "purge"
+	}
+	if !decodeJSONBody(w, r, &req, false) {
+		return
+	}
+	rawProject := strings.TrimSpace(req.Project)
+	if rawProject == "" || isFilesystemRootPath(rawProject) {
+		writeError(w, http.StatusBadRequest, "无效的项目路径")
+		return
+	}
+	absPath, err := filepath.Abs(rawProject)
+	if err != nil || isFilesystemRootPath(absPath) {
+		writeError(w, http.StatusBadRequest, "无效的项目路径")
+		return
+	}
+	absPath = filepath.Clean(absPath)
+
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	if mode == "" {
+		mode = "keep"
+	}
+	if mode != "keep" && mode != "purge" {
+		writeError(w, http.StatusBadRequest, "mode 必须为 keep 或 purge")
+		return
+	}
+
+	home := s.resolveHomeDir()
+	if mode == "keep" {
+		if s.guard != nil {
+			_ = s.guard.DisableProjectWatcherIfConfigured(absPath)
+		}
+		if err := setProjectHidden(home, absPath, true); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("保存项目隐藏状态失败: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":      true,
+			"project": absPath,
+			"mode":    "keep",
+		})
+		return
+	}
+
+	// mode == "purge": stop/remove guard, clean SlopGuard-managed project artifacts, and delete DB data.
+	if s.guard != nil {
+		if err := s.guard.RemoveProject(absPath); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("移除自动守护配置失败: %v", err))
+			return
+		}
+	}
+	if _, hookErr := uninstallGitPostCommitHook(s.backupsDir(), absPath); hookErr != nil && !isSurgicalFallbackEligibleErr(hookErr) {
+		writeError(w, http.StatusConflict, fmt.Sprintf("清理 Git Hook 失败: %v", hookErr))
+		return
+	}
+	if hookPath, isGit := resolveGitHookPath(absPath); isGit && hookPath != "" {
+		if data, readErr := os.ReadFile(hookPath); readErr == nil && strings.Contains(string(data), gitHookStartMarker) {
+			stripped := stripHookMarkerBlock(string(data))
+			trimmed := strings.TrimSpace(stripped)
+			if trimmed == "" || trimmed == "#!/bin/sh" || trimmed == "#!/usr/bin/env sh" {
+				_ = os.Remove(hookPath)
+			} else {
+				_ = writeFileAtomic(hookPath, []byte(stripped), existingFileModeOrDefault(hookPath, 0o755))
+			}
+		}
+	}
+	for _, client := range discoverMCPClients(home, absPath) {
+		if client.Scope == "project" && client.Configured {
+			_, _, _ = s.applyMCPTargetWithFallback(client, absPath, "restore", nil, true)
+		}
+	}
+	for _, sk := range discoverSkillTargets(home, absPath) {
+		if sk.Scope == "project" && sk.Configured {
+			_, _, _ = s.applySkillTargetWithFallback(home, sk, "restore", nil, true)
+		}
+	}
+	sgDir := filepath.Join(absPath, ".slopguard")
+	if info, statErr := os.Stat(sgDir); statErr == nil && info.IsDir() {
+		if err := os.RemoveAll(sgDir); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("清理 .slopguard 目录失败: %v", err))
+			return
+		}
+	}
+	if s.db != nil {
+		if err := s.db.DeleteProjectData(r.Context(), absPath); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("清理项目数据库记录失败: %v", err))
+			return
+		}
+	}
+	_ = setProjectHidden(home, absPath, false)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"project": absPath,
+		"mode":    "purge",
 	})
 }
 
@@ -359,21 +599,22 @@ func readFileTextOrEmpty(path string) (string, bool, error) {
 }
 
 type targetDiffSummary struct {
-	Kind       string `json:"kind"`
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Scope      string `json:"scope"`
-	ConfigPath string `json:"config_path"`
-	Action     string `json:"action"`
-	Existed    bool   `json:"existed"`
-	BaseSHA256 string `json:"base_sha256,omitempty"`
-	NewSHA256  string `json:"new_sha256,omitempty"`
-	PreviewID  string `json:"preview_id,omitempty"`
-	ExpiresAt  string `json:"expires_at,omitempty"`
-	HasChanges bool   `json:"has_changes"`
-	HasBackup  bool   `json:"has_backup"`
-	BackupAt   string `json:"backup_at,omitempty"`
-	Diff       string `json:"diff"`
+	Kind             string `json:"kind"`
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	Scope            string `json:"scope"`
+	ConfigPath       string `json:"config_path"`
+	Action           string `json:"action"`
+	Existed          bool   `json:"existed"`
+	BaseSHA256       string `json:"base_sha256,omitempty"`
+	NewSHA256        string `json:"new_sha256,omitempty"`
+	PreviewID        string `json:"preview_id,omitempty"`
+	ExpiresAt        string `json:"expires_at,omitempty"`
+	HasChanges       bool   `json:"has_changes"`
+	HasBackup        bool   `json:"has_backup"`
+	BackupAt         string `json:"backup_at,omitempty"`
+	SurgicalFallback bool   `json:"surgical_fallback,omitempty"`
+	Diff             string `json:"diff"`
 }
 
 func backupTargetForMCP(target mcpClientStatus) backupTarget {
@@ -422,9 +663,17 @@ func mutationStatus(status int, err error) int {
 	return status
 }
 
+func isSurgicalFallbackEligibleErr(err error) bool {
+	return errors.Is(err, ErrLegacyBackupNeedsReview) || errors.Is(err, ErrManagedConfigModified)
+}
+
 func (s *Server) previewMCPTarget(target mcpClientStatus, project, action string) (targetDiffSummary, int, error) {
+	return s.previewMCPTargetWithFallback(target, project, action, false)
+}
+
+func (s *Server) previewMCPTargetWithFallback(target mcpClientStatus, project, action string, allowSurgicalFallback bool) (targetDiffSummary, int, error) {
 	var oldText, newText string
-	var existed, deleteFile bool
+	var existed, deleteFile, surgicalFallback bool
 	var err error
 	switch action {
 	case "install":
@@ -443,16 +692,23 @@ func (s *Server) previewMCPTarget(target mcpClientStatus, project, action string
 			if ok {
 				plan, planErr := planManagedUninstall(s.backupsDir(), backupTargetForMCP(target), rec)
 				if planErr != nil {
-					return targetDiffSummary{}, mutationStatus(http.StatusConflict, planErr), planErr
-				}
-				switch plan.Action {
-				case uninstallDeleteFile:
-					newText = ""
-					deleteFile = true
-				case uninstallNoop:
-					newText = oldText
-				default:
-					newText = string(plan.NewData)
+					if !allowSurgicalFallback || !isSurgicalFallbackEligibleErr(planErr) {
+						return targetDiffSummary{}, mutationStatus(http.StatusConflict, planErr), planErr
+					}
+					surgicalFallback = true
+					var removeFile bool
+					_, newText, removeFile, err = renderMCPRemove(target.ConfigPath)
+					deleteFile = removeFile
+				} else {
+					switch plan.Action {
+					case uninstallDeleteFile:
+						newText = ""
+						deleteFile = true
+					case uninstallNoop:
+						newText = oldText
+					default:
+						newText = string(plan.NewData)
+					}
 				}
 			} else {
 				var removeFile bool
@@ -476,29 +732,35 @@ func (s *Server) previewMCPTarget(target mcpClientStatus, project, action string
 	}
 	diff := buildUnifiedDiff(target.ConfigPath, oldText, newText, 3)
 	return targetDiffSummary{
-		Kind:       "mcp",
-		ID:         target.ID,
-		Name:       target.Name,
-		Scope:      target.Scope,
-		ConfigPath: target.ConfigPath,
-		Action:     action,
-		Existed:    existed,
-		BaseSHA256: baseHash,
-		NewSHA256:  newHash,
-		HasChanges: diff != "",
-		HasBackup:  target.HasBackup,
-		BackupAt:   target.BackupAt,
-		Diff:       diff,
+		Kind:             "mcp",
+		ID:               target.ID,
+		Name:             target.Name,
+		Scope:            target.Scope,
+		ConfigPath:       target.ConfigPath,
+		Action:           action,
+		Existed:          existed,
+		BaseSHA256:       baseHash,
+		NewSHA256:        newHash,
+		HasChanges:       diff != "",
+		HasBackup:        target.HasBackup,
+		BackupAt:         target.BackupAt,
+		SurgicalFallback: surgicalFallback,
+		Diff:             diff,
 	}, http.StatusOK, nil
 }
 
 func (s *Server) previewSkillTarget(home string, target skillTargetStatus, action string) (targetDiffSummary, int, error) {
+	return s.previewSkillTargetWithFallback(home, target, action, false)
+}
+
+func (s *Server) previewSkillTargetWithFallback(home string, target skillTargetStatus, action string, allowSurgicalFallback bool) (targetDiffSummary, int, error) {
 	oldText, existed, err := readFileTextOrEmpty(target.ConfigPath)
 	if err != nil {
 		return targetDiffSummary{}, http.StatusInternalServerError, err
 	}
 	var newText string
 	deleteFile := false
+	surgicalFallback := false
 	switch action {
 	case "install":
 		rendered := renderSkillContent(home, target.ID)
@@ -514,25 +776,38 @@ func (s *Server) previewSkillTarget(home string, target skillTargetStatus, actio
 		if ok {
 			plan, planErr := planManagedUninstall(s.backupsDir(), backupTargetForSkill(target), rec)
 			if planErr != nil {
-				return targetDiffSummary{}, mutationStatus(http.StatusConflict, planErr), planErr
-			}
-			switch plan.Action {
-			case uninstallDeleteFile:
-				newText = ""
-				deleteFile = true
-			case uninstallNoop:
-				newText = oldText
-			default:
-				newText = string(plan.NewData)
+				if !allowSurgicalFallback || !isSurgicalFallbackEligibleErr(planErr) {
+					return targetDiffSummary{}, mutationStatus(http.StatusConflict, planErr), planErr
+				}
+				surgicalFallback = true
+				if extractSkillManagedBlock(oldText) != "" {
+					newText = removeSkillManagedBlock(oldText)
+					deleteFile = strings.TrimSpace(newText) == ""
+				} else {
+					newText = oldText
+				}
+			} else {
+				switch plan.Action {
+				case uninstallDeleteFile:
+					newText = ""
+					deleteFile = true
+				case uninstallNoop:
+					newText = oldText
+				default:
+					newText = string(plan.NewData)
+				}
 			}
 		} else if strings.TrimSpace(oldText) != "" {
-			// Without a trustworthy backup, only remove a managed block if it is
-			// explicitly present; never delete an unknown user-owned file.
 			if extractSkillManagedBlock(oldText) == "" {
-				return targetDiffSummary{}, http.StatusConflict, ErrLegacyBackupNeedsReview
+				if !allowSurgicalFallback {
+					return targetDiffSummary{}, http.StatusConflict, ErrLegacyBackupNeedsReview
+				}
+				surgicalFallback = true
+				newText = oldText
+			} else {
+				newText = removeSkillManagedBlock(oldText)
+				deleteFile = strings.TrimSpace(newText) == ""
 			}
-			newText = removeSkillManagedBlock(oldText)
-			deleteFile = strings.TrimSpace(newText) == ""
 		}
 	default:
 		return targetDiffSummary{}, http.StatusBadRequest, errors.New("不支持的预览操作类型")
@@ -547,46 +822,57 @@ func (s *Server) previewSkillTarget(home string, target skillTargetStatus, actio
 	}
 	diff := buildUnifiedDiff(target.ConfigPath, oldText, newText, 3)
 	return targetDiffSummary{
-		Kind:       "skill",
-		ID:         target.ID,
-		Name:       target.Name,
-		Scope:      target.Scope,
-		ConfigPath: target.ConfigPath,
-		Action:     action,
-		Existed:    existed,
-		BaseSHA256: baseHash,
-		NewSHA256:  newHash,
-		HasChanges: diff != "",
-		HasBackup:  target.HasBackup,
-		BackupAt:   target.BackupAt,
-		Diff:       diff,
+		Kind:             "skill",
+		ID:               target.ID,
+		Name:             target.Name,
+		Scope:            target.Scope,
+		ConfigPath:       target.ConfigPath,
+		Action:           action,
+		Existed:          existed,
+		BaseSHA256:       baseHash,
+		NewSHA256:        newHash,
+		HasChanges:       diff != "",
+		HasBackup:        target.HasBackup,
+		BackupAt:         target.BackupAt,
+		SurgicalFallback: surgicalFallback,
+		Diff:             diff,
 	}, http.StatusOK, nil
 }
 
 func (s *Server) applyMCPTarget(target mcpClientStatus, project, action string, lease *applyLease) (map[string]any, int, error) {
+	return s.applyMCPTargetWithFallback(target, project, action, lease, false)
+}
+
+func (s *Server) applyMCPTargetWithFallback(target mcpClientStatus, project, action string, lease *applyLease, allowSurgicalFallback bool) (map[string]any, int, error) {
 	if action == "restore" {
-		_, rec, hasBackup, checkErr := lookupBackupChecked(s.backupsDir(), "mcp", target.ID, target.ConfigPath)
+		bakPath, rec, hasBackup, checkErr := lookupBackupChecked(s.backupsDir(), "mcp", target.ID, target.ConfigPath)
 		if checkErr != nil {
 			return nil, mutationStatus(http.StatusConflict, checkErr), checkErr
 		}
 		removedFile := false
 		restoredFromBackup := false
+		useSurgical := !hasBackup
 		if hasBackup {
 			plan, planErr := planManagedUninstall(s.backupsDir(), backupTargetForMCP(target), rec)
 			if planErr != nil {
-				return nil, mutationStatus(http.StatusConflict, planErr), planErr
-			}
-			if lease != nil {
-				if err := plan.verify(lease, target.ConfigPath); err != nil {
+				if !allowSurgicalFallback || !isSurgicalFallbackEligibleErr(planErr) {
+					return nil, mutationStatus(http.StatusConflict, planErr), planErr
+				}
+				useSurgical = true
+			} else {
+				if lease != nil {
+					if err := plan.verify(lease, target.ConfigPath); err != nil {
+						return nil, mutationStatus(http.StatusConflict, err), err
+					}
+				}
+				if err := applyManagedUninstall(s.backupsDir(), backupTargetForMCP(target), plan); err != nil {
 					return nil, mutationStatus(http.StatusConflict, err), err
 				}
+				restoredFromBackup = true
+				removedFile = plan.Action == uninstallDeleteFile
 			}
-			if err := applyManagedUninstall(s.backupsDir(), backupTargetForMCP(target), plan); err != nil {
-				return nil, mutationStatus(http.StatusConflict, err), err
-			}
-			restoredFromBackup = true
-			removedFile = plan.Action == uninstallDeleteFile
-		} else {
+		}
+		if useSurgical {
 			oldText, newText, shouldRemove, remErr := renderMCPRemove(target.ConfigPath)
 			if remErr != nil {
 				return nil, mutationStatus(http.StatusConflict, remErr), remErr
@@ -611,6 +897,9 @@ func (s *Server) applyMCPTarget(target mcpClientStatus, project, action string, 
 				if err := writeFileAtomic(target.ConfigPath, []byte(newText), mode); err != nil {
 					return nil, http.StatusInternalServerError, err
 				}
+			}
+			if hasBackup && bakPath != "" {
+				_ = os.Remove(bakPath)
 			}
 		}
 		if target.ID == "antigravity" && !s.skipRealAgentCLI {
@@ -668,60 +957,76 @@ func (s *Server) applyMCPTarget(target mcpClientStatus, project, action string, 
 }
 
 func (s *Server) applySkillTarget(home string, target skillTargetStatus, action string, lease *applyLease) (map[string]any, int, error) {
+	return s.applySkillTargetWithFallback(home, target, action, lease, false)
+}
+
+func (s *Server) applySkillTargetWithFallback(home string, target skillTargetStatus, action string, lease *applyLease, allowSurgicalFallback bool) (map[string]any, int, error) {
 	if action == "restore" {
-		_, rec, hasBackup, checkErr := lookupBackupChecked(s.backupsDir(), "skill", target.ID, target.ConfigPath)
+		bakPath, rec, hasBackup, checkErr := lookupBackupChecked(s.backupsDir(), "skill", target.ID, target.ConfigPath)
 		if checkErr != nil {
 			return nil, mutationStatus(http.StatusConflict, checkErr), checkErr
 		}
 		removedFile := false
 		restoredFromBackup := false
+		useSurgical := !hasBackup
 		if hasBackup {
 			plan, planErr := planManagedUninstall(s.backupsDir(), backupTargetForSkill(target), rec)
 			if planErr != nil {
-				return nil, mutationStatus(http.StatusConflict, planErr), planErr
-			}
-			if lease != nil {
-				if err := plan.verify(lease, target.ConfigPath); err != nil {
+				if !allowSurgicalFallback || !isSurgicalFallbackEligibleErr(planErr) {
+					return nil, mutationStatus(http.StatusConflict, planErr), planErr
+				}
+				useSurgical = true
+			} else {
+				if lease != nil {
+					if err := plan.verify(lease, target.ConfigPath); err != nil {
+						return nil, mutationStatus(http.StatusConflict, err), err
+					}
+				}
+				if err := applyManagedUninstall(s.backupsDir(), backupTargetForSkill(target), plan); err != nil {
 					return nil, mutationStatus(http.StatusConflict, err), err
 				}
+				restoredFromBackup = true
+				removedFile = plan.Action == uninstallDeleteFile
 			}
-			if err := applyManagedUninstall(s.backupsDir(), backupTargetForSkill(target), plan); err != nil {
-				return nil, mutationStatus(http.StatusConflict, err), err
-			}
-			restoredFromBackup = true
-			removedFile = plan.Action == uninstallDeleteFile
-		} else {
+		}
+		if useSurgical {
 			oldText, _, readErr := readFileTextOrEmpty(target.ConfigPath)
 			if readErr != nil {
 				return nil, http.StatusInternalServerError, readErr
 			}
 			if strings.TrimSpace(oldText) != "" {
 				if extractSkillManagedBlock(oldText) == "" {
-					return nil, http.StatusConflict, ErrLegacyBackupNeedsReview
-				}
-				newText := removeSkillManagedBlock(oldText)
-				deleteFile := strings.TrimSpace(newText) == ""
-				if lease != nil {
-					if deleteFile {
-						if err := lease.checkDeletion(target.ConfigPath); err != nil {
+					if !allowSurgicalFallback {
+						return nil, http.StatusConflict, ErrLegacyBackupNeedsReview
+					}
+				} else {
+					newText := removeSkillManagedBlock(oldText)
+					deleteFile := strings.TrimSpace(newText) == ""
+					if lease != nil {
+						if deleteFile {
+							if err := lease.checkDeletion(target.ConfigPath); err != nil {
+								return nil, mutationStatus(http.StatusConflict, err), err
+							}
+						} else if err := lease.checkNewContent(target.ConfigPath, []byte(newText)); err != nil {
 							return nil, mutationStatus(http.StatusConflict, err), err
 						}
-					} else if err := lease.checkNewContent(target.ConfigPath, []byte(newText)); err != nil {
-						return nil, mutationStatus(http.StatusConflict, err), err
+					}
+					if deleteFile {
+						if err := os.Remove(target.ConfigPath); err != nil && !os.IsNotExist(err) {
+							return nil, http.StatusInternalServerError, err
+						}
+						removedFile = true
+						cleanupEmptySkillLeafDir("skill", target.ConfigPath)
+					} else {
+						mode := existingFileModeOrDefault(target.ConfigPath, defaultModeForTarget(target.Scope, "skill"))
+						if err := writeFileAtomic(target.ConfigPath, []byte(newText), mode); err != nil {
+							return nil, http.StatusInternalServerError, err
+						}
 					}
 				}
-				if deleteFile {
-					if err := os.Remove(target.ConfigPath); err != nil && !os.IsNotExist(err) {
-						return nil, http.StatusInternalServerError, err
-					}
-					removedFile = true
-					cleanupEmptySkillLeafDir("skill", target.ConfigPath)
-				} else {
-					mode := existingFileModeOrDefault(target.ConfigPath, defaultModeForTarget(target.Scope, "skill"))
-					if err := writeFileAtomic(target.ConfigPath, []byte(newText), mode); err != nil {
-						return nil, http.StatusInternalServerError, err
-					}
-				}
+			}
+			if hasBackup && bakPath != "" {
+				_ = os.Remove(bakPath)
 			}
 		}
 		return map[string]any{
@@ -1623,11 +1928,11 @@ func (s *Server) handlePreviewAgent(w http.ResponseWriter, r *http.Request) {
 	var paths []string
 	baseHashes := make(map[string]string, 2)
 	newHashes := make(map[string]string, 2)
-	var anyChanges, anyBackup bool
+	var anyChanges, anyBackup, anySurgicalFallback bool
 	var backupAt string
 
 	if prof.MCPTarget != nil {
-		d, status, err := s.previewMCPTarget(*prof.MCPTarget, project, action)
+		d, status, err := s.previewMCPTargetWithFallback(*prof.MCPTarget, project, action, true)
 		if err != nil {
 			writeError(w, status, err.Error())
 			return
@@ -1638,6 +1943,9 @@ func (s *Server) handlePreviewAgent(w http.ResponseWriter, r *http.Request) {
 		newHashes[d.ConfigPath] = d.NewSHA256
 		if d.HasChanges {
 			anyChanges = true
+		}
+		if d.SurgicalFallback {
+			anySurgicalFallback = true
 		}
 		if d.HasBackup {
 			anyBackup = true
@@ -1650,7 +1958,7 @@ func (s *Server) handlePreviewAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if prof.SkillTarget != nil {
-		d, status, err := s.previewSkillTarget(home, *prof.SkillTarget, action)
+		d, status, err := s.previewSkillTargetWithFallback(home, *prof.SkillTarget, action, true)
 		if err != nil {
 			writeError(w, status, err.Error())
 			return
@@ -1661,6 +1969,9 @@ func (s *Server) handlePreviewAgent(w http.ResponseWriter, r *http.Request) {
 		newHashes[d.ConfigPath] = d.NewSHA256
 		if d.HasChanges {
 			anyChanges = true
+		}
+		if d.SurgicalFallback {
+			anySurgicalFallback = true
 		}
 		if d.HasBackup {
 			anyBackup = true
@@ -1674,37 +1985,44 @@ func (s *Server) handlePreviewAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rec, err := s.createPreview(previewRecord{
-		Kind:      "agent",
-		TargetID:  prof.ID,
-		Project:   project,
-		Scope:     prof.Scope,
-		Action:    action,
-		Paths:     baseHashes,
-		NewHashes: newHashes,
+		Kind:             "agent",
+		TargetID:         prof.ID,
+		Project:          project,
+		Scope:            prof.Scope,
+		Action:           action,
+		SurgicalFallback: anySurgicalFallback,
+		Paths:            baseHashes,
+		NewHashes:        newHashes,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	legacyWarning := ""
+	if anySurgicalFallback {
+		legacyWarning = "旧版本备份缺少完整快照；本次将仅精确移除 SlopGuard 受管条目并保留您其余的配置，请核对 Diff 后确认。"
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":          true,
-		"kind":        "agent",
-		"agent_id":    prof.ID,
-		"client_id":   prof.ID,
-		"target_id":   prof.ID,
-		"name":        prof.Name,
-		"scope":       prof.Scope,
-		"action":      action,
-		"config_path": strings.Join(paths, " + "),
-		"base_hashes": baseHashes,
-		"new_hashes":  newHashes,
-		"preview_id":  rec.ID,
-		"expires_at":  rec.ExpiresAt.UTC().Format(time.RFC3339),
-		"has_changes": anyChanges,
-		"has_backup":  anyBackup,
-		"backup_at":   backupAt,
-		"targets":     diffs,
-		"diff":        strings.Join(combined, "\n"),
+		"ok":                true,
+		"kind":              "agent",
+		"agent_id":          prof.ID,
+		"client_id":         prof.ID,
+		"target_id":         prof.ID,
+		"name":              prof.Name,
+		"scope":             prof.Scope,
+		"action":            action,
+		"config_path":       strings.Join(paths, " + "),
+		"base_hashes":       baseHashes,
+		"new_hashes":        newHashes,
+		"preview_id":        rec.ID,
+		"expires_at":        rec.ExpiresAt.UTC().Format(time.RFC3339),
+		"has_changes":       anyChanges,
+		"has_backup":        anyBackup,
+		"backup_at":         backupAt,
+		"surgical_fallback": anySurgicalFallback,
+		"legacy_warning":    legacyWarning,
+		"targets":           diffs,
+		"diff":              strings.Join(combined, "\n"),
 	})
 }
 
@@ -1712,6 +2030,7 @@ func (s *Server) preflightAgentTargets(home string, prof *agentProfile, project,
 	if prof == nil {
 		return nil
 	}
+	allowSurgical := lease != nil && lease.record != nil && lease.record.SurgicalFallback
 	check := func(d targetDiffSummary, err error) error {
 		if err != nil {
 			return err
@@ -1722,13 +2041,13 @@ func (s *Server) preflightAgentTargets(home string, prof *agentProfile, project,
 		return lease.checkNewHash(d.ConfigPath, d.NewSHA256)
 	}
 	if prof.MCPTarget != nil {
-		d, _, err := s.previewMCPTarget(*prof.MCPTarget, project, action)
+		d, _, err := s.previewMCPTargetWithFallback(*prof.MCPTarget, project, action, allowSurgical)
 		if err := check(d, err); err != nil {
 			return err
 		}
 	}
 	if prof.SkillTarget != nil {
-		d, _, err := s.previewSkillTarget(home, *prof.SkillTarget, action)
+		d, _, err := s.previewSkillTargetWithFallback(home, *prof.SkillTarget, action, allowSurgical)
 		if err := check(d, err); err != nil {
 			return err
 		}
@@ -1803,10 +2122,11 @@ func (s *Server) handleToggleAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	allowSurgical := lease.record != nil && lease.record.SurgicalFallback
 	results := make([]map[string]any, 0, 2)
 	wroteMCP := false
 	if prof.MCPTarget != nil {
-		res, status, err := s.applyMCPTarget(*prof.MCPTarget, project, action, lease)
+		res, status, err := s.applyMCPTargetWithFallback(*prof.MCPTarget, project, action, lease, allowSurgical)
 		if err != nil {
 			writeError(w, status, err.Error())
 			return
@@ -1815,7 +2135,7 @@ func (s *Server) handleToggleAgent(w http.ResponseWriter, r *http.Request) {
 		results = append(results, res)
 	}
 	if prof.SkillTarget != nil {
-		res, status, err := s.applySkillTarget(home, *prof.SkillTarget, action, lease)
+		res, status, err := s.applySkillTargetWithFallback(home, *prof.SkillTarget, action, lease, allowSurgical)
 		if err != nil {
 			if wroteMCP && action == "install" && prof.MCPTarget != nil {
 				_, _, _ = s.applyMCPTarget(*prof.MCPTarget, project, "restore", nil)

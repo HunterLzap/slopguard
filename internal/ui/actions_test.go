@@ -1204,3 +1204,141 @@ func TestP1GitHookPathResolution(t *testing.T) {
 		t.Fatalf("git hook block must pin commit SHA via --commit, got:\n%s", block)
 	}
 }
+
+func TestAgentLegacyBackupSurgicalRestore(t *testing.T) {
+	home := t.TempDir()
+	db, err := store.Open(filepath.Join(t.TempDir(), "sg.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := NewServer(db, nil)
+	s.homeDir = home
+	handler := authedTestHandler(s)
+
+	// Legacy Codex TOML backup without InstalledSHA256 + extra user server added later.
+	codexTOML := filepath.Join(home, ".codex", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(codexTOML), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tomlContent := "model = \"o3\"\n\n[mcp_servers.user_other]\ncommand = \"npx\"\n\n[mcp_servers.slopguard]\ncommand = \"/usr/local/bin/slopguard\"\nargs = [\"mcp\"]\n"
+	if err := writeFileAtomic(codexTOML, []byte(tomlContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacyCodexBak := configBackupRecord{
+		Kind:          "mcp",
+		ID:            "codex",
+		TargetPath:    codexTOML,
+		Existed:       true,
+		OriginalBytes: []byte("model = \"o3\"\n"),
+	}
+	bakRaw, _ := json.Marshal(legacyCodexBak)
+	if err := writeFileAtomicWithDirMode(backupRecordPath(s.backupsDir(), "mcp", "codex", codexTOML), bakRaw, 0o600, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	pCode, pBody := postDashboardJSON(t, handler, "/api/agents/preview", map[string]any{
+		"agent_id": "codex",
+		"action":   "restore",
+	})
+	if pCode != http.StatusOK {
+		t.Fatalf("codex legacy restore preview = %d: %s", pCode, pBody)
+	}
+	preview := decodeDashboardJSON(t, pBody)
+	if preview["surgical_fallback"] != true {
+		t.Fatalf("expected surgical_fallback=true, got %v", preview)
+	}
+
+	tCode, tBody := postDashboardJSON(t, handler, "/api/agents/toggle", map[string]any{
+		"agent_id":        "codex",
+		"enable":          false,
+		"preview_id":      previewIDOf(t, preview),
+		"confirmed":       true,
+		"expected_hashes": preview["base_hashes"],
+	})
+	if tCode != http.StatusOK {
+		t.Fatalf("codex legacy restore apply = %d: %s", tCode, tBody)
+	}
+	after, err := os.ReadFile(codexTOML)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(after), "mcp_servers.slopguard") {
+		t.Fatalf("slopguard section still present:\n%s", after)
+	}
+	if !strings.Contains(string(after), "mcp_servers.user_other") {
+		t.Fatalf("user_other section lost during surgical uninstall:\n%s", after)
+	}
+}
+
+func TestRemoveProjectKeepAndPurge(t *testing.T) {
+	home := t.TempDir()
+	db, err := store.Open(filepath.Join(t.TempDir(), "sg.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := NewServer(db, nil)
+	s.homeDir = home
+	handler := authedTestHandler(s)
+
+	proj := t.TempDir()
+	sgDir := filepath.Join(proj, ".slopguard")
+	if err := os.MkdirAll(sgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileAtomic(filepath.Join(sgDir, "config.yaml"), []byte("version: 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecordMistake(context.Background(), contract.Mistake{
+		ProjectPath: proj,
+		Fingerprint: "fp-remove-test",
+		Category:    "ui",
+		Summary:     "test mistake",
+		Source:      "agent",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Keep mode hides project from /api/projects while preserving disk files and DB data.
+	kCode, kBody := postDashboardJSON(t, handler, "/api/projects/remove", map[string]any{
+		"project": proj,
+		"mode":    "keep",
+	})
+	if kCode != http.StatusOK {
+		t.Fatalf("remove keep = %d: %s", kCode, kBody)
+	}
+	_, pBody, _ := dashboardRequest(t, handler, http.MethodGet, "/api/projects")
+	pJSON := decodeDashboardJSON(t, pBody)
+	if projs, _ := pJSON["projects"].([]any); len(projs) != 0 {
+		t.Fatalf("expected 0 visible projects after keep remove, got %v", projs)
+	}
+	if _, err := os.Stat(filepath.Join(sgDir, "config.yaml")); err != nil {
+		t.Fatalf("keep mode deleted .slopguard/config.yaml: %v", err)
+	}
+	if mistakes, err := db.QueryMistakes(context.Background(), store.MistakeQuery{ProjectPath: proj}); err != nil || len(mistakes) != 1 {
+		t.Fatalf("keep mode dropped DB mistakes: len=%d err=%v", len(mistakes), err)
+	}
+
+	// Un-hiding restores project visibility cleanly.
+	if err := setProjectHidden(home, proj, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Purge mode deletes .slopguard and DB data completely.
+	pCode, pOut := postDashboardJSON(t, handler, "/api/projects/remove", map[string]any{
+		"project": proj,
+		"mode":    "purge",
+	})
+	if pCode != http.StatusOK {
+		t.Fatalf("remove purge = %d: %s", pCode, pOut)
+	}
+	if _, err := os.Stat(sgDir); !os.IsNotExist(err) {
+		t.Fatalf("purge mode expected .slopguard removed, stat err=%v", err)
+	}
+	if mistakes, err := db.QueryMistakes(context.Background(), store.MistakeQuery{ProjectPath: proj}); err != nil || len(mistakes) != 0 {
+		t.Fatalf("purge mode left DB mistakes: len=%d err=%v", len(mistakes), err)
+	}
+}

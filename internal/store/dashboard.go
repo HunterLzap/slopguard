@@ -924,3 +924,41 @@ func approveMistakeAndInsertRuleTx(
 	}
 	return affected > 0, nil
 }
+
+// DeleteProjectData 删除指定项目关联的全部扫描、错题、项目级规则及 MCP 调用记录。
+func (s *Store) DeleteProjectData(ctx context.Context, projectPath string) error {
+	if s == nil || s.db == nil {
+		return errors.New("store: not opened")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	clause, scopeArgs, err := projectPathScopeClause(projectPath)
+	if err != nil {
+		return fmt.Errorf("store: normalize project path: %w", err)
+	}
+	if clause == "" || len(scopeArgs) == 0 {
+		return ErrProjectScopeRequired
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin delete project tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	queries := []string{
+		"DELETE FROM scan_runs WHERE " + clause,
+		"DELETE FROM mistakes WHERE " + clause,
+		"DELETE FROM rules WHERE scope = 'project' AND " + clause,
+		"DELETE FROM mcp_events WHERE " + clause,
+	}
+	for _, q := range queries {
+		if _, err := tx.ExecContext(ctx, q, scopeArgs...); err != nil {
+			return fmt.Errorf("store: purge project data: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit delete project tx: %w", err)
+	}
+	return nil
+}

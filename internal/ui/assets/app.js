@@ -345,6 +345,13 @@
         addOpt.textContent = "+ 添加项目…";
         select.appendChild(addOpt);
 
+        if (state.projects.length > 0) {
+          const removeOpt = document.createElement("option");
+          removeOpt.value = "__remove__";
+          removeOpt.textContent = "− 清除项目…";
+          select.appendChild(removeOpt);
+        }
+
         if (state.project && !state.projects.some((p) => p.project_path === state.project)) {
           state.project = "";
         }
@@ -736,22 +743,59 @@
         : "Agent 提示词";
     }
 
+    const recTotal = recApprove + recSkip;
+    const actionParts = [];
+    if (recApprove > 0) actionParts.push(`${recApprove} 转规则`);
+    if (recSkip > 0) actionParts.push(`${recSkip} 忽略`);
+
+    const syncInlineApplyBtn = (show) => {
+      const inlineBtn = $("btn-apply-ai-rec-inline");
+      if (!inlineBtn) return;
+      if (!show || recTotal === 0) {
+        inlineBtn.hidden = true;
+        return;
+      }
+      inlineBtn.hidden = false;
+      inlineBtn.disabled = false;
+      inlineBtn.textContent = `采纳建议 (${recTotal})`;
+      inlineBtn.dataset.tip = `一键采纳 Agent 回传的 ${recTotal} 条建议（${actionParts.join(" · ")}），无需重跑指令`;
+    };
+
     const banner = $("session-scan-banner");
-    if (banner && !state.recBannerDismissed && (recApprove > 0 || recSkip > 0)) {
-      const parts = [];
-      if (recApprove > 0) parts.push(`建议入库 <strong>${recApprove}</strong> 条`);
-      if (recSkip > 0) parts.push(`建议忽略 <strong>${recSkip}</strong> 条`);
-      const actionParts = [];
-      if (recApprove > 0) actionParts.push(`${recApprove} 转规则`);
-      if (recSkip > 0) actionParts.push(`${recSkip} 忽略`);
-      showInboxBanner(
-        `<strong>Agent 审查建议已回传：</strong>共 ${recApprove + recSkip} 条待处理（${parts.join(" · ")}）。`,
-        `<button class="btn btn-primary btn-sm js-apply-ai-rec" type="button">一键采纳建议（${actionParts.join(" · ")}）</button>`,
-        true
-      );
-      const applyBtn = banner.querySelector(".js-apply-ai-rec");
-      if (applyBtn) {
-        applyBtn.addEventListener("click", () => applyAIRecommendations(applyBtn));
+    if (recTotal === 0) {
+      state.recBannerDismissed = false;
+      state.lastRecSignature = "";
+      syncInlineApplyBtn(false);
+      if (banner && banner.dataset.recPrompt === "1") {
+        banner.hidden = true;
+        banner.dataset.recPrompt = "";
+      }
+    } else {
+      const recSignature = `${state.project || ""}|${recApprove}|${recSkip}`;
+      if (recSignature !== state.lastRecSignature) {
+        state.lastRecSignature = recSignature;
+        state.recBannerDismissed = false;
+      }
+      if (banner && !state.recBannerDismissed) {
+        const parts = [];
+        if (recApprove > 0) parts.push(`建议入库 <strong>${recApprove}</strong> 条`);
+        if (recSkip > 0) parts.push(`建议忽略 <strong>${recSkip}</strong> 条`);
+        showInboxBanner(
+          `<strong>Agent 审查建议已回传：</strong>共 ${recTotal} 条待处理（${parts.join(" · ")}）。`,
+          `<button class="btn btn-primary btn-sm js-apply-ai-rec" type="button">一键采纳建议（${actionParts.join(" · ")}）</button>`,
+          true,
+          () => {
+            syncInlineApplyBtn(true);
+            showToast("已收起横幅，可随时点右上「采纳建议」一键处理");
+          }
+        );
+        const applyBtn = banner.querySelector(".js-apply-ai-rec");
+        if (applyBtn) {
+          applyBtn.addEventListener("click", () => applyAIRecommendations(applyBtn));
+        }
+        syncInlineApplyBtn(false);
+      } else {
+        syncInlineApplyBtn(true);
       }
     }
 
@@ -769,17 +813,20 @@
     applyMistakeFilters();
   }
 
-  function showInboxBanner(textHTML, actionHTML = "", isRecPrompt = false) {
+  function showInboxBanner(textHTML, actionHTML = "", isRecPrompt = false, onDismiss = null) {
     const banner = $("session-scan-banner");
     if (!banner) return;
     banner.hidden = false;
+    banner.dataset.recPrompt = isRecPrompt ? "1" : "";
     banner.innerHTML = `<span class="banner-text">${textHTML}</span>` +
       `<div class="card-header-actions">${actionHTML}<button class="icon-btn js-close-banner" type="button" aria-label="关闭提示">✕</button></div>`;
     const closeBtn = banner.querySelector(".js-close-banner");
     if (closeBtn) {
       closeBtn.addEventListener("click", () => {
         banner.hidden = true;
+        banner.dataset.recPrompt = "";
         if (isRecPrompt) state.recBannerDismissed = true;
+        if (typeof onDismiss === "function") onDismiss();
       });
     }
   }
@@ -818,7 +865,7 @@
     if (!filtered.length) {
       empty.textContent = reviewF === "pending"
         ? "待处理已清零 · 所有捕获问题均已处理，可在「已入库规则」或「全部」中查看"
-        : "当前分类暂无错题 · 点击右上「立即体检」或「嗅探会话」可自动捕获";
+        : "当前分类暂无错题 · 点击右上「立即体检」或「Agent 提示词」即可捕获与复盘";
       empty.hidden = false;
       return;
     }
@@ -952,6 +999,14 @@
     body.innerHTML = "";
     if (!filtered.length) {
       empty.hidden = false;
+      if (state.events.length === 0 && state.project) {
+        empty.innerHTML =
+          `<span class="muted">当前项目「${escapeHTML(shortProject(state.project))}」暂无 MCP 调用记录 · 客户端重连或下次在该项目调用工具后会记在这里</span>` +
+          `<button class="btn btn-sm btn-ghost js-events-view-all" type="button">查看全部项目</button>`;
+        empty.querySelector(".js-events-view-all")?.addEventListener("click", () => selectProject(""));
+      } else {
+        empty.innerHTML = `<span class="muted">暂无 Agent 调用记录 · 开启上方 Agent 开关并重启对应客户端后，AI 每次写代码触发体检都会记在这里</span>`;
+      }
       return;
     }
     empty.hidden = true;
@@ -1294,11 +1349,16 @@
     const feedback = $("add-project-feedback");
     btn.disabled = true;
     try {
-      const res = await api("/api/pick-folder");
-      if (res.ok && res.path) {
+      let res;
+      if (window.webkit?.messageHandlers?.pickFolder?.postMessage) {
+        res = await window.webkit.messageHandlers.pickFolder.postMessage({});
+      } else {
+        res = await api("/api/pick-folder");
+      }
+      if (res && res.ok && res.path) {
         $("add-project-path").value = res.path;
         feedback.hidden = true;
-      } else if (!res.cancelled && res.error) {
+      } else if (res && !res.cancelled && res.error) {
         feedback.hidden = false;
         feedback.textContent = res.error;
       }
@@ -1340,6 +1400,86 @@
     } finally {
       btn.disabled = false;
       btn.textContent = "添加并体检";
+    }
+  }
+
+  function updateRemoveProjectSelectionPath() {
+    const sel = $("remove-project-select");
+    const pathEl = $("remove-project-path");
+    if (!sel || !pathEl) return;
+    pathEl.textContent = sel.value || "";
+  }
+
+  function openRemoveProjectModal() {
+    const projects = Array.isArray(state.projects) ? state.projects : [];
+    if (!projects.length) {
+      showToast("当前没有可清除的项目");
+      return;
+    }
+    const sel = $("remove-project-select");
+    if (sel) {
+      sel.innerHTML = "";
+      for (const proj of projects) {
+        const opt = document.createElement("option");
+        opt.value = proj.project_path;
+        opt.textContent = shortProject(proj.project_path);
+        sel.appendChild(opt);
+      }
+      if (state.project && projects.some((p) => p.project_path === state.project)) {
+        sel.value = state.project;
+      } else {
+        sel.value = projects[0].project_path;
+      }
+    }
+    updateRemoveProjectSelectionPath();
+    const feedback = $("remove-project-feedback");
+    if (feedback) {
+      feedback.hidden = true;
+      feedback.textContent = "";
+    }
+    $("remove-project-modal").hidden = false;
+  }
+
+  function closeRemoveProjectModal() {
+    $("remove-project-modal").hidden = true;
+  }
+
+  async function submitRemoveProject(mode) {
+    const sel = $("remove-project-select");
+    const targetProject = sel ? sel.value.trim() : "";
+    const feedback = $("remove-project-feedback");
+    const keepBtn = $("btn-remove-project-keep");
+    const purgeBtn = $("btn-remove-project-purge");
+    if (!targetProject) return;
+
+    if (keepBtn) keepBtn.disabled = true;
+    if (purgeBtn) purgeBtn.disabled = true;
+    if (feedback) {
+      feedback.hidden = false;
+      feedback.textContent = mode === "purge" ? "正在彻底清理配置与数据…" : "正在从工作区移除项目…";
+    }
+    try {
+      await api("/api/projects/remove", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project: targetProject, mode }),
+      });
+      if (state.project === targetProject) {
+        state.project = "";
+        localStorage.removeItem("slopguard.project");
+      }
+      closeRemoveProjectModal();
+      await loadProjects();
+      await refresh();
+      showToast(mode === "purge" ? "已完全清除项目配置与数据" : "已从列表移除，配置与数据已保留");
+    } catch (error) {
+      if (feedback) {
+        feedback.hidden = false;
+        feedback.textContent = `清除失败：${error.message}`;
+      }
+    } finally {
+      if (keepBtn) keepBtn.disabled = false;
+      if (purgeBtn) purgeBtn.disabled = false;
     }
   }
 
@@ -1421,7 +1561,10 @@
     const feedback = $("diff-preview-feedback");
     feedback.hidden = true;
     feedback.textContent = "";
-    if (preview.has_backup && preview.backup_at) {
+    if (preview.legacy_warning) {
+      feedback.hidden = false;
+      feedback.textContent = preview.legacy_warning;
+    } else if (preview.has_backup && preview.backup_at) {
       feedback.hidden = false;
       feedback.textContent = `已存在原配置备份（${formatDate(preview.backup_at)}），支持随时还原。`;
     }
@@ -1502,15 +1645,19 @@
           }),
         });
       } else if (preview.kind === "guard_hook") {
+        const body = {
+          project: boundProject,
+          hook_enabled: !isRestore,
+          preview_id: preview.preview_id,
+          confirmed: true,
+        };
+        if (typeof preview.also_enable_watch === "boolean") {
+          body.enabled = preview.also_enable_watch;
+        }
         await api("/api/guard/toggle", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            project: boundProject,
-            hook_enabled: !isRestore,
-            preview_id: preview.preview_id,
-            confirmed: true,
-          }),
+          body: JSON.stringify(body),
         });
       } else {
         const endpoint = preview.kind === "skill"
@@ -1530,7 +1677,11 @@
         });
       }
       closeDiffModal();
-      await loadAgents();
+      if (preview.kind === "guard_hook") {
+        await Promise.all([loadGuardStatus(), loadProjects()]);
+      } else {
+        await loadAgents();
+      }
       renderOnboardingCard();
     } catch (error) {
       feedback.hidden = false;
@@ -1583,43 +1734,44 @@
 
   function buildAgentPromptText(mode) {
     const projectPath = state.project || "<请在 SlopGuard 顶部选择具体项目路径>";
+    const scopeHint = `（调用各 \`sg_*\` MCP 工具时请传入 \`project_path: "${projectPath}"\`）`;
     const pendingAI = pendingAIMistakesForPrompt();
     if (mode === "session") {
       return [
         `请使用当前项目已接入的 \`slopguard\` MCP 工具，直接结合我们**本次对话上下文**和近期代码改动做一次踩坑复盘与防线沉淀：`,
-        `1. 目标项目：\`${projectPath}\``,
+        `1. 目标项目：\`${projectPath}\`${scopeHint}`,
         `2. 回顾本次对话中反复修改、编译/Lint/类型报错、或曾经想绕过检查的问题点（如未判空、类型逃逸、缺失导入、重复踩坑逻辑）；`,
-        `3. 筛选 1~5 条值得长期拦截的真实隐患，依次调用 \`sg_record_mistake\` 写入错题（写清 \`category\`、\`summary\`、\`bad_snippet\`、\`good_snippet\`）；`,
-        `4. 对每条错题紧接着调用 \`sg_submit_analysis\`：\`decision\` 设为 \`"recommend"\` 或 \`"skip"\`，用简洁通俗的中文写明 \`reason\`（哪里有问题、会有什么后果、为何入库），并在 \`rule_draft\` 给出可直接落地的配置规则草案；`,
+        `3. 筛选 1~5 条值得长期拦截的真实隐患，依次调用 \`sg_record_mistake\` 写入错题（写清 \`project_path\`、\`category\`、\`summary\`、\`bad_snippet\`、\`good_snippet\`）；`,
+        `4. 对每条错题紧接着调用 \`sg_submit_analysis\`：传入 \`project_path\`、\`fingerprint\`、\`decision\`（\`"recommend"\` / \`"skip"\`）、简洁通俗的中文 \`reason\` 以及可直接落地的 \`rule_draft\`；`,
         `5. 提交完成后用中文简明列出已写入的条数和结论，提醒我回 SlopGuard 控制台一键采纳规则（暂不自行修改业务代码）。`,
       ].join("\n");
     }
     if (mode === "history") {
       return [
         `请使用 \`slopguard\` MCP 工具并结合当前仓库的真实 Git 历史，完成一次高精度返工与隐患嗅探：`,
-        `1. 目标项目：\`${projectPath}\``,
-        `2. 调用 \`sg_radar\`（如 \`{"top": 10}\`）查看返工热点与跳过注释分布，同时只读查看近 14~30 天 \`git log\` / \`git show\` 里的 \`fix\`、\`revert\` 或同一模块反复修改的提交 diff；`,
-        `3. 对比修改前后 diff，识别 1~5 个最容易复发的问题根因（而非仅仅抄 commit 标题），依次调用 \`sg_record_mistake\` 记录（务必填好 \`category\`、\`summary\`、修前 \`bad_snippet\`、修后 \`good_snippet\`）；`,
-        `4. 对每条错题紧接着调用 \`sg_submit_analysis\`，写入 \`decision\`（\`"recommend"\` / \`"skip"\`）、通俗中文 \`reason\` 及可直接落地的 \`rule_draft\`；`,
+        `1. 目标项目：\`${projectPath}\`${scopeHint}`,
+        `2. 调用 \`sg_radar\`（如 \`{"project_path": "${projectPath}", "top": 10}\`）查看返工热点与跳过注释分布，同时只读查看近 14~30 天 \`git log\` / \`git show\` 里的 \`fix\`、\`revert\` 或同一模块反复修改的提交 diff；`,
+        `3. 对比修改前后 diff，识别 1~5 个最容易复发的问题根因（而非仅仅抄 commit 标题），依次调用 \`sg_record_mistake\` 记录（务必填好 \`project_path\`、\`category\`、\`summary\`、修前 \`bad_snippet\`、修后 \`good_snippet\`）；`,
+        `4. 对每条错题紧接着调用 \`sg_submit_analysis\`，写入 \`project_path\`、\`fingerprint\`、\`decision\`（\`"recommend"\` / \`"skip"\`）、通俗中文 \`reason\` 及可直接落地的 \`rule_draft\`；`,
         `5. 提交后汇报命中提交与沉淀的规则建议，提醒我回 SlopGuard 控制台一键采纳。`,
       ].join("\n");
     }
     if (mode === "verify") {
       return [
         `请使用 \`slopguard\` MCP 对当前项目改动执行门禁检查与错题闭环：`,
-        `1. 目标项目：\`${projectPath}\``,
-        `2. 调用 \`sg_verify\` 检查当前改动与跳过注释基线；`,
-        `3. 若返回中存在 \`pending_inbox\` 待分析错题或新报错，请结合当前仓库源码评估后，逐条调用 \`sg_submit_analysis\` 提交中文 \`reason\`、\`decision\`（\`"recommend"\` / \`"skip"\`）与 \`rule_draft\`；`,
+        `1. 目标项目：\`${projectPath}\`${scopeHint}`,
+        `2. 调用 \`sg_verify\`（传 \`project_path\`）检查当前改动与跳过注释基线；`,
+        `3. 若返回中存在 \`pending_inbox\` 待分析错题或新报错，请结合当前仓库源码评估后，逐条调用 \`sg_submit_analysis\` 提交 \`project_path\`、\`fingerprint\`、中文 \`reason\`、\`decision\`（\`"recommend"\` / \`"skip"\`）与 \`rule_draft\`；`,
         `4. 汇报本次检查结果，若有阻塞项再给出修复建议。`,
       ].join("\n");
     }
 
     const lines = [
       `请使用 \`slopguard\` MCP 对当前项目的待审查错题执行分析与回传：`,
-      `1. 目标项目：\`${projectPath}\``,
-      `2. 调用 \`sg_list_inbox\`（参数：\`{"review_status": "pending_ai"}\`）读取当前待分析错题，并结合仓库实际代码核对上下文；`,
+      `1. 目标项目：\`${projectPath}\`${scopeHint}`,
+      `2. 调用 \`sg_list_inbox\`（参数：\`{"project_path": "${projectPath}", "review_status": "pending_ai"}\`）读取当前待分析错题，并结合仓库实际代码核对上下文；`,
       `3. 逐条评估判断：第三方缓存/构建产物误报（如 \`.cache/\`、\`.venv/\`、\`node_modules/\`）或纯偶然单次失误设 \`decision="skip"\`；高频返工或真实隐患设 \`decision="recommend"\`；`,
-      `4. 逐条调用 \`sg_submit_analysis\` 提交 \`fingerprint\`、\`decision\`、通俗中文 \`reason\` 及简明 \`rule_draft\`（不要擅自静默修改业务文件）；`,
+      `4. 逐条调用 \`sg_submit_analysis\` 提交 \`project_path\`、\`fingerprint\`、\`decision\`、通俗中文 \`reason\` 及简明 \`rule_draft\`（不要擅自静默修改业务文件）；`,
       `5. 全部提交后告知我回 SlopGuard 控制台点击「一键采纳建议」。`,
     ];
     if (pendingAI.length > 0) {
@@ -2093,6 +2245,9 @@
           body: JSON.stringify({ project: state.project, hook_enabled: Boolean(patch.hook_enabled) }),
         });
         preview.project = state.project;
+        if (typeof patch.enabled === "boolean") {
+          preview.also_enable_watch = patch.enabled;
+        }
         openDiffModal(preview);
         return;
       }
@@ -2140,6 +2295,7 @@
   async function applyAIRecommendations(triggerBtn) {
     const banner = $("session-scan-banner");
     const btn = triggerBtn || banner?.querySelector(".js-apply-ai-rec");
+    const origText = btn ? btn.textContent : "";
     if (btn) {
       btn.disabled = true;
       btn.textContent = "处理中…";
@@ -2154,6 +2310,7 @@
       await refresh();
     } catch (error) {
       showInboxBanner(`采纳失败：${escapeHTML(error.message)}`);
+      if (btn && origText) btn.textContent = origText;
     } finally {
       if (btn) btn.disabled = false;
     }
@@ -2315,6 +2472,7 @@
     document.querySelectorAll("#mistakes-review-tabs .seg-tab").forEach((btn) => {
       btn.addEventListener("click", () => selectReviewTab(btn.dataset.reviewStatus ?? "", true));
     });
+    $("btn-apply-ai-rec-inline")?.addEventListener("click", (e) => applyAIRecommendations(e.currentTarget));
     $("btn-agent-prompt")?.addEventListener("click", () => openAgentPromptModal());
     document.querySelectorAll("#agent-prompt-modes .seg-btn").forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -2396,6 +2554,12 @@
     $("add-project-backdrop").addEventListener("click", closeAddProjectModal);
     $("btn-pick-folder").addEventListener("click", pickFolder);
     $("btn-submit-add-project").addEventListener("click", submitAddProject);
+    $("remove-project-close")?.addEventListener("click", closeRemoveProjectModal);
+    $("remove-project-cancel")?.addEventListener("click", closeRemoveProjectModal);
+    $("remove-project-backdrop")?.addEventListener("click", closeRemoveProjectModal);
+    $("remove-project-select")?.addEventListener("change", updateRemoveProjectSelectionPath);
+    $("btn-remove-project-keep")?.addEventListener("click", () => submitRemoveProject("keep"));
+    $("btn-remove-project-purge")?.addEventListener("click", () => submitRemoveProject("purge"));
     $("service-switch")?.addEventListener("change", (e) => toggleService(e.currentTarget.checked));
     $("btn-baseline-tighten").addEventListener("click", () => runBaselineAction("tighten"));
     $("btn-baseline-reset").addEventListener("click", () => runBaselineAction("reset"));
@@ -2453,14 +2617,21 @@
         closeGenericMCPModal();
       } else if (!$("add-project-modal").hidden) {
         closeAddProjectModal();
+      } else if (!$("remove-project-modal")?.hidden) {
+        closeRemoveProjectModal();
       }
     });
 
-    // 项目切换（含「+ 添加项目…」选项）与刷新
+    // 项目切换（含「+ 添加项目…」「− 清除项目…」选项）与刷新
     $("project-select").addEventListener("change", (e) => {
       if (e.target.value === "__add__") {
         e.target.value = state.project || "";
         openAddProjectModal();
+        return;
+      }
+      if (e.target.value === "__remove__") {
+        e.target.value = state.project || "";
+        openRemoveProjectModal();
         return;
       }
       selectProject(e.target.value);

@@ -2454,6 +2454,65 @@ body.macos-frameless .workspace-topbar {
   display: none;
 }
 
+.remove-project-target {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.remove-project-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.remove-option-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--fg);
+  text-align: left;
+  font-family: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.remove-option-card:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+}
+
+.remove-option-card.danger:hover:not(:disabled) {
+  border-color: var(--error);
+  background: var(--error-bg);
+}
+
+.remove-option-card:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.remove-option-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: inherit;
+}
+
+.remove-option-card.danger .remove-option-title {
+  color: var(--error);
+}
+
+.remove-option-desc {
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 @media (max-width: 860px) {
   .onboarding-grid {
     grid-template-columns: 1fr;

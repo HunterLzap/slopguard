@@ -519,6 +519,7 @@
                 </button>
               </div>
               <div class="card-header-actions">
+                <button id="btn-apply-ai-rec-inline" class="btn btn-secondary btn-sm" type="button" hidden>采纳建议</button>
                 <button id="btn-agent-prompt" class="btn btn-primary btn-sm" type="button" data-tip="生成可直接粘贴到项目会话里的 Agent 提示词：支持审查待分析错题、对话踩坑复盘、Git 历史返工嗅探及提交前体检">Agent 提示词</button>
               </div>
             </div>
@@ -604,6 +605,38 @@
         <div class="modal-actions">
           <button id="add-project-cancel" class="btn btn-ghost" type="button">取消</button>
           <button id="btn-submit-add-project" class="btn btn-primary" type="button">添加并体检</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 清除项目弹窗 -->
+  <div id="remove-project-modal" class="lightbox" hidden role="dialog" aria-modal="true" aria-label="清除项目">
+    <div class="lightbox-backdrop" id="remove-project-backdrop"></div>
+    <div class="modal-dialog">
+      <div class="lightbox-header">
+        <strong>清除项目</strong>
+        <button id="remove-project-close" class="icon-btn" type="button" aria-label="关闭">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="remove-project-target">
+          <label class="muted" for="remove-project-select">目标项目</label>
+          <select id="remove-project-select" class="text-input"></select>
+          <div id="remove-project-path" class="mcp-client-path mono"></div>
+        </div>
+        <div class="remove-project-options">
+          <button id="btn-remove-project-keep" class="remove-option-card" type="button">
+            <span class="remove-option-title">保留配置和数据</span>
+            <span class="remove-option-desc muted">仅从下拉列表移除并暂停监听，保留项目内的 .slopguard/、Git 钩子及全部错题和规则记录，之后重新添加即可恢复。</span>
+          </button>
+          <button id="btn-remove-project-purge" class="remove-option-card danger" type="button">
+            <span class="remove-option-title">完全清除</span>
+            <span class="remove-option-desc muted">安全移除本项目的 Git 钩子、项目级 MCP / Skill 接入与 .slopguard/ 目录，并清空全部扫描、错题、规则及调用记录。</span>
+          </button>
+        </div>
+        <p id="remove-project-feedback" class="modal-feedback muted" hidden></p>
+        <div class="modal-actions">
+          <button id="remove-project-cancel" class="btn btn-ghost" type="button">取消</button>
         </div>
       </div>
     </div>

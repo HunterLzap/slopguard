@@ -20,6 +20,8 @@ import (
 
 var openMCPStore = store.OpenDefault
 
+const projectPathSchemaDesc = "target project repository path (required when MCP server runs globally without --root)"
+
 func buildMCPTools(root string) []mcp.Tool {
 	scopeRoot := normalizeMCPScopePath(root)
 	tools := []mcp.Tool{
@@ -27,42 +29,55 @@ func buildMCPTools(root string) []mcp.Tool {
 			Name:        "sg_verify",
 			Description: "Run the deterministic SlopGuard gate for the project. Also returns any pending_inbox mistakes awaiting plain-language Chinese analysis via sg_submit_analysis.",
 			InputSchema: objectSchema(map[string]any{
-				"all":   map[string]any{"type": "boolean", "description": "scan all files instead of git-changed files"},
-				"paths": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "optional explicit file paths"},
-				"ui":    map[string]any{"type": "boolean", "description": "also run Playwright UI smoke checks after regular checks pass"},
+				"project_path": map[string]any{"type": "string", "description": projectPathSchemaDesc},
+				"all":          map[string]any{"type": "boolean", "description": "scan all files instead of git-changed files"},
+				"paths":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "optional explicit file paths"},
+				"ui":           map[string]any{"type": "boolean", "description": "also run Playwright UI smoke checks after regular checks pass"},
 			}),
 			Handler: func(ctx context.Context, args json.RawMessage) (any, error) {
 				var a struct {
-					All   bool     `json:"all"`
-					Paths []string `json:"paths"`
-					UI    bool     `json:"ui"`
+					ProjectPath string   `json:"project_path"`
+					All         bool     `json:"all"`
+					Paths       []string `json:"paths"`
+					UI          bool     `json:"ui"`
 				}
 				if err := decodeMCPArgs(args, &a); err != nil {
 					return nil, err
 				}
-				return verifyForMCP(ctx, scopeRoot, a.All, a.Paths, a.UI)
+				resolved, err := resolveMCPToolScope(ctx, scopeRoot, a.ProjectPath)
+				if err != nil {
+					return nil, err
+				}
+				return verifyForMCP(ctx, resolved, a.All, a.Paths, a.UI)
 			},
 		},
 		{
 			Name:        "sg_radar",
 			Description: "Scan for high-risk bad-sample hotspots and return Top N ranked files.",
 			InputSchema: objectSchema(map[string]any{
-				"top": map[string]any{"type": "integer", "description": "number of hotspots to return (default 3)"},
+				"project_path": map[string]any{"type": "string", "description": projectPathSchemaDesc},
+				"top":          map[string]any{"type": "integer", "description": "number of hotspots to return (default 3)"},
 			}),
 			Handler: func(ctx context.Context, args json.RawMessage) (any, error) {
 				var a struct {
-					Top int `json:"top"`
+					ProjectPath string `json:"project_path"`
+					Top         int    `json:"top"`
 				}
 				if err := decodeMCPArgs(args, &a); err != nil {
 					return nil, err
 				}
-				return radarForMCP(ctx, scopeRoot, a.Top)
+				resolved, err := resolveMCPToolScope(ctx, scopeRoot, a.ProjectPath)
+				if err != nil {
+					return nil, err
+				}
+				return radarForMCP(ctx, resolved, a.Top)
 			},
 		},
 		{
 			Name:        "sg_record_mistake",
 			Description: "Record an AI mistake in the current project for later rule extraction; repeated fingerprints increment the count.",
 			InputSchema: objectSchema(map[string]any{
+				"project_path": map[string]any{"type": "string", "description": projectPathSchemaDesc},
 				"category":     map[string]any{"type": "string", "description": "import | syntax | type | architecture | ui"},
 				"summary":      map[string]any{"type": "string"},
 				"bad_snippet":  map[string]any{"type": "string"},
@@ -70,6 +85,7 @@ func buildMCPTools(root string) []mcp.Tool {
 			}, "summary"),
 			Handler: func(ctx context.Context, args json.RawMessage) (any, error) {
 				var a struct {
+					ProjectPath string `json:"project_path"`
 					Category    string `json:"category"`
 					Summary     string `json:"summary"`
 					BadSnippet  string `json:"bad_snippet"`
@@ -78,29 +94,40 @@ func buildMCPTools(root string) []mcp.Tool {
 				if err := decodeMCPArgs(args, &a); err != nil {
 					return nil, err
 				}
-				return recordMistakeForMCP(ctx, scopeRoot, a.Category, a.Summary, a.BadSnippet, a.GoodSnippet)
+				resolved, err := resolveMCPToolScope(ctx, scopeRoot, a.ProjectPath)
+				if err != nil {
+					return nil, err
+				}
+				return recordMistakeForMCP(ctx, resolved, a.Category, a.Summary, a.BadSnippet, a.GoodSnippet)
 			},
 		},
 		{
 			Name:        "sg_list_candidates",
 			Description: "List pending mistake clusters in the current project that reached the minimum occurrence count.",
 			InputSchema: objectSchema(map[string]any{
-				"min_count": map[string]any{"type": "integer", "description": "minimum occurrence count (default 2)"},
+				"project_path": map[string]any{"type": "string", "description": projectPathSchemaDesc},
+				"min_count":    map[string]any{"type": "integer", "description": "minimum occurrence count (default 2)"},
 			}),
 			Handler: func(ctx context.Context, args json.RawMessage) (any, error) {
 				var a struct {
-					MinCount int `json:"min_count"`
+					ProjectPath string `json:"project_path"`
+					MinCount    int    `json:"min_count"`
 				}
 				if err := decodeMCPArgs(args, &a); err != nil {
 					return nil, err
 				}
-				return listCandidatesForMCP(ctx, scopeRoot, a.MinCount)
+				resolved, err := resolveMCPToolScope(ctx, scopeRoot, a.ProjectPath)
+				if err != nil {
+					return nil, err
+				}
+				return listCandidatesForMCP(ctx, resolved, a.MinCount)
 			},
 		},
 		{
 			Name:        "sg_dry_run_rule",
 			Description: "Run a candidate rule in an isolated temporary config; never modifies project config.",
 			InputSchema: objectSchema(map[string]any{
+				"project_path": map[string]any{"type": "string", "description": projectPathSchemaDesc},
 				"engine":       map[string]any{"type": "string", "description": "eslint | ruff | semgrep"},
 				"rule_id":      map[string]any{"type": "string"},
 				"rule_payload": map[string]any{"description": "rule configuration fragment (JSON or YAML)"},
@@ -116,6 +143,7 @@ func buildMCPTools(root string) []mcp.Tool {
 			Name:        "sg_apply_rule",
 			Description: "Apply a confirmed rule to project config or global presets and record it in the rule ledger.",
 			InputSchema: objectSchema(map[string]any{
+				"project_path": map[string]any{"type": "string", "description": projectPathSchemaDesc},
 				"engine":       map[string]any{"type": "string", "description": "eslint | ruff | semgrep"},
 				"rule_id":      map[string]any{"type": "string"},
 				"rule_payload": map[string]any{"description": "rule configuration fragment"},
@@ -131,31 +159,40 @@ func buildMCPTools(root string) []mcp.Tool {
 			Name:        "sg_list_inbox",
 			Description: "List auto-captured or pending inbox mistakes (pending_ai / pending_user) so the host Agent can analyze them.",
 			InputSchema: objectSchema(map[string]any{
-				"project":       map[string]any{"type": "string", "description": "optional project path filter"},
+				"project_path":  map[string]any{"type": "string", "description": projectPathSchemaDesc},
+				"project":       map[string]any{"type": "string", "description": "alias of project_path"},
 				"review_status": map[string]any{"type": "string", "enum": []string{"pending_ai", "pending_user", "approved", "ignored"}},
 			}),
 			Handler: func(ctx context.Context, args json.RawMessage) (any, error) {
 				var a struct {
+					ProjectPath  string `json:"project_path"`
 					Project      string `json:"project"`
 					ReviewStatus string `json:"review_status"`
 				}
 				if err := decodeMCPArgs(args, &a); err != nil {
 					return nil, err
 				}
-				return listInboxForMCP(ctx, scopeRoot, a.Project, a.ReviewStatus)
+				reqProject := firstNonEmpty(a.ProjectPath, a.Project)
+				resolved, err := resolveMCPToolScope(ctx, scopeRoot, reqProject)
+				if err != nil {
+					return nil, err
+				}
+				return listInboxForMCP(ctx, resolved, reqProject, a.ReviewStatus)
 			},
 		},
 		{
 			Name:        "sg_submit_analysis",
 			Description: "Submit plain-language Chinese AI analysis and recommendation for a captured mistake to await user approval in the dashboard.",
 			InputSchema: objectSchema(map[string]any{
-				"fingerprint": map[string]any{"type": "string"},
-				"decision":    map[string]any{"type": "string", "enum": []string{"recommend", "skip"}},
-				"reason":      map[string]any{"type": "string", "description": "plain-language Chinese explanation of why to recommend or skip"},
-				"rule_draft":  map[string]any{"type": "string", "description": "optional draft rule configuration"},
+				"project_path": map[string]any{"type": "string", "description": projectPathSchemaDesc},
+				"fingerprint":  map[string]any{"type": "string"},
+				"decision":     map[string]any{"type": "string", "enum": []string{"recommend", "skip"}},
+				"reason":       map[string]any{"type": "string", "description": "plain-language Chinese explanation of why to recommend or skip"},
+				"rule_draft":   map[string]any{"type": "string", "description": "optional draft rule configuration"},
 			}, "fingerprint", "decision", "reason"),
 			Handler: func(ctx context.Context, args json.RawMessage) (any, error) {
 				var a struct {
+					ProjectPath string `json:"project_path"`
 					Fingerprint string `json:"fingerprint"`
 					Decision    string `json:"decision"`
 					Reason      string `json:"reason"`
@@ -164,7 +201,11 @@ func buildMCPTools(root string) []mcp.Tool {
 				if err := decodeMCPArgs(args, &a); err != nil {
 					return nil, err
 				}
-				return submitAnalysisForMCP(ctx, scopeRoot, a.Fingerprint, a.Decision, a.Reason, a.RuleDraft)
+				resolved, err := resolveMCPToolScope(ctx, scopeRoot, a.ProjectPath)
+				if err != nil {
+					return nil, err
+				}
+				return submitAnalysisForMCP(ctx, resolved, a.Fingerprint, a.Decision, a.Reason, a.RuleDraft)
 			},
 		},
 	}
@@ -180,12 +221,39 @@ func wrapMCPToolsWithAudit(root string, tools []mcp.Tool) []mcp.Tool {
 			started := time.Now()
 			res, err := orig(ctx, args)
 			durationMs := time.Since(started).Milliseconds()
-			recordMCPAuditEvent(ctx, root, t.Name, args, res, err, durationMs)
+			auditProject := root
+			if resolved, rErr := resolveMCPToolScope(ctx, root, extractMCPRequestedProject(args)); rErr == nil {
+				auditProject = resolved
+			}
+			recordMCPAuditEvent(ctx, auditProject, t.Name, args, res, err, durationMs)
 			return res, err
 		}
 		wrapped[i] = t
 	}
 	return wrapped
+}
+
+func extractMCPRequestedProject(args json.RawMessage) string {
+	if len(args) == 0 {
+		return ""
+	}
+	var a struct {
+		ProjectPath string `json:"project_path"`
+		Project     string `json:"project"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return ""
+	}
+	return firstNonEmpty(a.ProjectPath, a.Project)
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func recordMCPAuditEvent(ctx context.Context, root, toolName string, args json.RawMessage, res any, callErr error, durationMs int64) {
@@ -404,6 +472,9 @@ func normalizeMCPScopePath(p string) string {
 	if p == "" {
 		return ""
 	}
+	if strings.ContainsRune(p, 0) {
+		return ""
+	}
 	if abs, err := filepath.Abs(p); err == nil {
 		p = abs
 	}
@@ -413,14 +484,66 @@ func normalizeMCPScopePath(p string) string {
 	return filepath.Clean(p)
 }
 
+func isDisallowedGlobalMCPDir(p string) bool {
+	clean := normalizeMCPScopePath(p)
+	if clean == "" {
+		return true
+	}
+	if filepath.Dir(clean) == clean {
+		return true
+	}
+	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		if normalizeMCPScopePath(home) == clean {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveMCPToolScope(ctx context.Context, pinnedRoot, requestedProject string) (string, error) {
+	pinned := normalizeMCPScopePath(pinnedRoot)
+	if pinned != "" {
+		if isDisallowedGlobalMCPDir(pinned) {
+			return "", fmt.Errorf("mcp project root %q cannot be filesystem root or home directory; pass a project repository path", pinned)
+		}
+		if strings.TrimSpace(requestedProject) != "" {
+			reqNorm := normalizeMCPScopePath(requestedProject)
+			if reqNorm == "" || reqNorm != pinned {
+				return "", fmt.Errorf("cross-project operation blocked: MCP server is scoped to %s", pinned)
+			}
+		}
+		return resolveMCPEnforcedRoot(pinned)
+	}
+
+	if sessionRoot := normalizeMCPScopePath(mcp.SessionRootFromContext(ctx)); sessionRoot != "" && !isDisallowedGlobalMCPDir(sessionRoot) {
+		if strings.TrimSpace(requestedProject) != "" {
+			reqNorm := normalizeMCPScopePath(requestedProject)
+			if reqNorm == "" || reqNorm != sessionRoot {
+				return "", fmt.Errorf("cross-project operation blocked: MCP session is scoped to %s", sessionRoot)
+			}
+		}
+		return resolveMCPEnforcedRoot(sessionRoot)
+	}
+
+	reqRaw := strings.TrimSpace(requestedProject)
+	if reqRaw == "" {
+		return "", errors.New("mcp workspace root is required: pass project_path for the target repository or start slopguard mcp with --root")
+	}
+	reqNorm := normalizeMCPScopePath(reqRaw)
+	if isDisallowedGlobalMCPDir(reqNorm) {
+		return "", fmt.Errorf("invalid project_path %q: must be a concrete project directory, not filesystem root or home directory", reqRaw)
+	}
+	return resolveMCPEnforcedRoot(reqNorm)
+}
+
 func resolveMCPEnforcedRoot(root string) (string, error) {
 	raw := strings.TrimSpace(root)
-	if raw == "" {
+	if raw == "" || strings.ContainsRune(raw, 0) {
 		return "", errors.New("mcp workspace root is required for mistake operations")
 	}
 	scopeRoot := normalizeMCPScopePath(raw)
-	if scopeRoot == "" {
-		return "", errors.New("mcp workspace root is required for mistake operations")
+	if scopeRoot == "" || isDisallowedGlobalMCPDir(scopeRoot) {
+		return "", errors.New("mcp workspace root cannot be filesystem root or home directory")
 	}
 	info, err := os.Stat(scopeRoot)
 	if err != nil {
@@ -485,6 +608,7 @@ func submitAnalysisForMCP(ctx context.Context, root, fingerprint, decision, reas
 }
 
 type dryRunArgs struct {
+	ProjectPath string          `json:"project_path"`
 	Engine      string          `json:"engine"`
 	RuleID      string          `json:"rule_id"`
 	RulePayload json.RawMessage `json:"rule_payload"`
@@ -496,6 +620,10 @@ type dryRunArgs struct {
 func dryRunRuleForMCP(ctx context.Context, root string, args json.RawMessage) (any, error) {
 	var a dryRunArgs
 	if err := decodeMCPArgs(args, &a); err != nil {
+		return nil, err
+	}
+	scopeRoot, err := resolveMCPToolScope(ctx, root, a.ProjectPath)
+	if err != nil {
 		return nil, err
 	}
 	payload, err := rawPayloadString(a.RulePayload)
@@ -510,7 +638,7 @@ func dryRunRuleForMCP(ctx context.Context, root string, args json.RawMessage) (a
 		Engine:      a.Engine,
 		RuleID:      ruleID,
 		RulePayload: payload,
-		ProjectRoot: root,
+		ProjectRoot: scopeRoot,
 		SampleBad:   a.SampleBad,
 		Files:       a.Files,
 		Threshold:   a.Threshold,
@@ -518,6 +646,7 @@ func dryRunRuleForMCP(ctx context.Context, root string, args json.RawMessage) (a
 }
 
 type applyRuleArgs struct {
+	ProjectPath string          `json:"project_path"`
 	Engine      string          `json:"engine"`
 	RuleID      string          `json:"rule_id"`
 	RulePayload json.RawMessage `json:"rule_payload"`
@@ -547,10 +676,19 @@ func applyRuleForMCP(ctx context.Context, root string, args json.RawMessage) (an
 		scope = "project"
 	}
 
+	var scopeRoot string
+	if scope == "project" || strings.TrimSpace(root) != "" || strings.TrimSpace(a.ProjectPath) != "" {
+		var scopeErr error
+		scopeRoot, scopeErr = resolveMCPToolScope(ctx, root, a.ProjectPath)
+		if scopeErr != nil && scope == "project" {
+			return nil, scopeErr
+		}
+	}
+
 	var result adapter.RuleApplyResult
 	switch scope {
 	case "project":
-		result, err = adapter.ApplyRule(a.Engine, ruleID, []byte(payload), root)
+		result, err = adapter.ApplyRule(a.Engine, ruleID, []byte(payload), scopeRoot)
 	case "global":
 		var path string
 		path, err = adapter.MergeGlobalRuleTemplate(a.Engine, ruleID, []byte(payload))
@@ -562,7 +700,7 @@ func applyRuleForMCP(ctx context.Context, root string, args json.RawMessage) (an
 		return nil, fmt.Errorf("apply rule: %w", err)
 	}
 
-	ledgerErr := recordRuleLedger(ctx, scope, root, a.Engine, ruleID, payload, a.Rationale)
+	ledgerErr := recordRuleLedger(ctx, scope, scopeRoot, a.Engine, ruleID, payload, a.Rationale)
 	out := map[string]any{
 		"applied":     true,
 		"engine":      strings.ToLower(a.Engine),

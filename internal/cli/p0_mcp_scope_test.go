@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/HunterLzap/slopguard/internal/contract"
+	"github.com/HunterLzap/slopguard/internal/mcp"
 	"github.com/HunterLzap/slopguard/internal/store"
 )
 
@@ -124,5 +125,73 @@ func TestP0MCPStoreListCandidatesScopedRequiresProject(t *testing.T) {
 	defer s.Close()
 	if _, err := s.ListCandidatesScoped(context.Background(), "", 2); !errors.Is(err, store.ErrProjectScopeRequired) {
 		t.Fatalf("empty project err = %v, want ErrProjectScopeRequired", err)
+	}
+}
+
+func TestGlobalMCPProjectPathAndDisallowedRoots(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "slopguard.db")
+	oldOpen := openMCPStore
+	openMCPStore = func() (*store.Store, error) {
+		return store.Open(dbPath)
+	}
+	t.Cleanup(func() { openMCPStore = oldOpen })
+
+	repoA := t.TempDir()
+	repoB := t.TempDir()
+	globalTools := buildMCPTools("")
+	recordTool := findMCPTool(t, globalTools, "sg_record_mistake")
+	submitTool := findMCPTool(t, globalTools, "sg_submit_analysis")
+	inboxTool := findMCPTool(t, globalTools, "sg_list_inbox")
+
+	// Disallowed filesystem root must be rejected.
+	if _, err := recordTool.Handler(context.Background(), json.RawMessage(`{"project_path":"/","category":"ui","summary":"root should fail"}`)); err == nil {
+		t.Fatal("sg_record_mistake with project_path='/' must fail")
+	}
+
+	// Concrete project_path works in global MCP mode and scopes cleanly.
+	recPayload, _ := json.Marshal(map[string]any{
+		"project_path": repoA,
+		"category":     "architecture",
+		"summary":      "repoA mistake",
+	})
+	recRes, err := recordTool.Handler(context.Background(), recPayload)
+	if err != nil {
+		t.Fatalf("sg_record_mistake(repoA): %v", err)
+	}
+	recMap, ok := recRes.(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected record result %T", recRes)
+	}
+	fp, _ := recMap["fingerprint"].(string)
+	if fp == "" {
+		t.Fatalf("missing fingerprint in %#v", recRes)
+	}
+
+	subPayload, _ := json.Marshal(map[string]any{
+		"project_path": repoA,
+		"fingerprint":  fp,
+		"decision":     "recommend",
+		"reason":       "测试原因",
+	})
+	if _, err := submitTool.Handler(context.Background(), subPayload); err != nil {
+		t.Fatalf("sg_submit_analysis(repoA): %v", err)
+	}
+
+	// Session root from MCP initialize must block mismatched project_path.
+	sessionCtx := mcp.WithSessionRoot(context.Background(), repoA)
+	badInboxPayload, _ := json.Marshal(map[string]any{
+		"project_path": repoB,
+	})
+	if _, err := inboxTool.Handler(sessionCtx, badInboxPayload); err == nil {
+		t.Fatal("cross-project project_path inside session root must be blocked")
+	}
+
+	okInboxRes, err := inboxTool.Handler(sessionCtx, json.RawMessage(`{"review_status":"pending_user"}`))
+	if err != nil {
+		t.Fatalf("sg_list_inbox(sessionRoot): %v", err)
+	}
+	items, ok := okInboxRes.([]store.MistakeRecord)
+	if !ok || len(items) != 1 || items[0].Fingerprint != fp {
+		t.Fatalf("sg_list_inbox items = %#v", okInboxRes)
 	}
 }

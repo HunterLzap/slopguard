@@ -882,6 +882,54 @@ func (g *GuardManager) setProjectConfig(project string, enabled *bool, hookEnabl
 	return g.ProjectStatus(absProject), nil
 }
 
+// RemoveProject removes a project entry from guard.json and clears runtime state.
+func (g *GuardManager) RemoveProject(project string) error {
+	if g == nil {
+		return nil
+	}
+	absProject, err := filepath.Abs(strings.TrimSpace(project))
+	if err != nil || absProject == "" {
+		return errors.New("无效项目路径")
+	}
+	absProject = filepath.Clean(absProject)
+
+	g.mu.Lock()
+	g.ensureLoadedLocked()
+	delete(g.configs, absProject)
+	delete(g.runtime, absProject)
+	delete(g.watch, absProject)
+	saveErr := g.saveLocked()
+	g.mu.Unlock()
+	return saveErr
+}
+
+// DisableProjectWatcherIfConfigured turns off background watching for an existing guard entry without writing disk hooks.
+func (g *GuardManager) DisableProjectWatcherIfConfigured(project string) error {
+	if g == nil {
+		return nil
+	}
+	absProject, err := filepath.Abs(strings.TrimSpace(project))
+	if err != nil || absProject == "" {
+		return nil
+	}
+	absProject = filepath.Clean(absProject)
+
+	g.mu.Lock()
+	g.ensureLoadedLocked()
+	cfg, ok := g.configs[absProject]
+	if !ok || !cfg.Enabled {
+		g.mu.Unlock()
+		return nil
+	}
+	cfg.Enabled = false
+	cfg.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	g.configs[absProject] = cfg
+	delete(g.watch, absProject)
+	saveErr := g.saveLocked()
+	g.mu.Unlock()
+	return saveErr
+}
+
 func (s *Server) handleGuardToggle(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w, http.MethodPost)

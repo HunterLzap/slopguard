@@ -1736,14 +1736,26 @@ func verifyAgentProfile(ctx context.Context, home, project string, prof agentPro
 		rep.GlobalConfigured = prof.Enabled
 	}
 
+	globalEventCount := 0
 	if db != nil {
-		queryProj := ""
-		if prof.Scope == "project" {
-			queryProj = project
+		if events, err := db.ListMCPEvents(ctx, "", "", 50); err == nil {
+			for _, ev := range events {
+				if isFilesystemRootPath(ev.ProjectPath) {
+					continue
+				}
+				globalEventCount++
+				if rep.LastEventAt == "" {
+					rep.LastEventAt = ev.CreatedAt.UTC().Format(time.RFC3339)
+				}
+			}
 		}
-		if events, err := db.ListMCPEvents(ctx, queryProj, "", 50); err == nil && len(events) > 0 {
-			rep.EventCount = len(events)
-			rep.LastEventAt = events[0].CreatedAt.UTC().Format(time.RFC3339)
+		if project != "" {
+			if projEvents, err := db.ListMCPEvents(ctx, project, "", 50); err == nil && len(projEvents) > 0 {
+				rep.EventCount = len(projEvents)
+				rep.LastEventAt = projEvents[0].CreatedAt.UTC().Format(time.RFC3339)
+			}
+		} else if prof.Scope == "global" {
+			rep.EventCount = globalEventCount
 		}
 	}
 
@@ -1817,11 +1829,18 @@ func verifyAgentProfile(ctx context.Context, home, project string, prof agentPro
 		cliRegistered = reg
 	}
 
-	if rep.EventCount > 0 || cliRegistered {
+	if rep.EventCount > 0 || (prof.Scope == "global" && globalEventCount > 0) || cliRegistered {
 		rep.HealthStatus = "active"
 		if rep.EventCount > 0 {
 			rep.ActivationStatus = "active"
-			rep.Diagnosis = fmt.Sprintf("MCP 握手通过 (%dms, %d个工具) · 已记录 %d 次真实调用", latencyMS, len(tools), rep.EventCount)
+			if prof.Scope == "global" && project != "" {
+				rep.Diagnosis = fmt.Sprintf("MCP 握手通过 (%dms, %d个工具) · 当前项目已记录 %d 次调用", latencyMS, len(tools), rep.EventCount)
+			} else {
+				rep.Diagnosis = fmt.Sprintf("MCP 握手通过 (%dms, %d个工具) · 已记录 %d 次真实调用", latencyMS, len(tools), rep.EventCount)
+			}
+		} else if globalEventCount > 0 && prof.Scope == "global" {
+			rep.ActivationStatus = "active"
+			rep.Diagnosis = fmt.Sprintf("MCP 握手通过 (%dms, %d个工具) · 全局已记录 %d 次调用（当前项目 0 次）", latencyMS, len(tools), globalEventCount)
 		} else {
 			rep.ActivationStatus = "registered_idle"
 			rep.Diagnosis = fmt.Sprintf("MCP 握手通过 (%dms, %d个工具) · 客户端 CLI 已注册", latencyMS, len(tools))

@@ -33,7 +33,7 @@ private struct StatusSummary: Decodable, Sendable {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandlerWithReply {
     private var statusItem: NSStatusItem?
     private var contextMenu: NSMenu?
     private var pendingSummaryItem: NSMenuItem?
@@ -93,10 +93,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         let config = WKWebViewConfiguration()
         config.applicationNameForUserAgent = "SlopGuardApp/1.0"
         config.preferences.setValue(true, forKey: "developerExtrasEnabled")
+        config.userContentController.addScriptMessageHandler(self, contentWorld: .page, name: "pickFolder")
 
         let wv = WKWebView(frame: contentRect, configuration: config)
         wv.autoresizingMask = [.width, .height]
         wv.navigationDelegate = self
+        wv.uiDelegate = self
         win.contentView = wv
 
         self.window = win
@@ -598,6 +600,105 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             return path
         }
         return nil
+    }
+
+    // MARK: - WKScriptMessageHandlerWithReply
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage,
+        replyHandler: @escaping @MainActor (Any?, String?) -> Void
+    ) {
+        guard message.name == "pickFolder" else {
+            replyHandler(nil, "unsupported message handler")
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.prompt = "选择"
+        panel.message = "选择要接入 SlopGuard 的项目目录"
+
+        NSApp.activate(ignoringOtherApps: true)
+        if let win = self.window {
+            win.makeKeyAndOrderFront(nil)
+            panel.beginSheetModal(for: win) { [weak self] response in
+                Task { @MainActor in
+                    NSApp.activate(ignoringOtherApps: true)
+                    self?.window?.makeKeyAndOrderFront(nil)
+                    if response == .OK, let url = panel.url {
+                        replyHandler(["ok": true, "path": url.path], nil)
+                    } else {
+                        replyHandler(["ok": false, "cancelled": true], nil)
+                    }
+                }
+            }
+        } else {
+            panel.begin { response in
+                Task { @MainActor in
+                    if response == .OK, let url = panel.url {
+                        replyHandler(["ok": true, "path": url.path], nil)
+                    } else {
+                        replyHandler(["ok": false, "cancelled": true], nil)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - WKUIDelegate
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptAlertPanelWithMessage message: String,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping @MainActor () -> Void
+    ) {
+        let alert = NSAlert()
+        alert.messageText = "SlopGuard"
+        alert.informativeText = message
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "确定")
+        if let win = self.window {
+            NSApp.activate(ignoringOtherApps: true)
+            win.makeKeyAndOrderFront(nil)
+            alert.beginSheetModal(for: win) { _ in
+                Task { @MainActor in
+                    completionHandler()
+                }
+            }
+        } else {
+            alert.runModal()
+            completionHandler()
+        }
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptConfirmPanelWithMessage message: String,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping @MainActor (Bool) -> Void
+    ) {
+        let alert = NSAlert()
+        alert.messageText = "SlopGuard"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "确认")
+        alert.addButton(withTitle: "取消")
+        if let win = self.window {
+            NSApp.activate(ignoringOtherApps: true)
+            win.makeKeyAndOrderFront(nil)
+            alert.beginSheetModal(for: win) { response in
+                Task { @MainActor in
+                    completionHandler(response == .alertFirstButtonReturn)
+                }
+            }
+        } else {
+            let res = alert.runModal()
+            completionHandler(res == .alertFirstButtonReturn)
+        }
     }
 
     // MARK: - WKNavigationDelegate

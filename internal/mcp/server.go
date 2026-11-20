@@ -12,8 +12,29 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
+	"path/filepath"
 	"strings"
 )
+
+type sessionRootContextKey struct{}
+
+// WithSessionRoot attaches an MCP client-advertised workspace root to ctx.
+func WithSessionRoot(ctx context.Context, root string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, sessionRootContextKey{}, strings.TrimSpace(root))
+}
+
+// SessionRootFromContext returns any workspace root parsed from MCP initialize.
+func SessionRootFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(sessionRootContextKey{}).(string)
+	return strings.TrimSpace(v)
+}
 
 const (
 	// DefaultProtocolVersion is returned when the client does not request one.
@@ -34,10 +55,11 @@ type Tool struct {
 
 // Server is a stdio MCP server with a fixed tool set.
 type Server struct {
-	Tools      []Tool
-	Log        io.Writer
-	Protocol   string
-	ServerInfo string
+	Tools       []Tool
+	Log         io.Writer
+	Protocol    string
+	ServerInfo  string
+	sessionRoot string
 }
 
 // NewServer creates a server. log may be nil; log messages are discarded then.
@@ -145,12 +167,23 @@ func (s *Server) dispatch(ctx context.Context, request rpcRequest) (any, *rpcErr
 			protocol = DefaultProtocolVersion
 		}
 		var params struct {
-			ProtocolVersion string `json:"protocolVersion"`
+			ProtocolVersion  string `json:"protocolVersion"`
+			RootURI          string `json:"rootUri"`
+			RootPath         string `json:"rootPath"`
+			WorkspaceFolders []struct {
+				URI string `json:"uri"`
+			} `json:"workspaceFolders"`
 		}
 		if len(request.Params) > 0 {
 			_ = json.Unmarshal(request.Params, &params)
 			if strings.TrimSpace(params.ProtocolVersion) != "" {
 				protocol = params.ProtocolVersion
+			}
+			for _, candidate := range append(workspaceFolderURIs(params.WorkspaceFolders), params.RootURI, params.RootPath) {
+				if parsed := parseWorkspaceRootCandidate(candidate); parsed != "" {
+					s.sessionRoot = parsed
+					break
+				}
 			}
 		}
 		return map[string]any{
@@ -183,7 +216,11 @@ func (s *Server) dispatch(ctx context.Context, request rpcRequest) (any, *rpcErr
 		if len(args) == 0 {
 			args = json.RawMessage(`{}`)
 		}
-		value, err := tool.Handler(ctx, args)
+		callCtx := ctx
+		if s.sessionRoot != "" && SessionRootFromContext(callCtx) == "" {
+			callCtx = WithSessionRoot(callCtx, s.sessionRoot)
+		}
+		value, err := tool.Handler(callCtx, args)
 		if err != nil {
 			return map[string]any{
 				"content": []map[string]any{{"type": "text", "text": err.Error()}},
@@ -230,6 +267,35 @@ func (s *Server) toolDescriptors() []map[string]any {
 		})
 	}
 	return out
+}
+
+func workspaceFolderURIs(folders []struct {
+	URI string `json:"uri"`
+}) []string {
+	out := make([]string, 0, len(folders))
+	for _, f := range folders {
+		out = append(out, f.URI)
+	}
+	return out
+}
+
+func parseWorkspaceRootCandidate(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.HasPrefix(strings.ToLower(trimmed), "file://") {
+		u, err := url.Parse(trimmed)
+		if err != nil || u.Path == "" {
+			return ""
+		}
+		p := u.Path
+		if len(p) >= 3 && p[0] == '/' && p[2] == ':' {
+			p = p[1:]
+		}
+		return filepath.Clean(filepath.FromSlash(p))
+	}
+	return filepath.Clean(trimmed)
 }
 
 func writeResponse(w *bufio.Writer, response rpcResponse) error {

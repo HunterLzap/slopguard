@@ -25,17 +25,18 @@ var (
 )
 
 type previewRecord struct {
-	ID        string
-	Kind      string
-	TargetID  string
-	Project   string
-	Scope     string
-	Action    string
-	Paths     map[string]string
-	NewHashes map[string]string
-	CreatedAt time.Time
-	ExpiresAt time.Time
-	Consumed  bool
+	ID               string
+	Kind             string
+	TargetID         string
+	Project          string
+	Scope            string
+	Action           string
+	SurgicalFallback bool
+	Paths            map[string]string
+	NewHashes        map[string]string
+	CreatedAt        time.Time
+	ExpiresAt        time.Time
+	Consumed         bool
 }
 
 type previewExpectation struct {

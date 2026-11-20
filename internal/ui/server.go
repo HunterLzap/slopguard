@@ -300,6 +300,9 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 	}
 	var pendingUser, pendingAI int
 	for _, m := range mistakes {
+		if isFilesystemRootPath(m.ProjectPath) {
+			continue
+		}
 		switch m.ReviewStatus {
 		case "pending_user":
 			pendingUser++
@@ -343,14 +346,27 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 	if s.guard != nil {
 		guarded = s.guard.EnabledMap()
 	}
+	hidden := loadHiddenProjects(s.resolveHomeDir())
 	out := make([]projectInfoResponse, 0, len(projects))
 	for _, p := range projects {
+		if isFilesystemRootPath(p.ProjectPath) || isProjectHidden(hidden, p.ProjectPath) {
+			continue
+		}
 		out = append(out, projectInfoResponse{
 			ProjectInfo:  p,
 			GuardEnabled: guarded[filepath.Clean(p.ProjectPath)],
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"projects": out})
+}
+
+func isFilesystemRootPath(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return true
+	}
+	cleaned := filepath.Clean(trimmed)
+	return filepath.Dir(cleaned) == cleaned
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -372,15 +388,20 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = parsed
 	}
-	events, err := s.db.ListMCPEvents(r.Context(), q.Get("project"), q.Get("tool"), limit)
+	reqProj := strings.TrimSpace(q.Get("project"))
+	events, err := s.db.ListMCPEvents(r.Context(), reqProj, q.Get("tool"), limit)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if events == nil {
-		events = []store.MCPEvent{}
+	filtered := make([]store.MCPEvent, 0, len(events))
+	for _, ev := range events {
+		if reqProj == "" && isFilesystemRootPath(ev.ProjectPath) {
+			continue
+		}
+		filtered = append(filtered, ev)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"events": events})
+	writeJSON(w, http.StatusOK, map[string]any{"events": filtered})
 }
 
 type mistakeResponse struct {

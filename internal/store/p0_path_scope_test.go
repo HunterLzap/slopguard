@@ -104,12 +104,16 @@ func TestP0NormalizeHistoricalProjectPathsMigration(t *testing.T) {
 	}
 	runMigration()
 
+	wantCanonical, err := canonicalProjectPathStrict(canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var gotM1, gotM3 string
 	if err := s.db.QueryRow(`SELECT project_path FROM mistakes WHERE id='m1'`).Scan(&gotM1); err != nil {
 		t.Fatal(err)
 	}
-	if gotM1 != canonical {
-		t.Fatalf("m1 path = %q, want %q", gotM1, canonical)
+	if gotM1 != wantCanonical {
+		t.Fatalf("m1 path = %q, want %q", gotM1, wantCanonical)
 	}
 	if err := s.db.QueryRow(`SELECT project_path FROM mistakes WHERE id='m3'`).Scan(&gotM3); err != nil {
 		t.Fatal(err)
@@ -170,8 +174,8 @@ func TestP0NormalizeHistoricalProjectPathsMigration(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT project_path FROM mistakes WHERE id='m1'`).Scan(&gotM1); err != nil {
 		t.Fatal(err)
 	}
-	if gotM1 != canonical {
-		t.Fatalf("m1 path after second migration = %q", gotM1)
+	if gotM1 != wantCanonical {
+		t.Fatalf("m1 path after second migration = %q, want %q", gotM1, wantCanonical)
 	}
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM mistakes`).Scan(&mistakeCount); err != nil {
 		t.Fatal(err)
@@ -216,12 +220,16 @@ func TestP0ReopenMigratesLegacyProjectPaths(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer s2.Close()
+	wantCanonical, err := canonicalProjectPathStrict(canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var got string
 	if err := s2.db.QueryRow(`SELECT project_path FROM mistakes WHERE id='reopen-m1'`).Scan(&got); err != nil {
 		t.Fatal(err)
 	}
-	if got != canonical {
-		t.Fatalf("path after reopen = %q, want %q", got, canonical)
+	if got != wantCanonical {
+		t.Fatalf("path after reopen = %q, want %q", got, wantCanonical)
 	}
 	var status string
 	if err := s2.db.QueryRow(`SELECT status FROM project_path_migrations

@@ -311,8 +311,13 @@ func (s *Store) QueryMistakes(ctx context.Context, query MistakeQuery) ([]Mistak
 		args = append(args, reviewStatus)
 	}
 	if projectPath != "" {
-		conditions = append(conditions, "project_path = ?")
-		args = append(args, projectPath)
+		if clause, scopeArgs, scopeErr := projectPathScopeClause(projectPath); scopeErr == nil && clause != "" {
+			conditions = append(conditions, clause)
+			args = append(args, scopeArgs...)
+		} else {
+			conditions = append(conditions, "project_path = ?")
+			args = append(args, projectPath)
+		}
 	}
 	if category != "" {
 		conditions = append(conditions, "LOWER(category) = ?")
@@ -558,8 +563,13 @@ func (s *Store) ListMCPEvents(ctx context.Context, projectPath, toolName string,
 	var conditions []string
 	var args []any
 	if projectPath != "" {
-		conditions = append(conditions, "project_path = ?")
-		args = append(args, projectPath)
+		if clause, scopeArgs, scopeErr := projectPathScopeClause(projectPath); scopeErr == nil && clause != "" {
+			conditions = append(conditions, clause)
+			args = append(args, scopeArgs...)
+		} else {
+			conditions = append(conditions, "project_path = ?")
+			args = append(args, projectPath)
+		}
 	}
 	if toolName != "" {
 		conditions = append(conditions, "tool_name = ?")

@@ -417,83 +417,12 @@ func TestGuardToggleGitHookAndDebounceWatcher(t *testing.T) {
 	}
 }
 
-func TestSessionScannerReadOnlyAndGitFix(t *testing.T) {
-	home := t.TempDir()
-	db := openDashboardStore(t)
-	project := filepath.Join(t.TempDir(), "web-app")
-	writeDashboardFile(t, filepath.Join(project, ".git", "HEAD"), "ref: refs/heads/main\n")
-
-	claudeLog := filepath.Join(home, ".claude", "projects", "web-app", "sess1.jsonl")
-	claudeContent := `{"cwd":` + jsonQuote(project) + `,"timestamp":"2026-11-18T10:00:00Z","message":{"content":[{"type":"tool_result","is_error":true,"content":"src/index.ts(12,5): error TS2322: Type 'string' is not assignable to type 'number'."}]}}` + "\n"
-	writeDashboardFile(t, claudeLog, claudeContent)
-
-	codexLog := filepath.Join(home, ".codex", "sessions", "2026", "11", "18", "rollout-1.jsonl")
-	codexContent := `{"type":"session_meta","timestamp":"2026-11-18T10:05:00Z","payload":{"cwd":` + jsonQuote(project) + `}}` + "\n" +
-		`{"type":"response_item","timestamp":"2026-11-18T10:06:00Z","payload":{"type":"custom_tool_call_output","output":"Command exited with code 1\ninternal/app.go:44:12: undefined: buildClient"}}` + "\n"
-	writeDashboardFile(t, codexLog, codexContent)
-
-	agyLog := filepath.Join(home, ".gemini", "antigravity", "brain", "conv-1", ".system_generated", "logs", "transcript.jsonl")
-	agyContent := `{"status":"ERROR","created_at":"2026-11-18T10:09:00Z","content":"Encountered error in step execution: file does not exist\nthe error messages you got name them"}` + "\n" +
-		`{"status":"ERROR","created_at":"2026-11-18T10:10:00Z","content":"Running pytest in ` + strings.ReplaceAll(project, `\`, `\\`) + `\nModuleNotFoundError: No module named 'httpx'"}` + "\n"
-	writeDashboardFile(t, agyLog, agyContent)
-
-	claudeStatBefore, _ := os.Stat(claudeLog)
-
-	runner := &fakeUIRunner{
-		runFunc: func(_ context.Context, spec contract.RunSpec) contract.RunResult {
-			joined := strings.Join(spec.Args, " ")
-			switch {
-			case strings.Contains(joined, "rev-parse"):
-				return contract.RunResult{ExitCode: 0, Stdout: "true\n"}
-			case strings.Contains(joined, "log"):
-				return contract.RunResult{
-					ExitCode: 0,
-					Stdout:   "1234567890abcdef1234567890abcdef12345678\t2026-11-18T09:00:00Z\tfix: resolve null token crash\nsrc/auth.ts\n",
-				}
-			default:
-				return contract.RunResult{ExitCode: 0}
-			}
-		},
-	}
-
-	s := NewServer(db, runner)
-	s.homeDir = home
+func TestLegacySessionScanEndpointRemoved(t *testing.T) {
+	s := NewServer(openDashboardStore(t), nil)
 	handler := authedTestHandler(s)
-
-	code, body := postDashboardJSON(t, handler, "/api/sessions/scan", map[string]any{
-		"project": project,
-		"days":    14,
-	})
-	if code != http.StatusOK {
-		t.Fatalf("POST /api/sessions/scan = %d: %s", code, body)
-	}
-	scanJSON := decodeDashboardJSON(t, body)
-	if scanJSON["found"] != float64(4) || scanJSON["imported"] != float64(4) {
-		t.Fatalf("scan response = %v, want found=4 imported=4", scanJSON)
-	}
-
-	// Verify read-only guarantee: original log files untouched.
-	claudeAfter, _ := os.ReadFile(claudeLog)
-	claudeStatAfter, _ := os.Stat(claudeLog)
-	if string(claudeAfter) != claudeContent || !claudeStatAfter.ModTime().Equal(claudeStatBefore.ModTime()) {
-		t.Fatalf("session file was modified by read-only scanner")
-	}
-
-	records, err := db.QueryMistakes(context.Background(), store.MistakeQuery{ProjectPath: project})
-	if err != nil {
-		t.Fatal(err)
-	}
-	sources := map[string]bool{}
-	for _, r := range records {
-		sources[r.Source] = true
-		if r.ReviewStatus != "pending_ai" {
-			t.Fatalf("expected pending_ai review_status, got %q", r.ReviewStatus)
-		}
-	}
-	for _, wantSrc := range []string{"git_fix", "session_claude", "session_codex", "session_antigravity"} {
-		if !sources[wantSrc] {
-			t.Fatalf("missing source %q in records: %+v", wantSrc, records)
-		}
+	code, _ := postDashboardJSON(t, handler, "/api/sessions/scan", map[string]any{})
+	if code != http.StatusNotFound {
+		t.Fatalf("POST /api/sessions/scan = %d, want 404 (replaced by Agent prompt workflow)", code)
 	}
 }
 
@@ -812,7 +741,7 @@ func TestMistakeLocalHintCacheExclusionAndSetProjectConfig(t *testing.T) {
 	}
 }
 
-func TestAnalyzeAllAndApproveCreatesRule(t *testing.T) {
+func TestMCPAnalysisSubmitAndApplyRecommendations(t *testing.T) {
 	home := t.TempDir()
 	db := openDashboardStore(t)
 	project := filepath.Join(t.TempDir(), "py-rules")
@@ -842,48 +771,14 @@ func TestAnalyzeAllAndApproveCreatesRule(t *testing.T) {
 
 	s := NewServer(db, nil)
 	s.homeDir = home
-	s.ai.analyzeFn = func(_ context.Context, _ AgentCLIRunner, _ string, mistakes []store.MistakeRecord) ([]AIAnalysisItem, error) {
-		out := make([]AIAnalysisItem, 0, len(mistakes))
-		for _, m := range mistakes {
-			if strings.Contains(m.Summary, ".cache") || strings.Contains(m.Summary, ".venv") {
-				out = append(out, AIAnalysisItem{
-					Fingerprint: m.Fingerprint,
-					Decision:    "skip",
-					Reason:      "属于缓存目录噪音，建议忽略。",
-				})
-			} else {
-				out = append(out, AIAnalysisItem{
-					Fingerprint: m.Fingerprint,
-					Decision:    "recommend",
-					Reason:      "模型判断属于真实类型安全风险，建议入库拦截。",
-					RuleDraft:   m.Summary,
-				})
-			}
-		}
-		return out, nil
-	}
 	handler := authedTestHandler(s)
 
-	// Verify AI config toggle persists cleanly.
-	aiOn := false
-	cfgCode, cfgBody := postDashboardJSON(t, handler, "/api/ai/config", map[string]any{
-		"auto_analyze": aiOn,
-		"runner_id":    "agy",
-	})
-	if cfgCode != http.StatusOK {
-		t.Fatalf("POST /api/ai/config = %d: %s", cfgCode, cfgBody)
+	// 1. Simulate host Agent submitting analysis back via MCP (sg_submit_analysis).
+	if err := db.SubmitMistakeAnalysisScoped(context.Background(), project, "fp-cache-noise", "skip", "属于缓存目录噪音，建议忽略。", ""); err != nil {
+		t.Fatal(err)
 	}
-
-	// 1. Real Agent CLI pipeline classifies cache noise as skip and optional member access as recommend.
-	aCode, aBody := postDashboardJSON(t, handler, "/api/mistakes/analyze-all", map[string]any{
-		"project": project,
-	})
-	if aCode != http.StatusOK {
-		t.Fatalf("POST /api/mistakes/analyze-all = %d: %s", aCode, aBody)
-	}
-	aJSON := decodeDashboardJSON(t, aBody)
-	if aJSON["analyzed"] != float64(2) || aJSON["recommended"] != float64(1) || aJSON["skipped"] != float64(1) {
-		t.Fatalf("analyze-all = %v, want analyzed=2 recommended=1 skipped=1", aJSON)
+	if err := db.SubmitMistakeAnalysisScoped(context.Background(), project, "fp-pyright-none", "recommend", "模型判断属于真实类型安全风险，建议入库拦截。", `[pyright:reportOptionalMemberAccess]`); err != nil {
+		t.Fatal(err)
 	}
 
 	// Verify both moved to pending_user with expected decisions.
@@ -915,7 +810,7 @@ func TestAnalyzeAllAndApproveCreatesRule(t *testing.T) {
 		t.Fatalf("rules ledger = %+v, want 1 pyright reportOptionalMemberAccess rule", rules)
 	}
 
-	// 3. One-click apply recommendations after resetting fp-pyright-none back, or add a fresh pair and apply all.
+	// 3. Batch apply recommendations atomically promotes recommend items and ignores skip items.
 	if _, err := db.RecordMistake(context.Background(), contract.Mistake{
 		ProjectPath: project,
 		Fingerprint: "fp-rec-eslint",
@@ -934,7 +829,12 @@ func TestAnalyzeAllAndApproveCreatesRule(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	_, _ = postDashboardJSON(t, handler, "/api/mistakes/analyze-all", map[string]any{"project": project})
+	if err := db.SubmitMistakeAnalysisScoped(context.Background(), project, "fp-rec-eslint", "recommend", "建议禁止 explicit any", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SubmitMistakeAnalysisScoped(context.Background(), project, "fp-skip-cache2", "skip", "虚拟环境误报", ""); err != nil {
+		t.Fatal(err)
+	}
 
 	apAllCode, apAllBody := postDashboardJSON(t, handler, "/api/mistakes/apply-recommendations", map[string]any{
 		"project": project,
@@ -952,15 +852,7 @@ func TestAnalyzeAllAndApproveCreatesRule(t *testing.T) {
 	}
 }
 
-func TestParseAgentAnalysisOutputAndCodexTOMLVerify(t *testing.T) {
-	// 1. Parse agy structured_output JSON envelope cleanly.
-	raw := []byte(`{"status":"SUCCESS","structured_output":{"items":[{"fingerprint":"fp-1","decision":"recommend","reason":"空值风险","rule_draft":"{\"reportOptionalMemberAccess\":\"error\"}"}]}}`)
-	items, err := parseAgentAnalysisOutput(raw)
-	if err != nil || len(items) != 1 || items[0].Fingerprint != "fp-1" || items[0].Decision != "recommend" {
-		t.Fatalf("parseAgentAnalysisOutput = %+v, err=%v", items, err)
-	}
-
-	// 2. Codex TOML upsert/restore preserves existing MCP servers + verify detects broken path.
+func TestCodexToggleAndVerifyBrokenCursor(t *testing.T) {
 	home := t.TempDir()
 	db := openDashboardStore(t)
 	codexTOMLPath := filepath.Join(home, ".codex", "config.toml")
@@ -1082,22 +974,15 @@ func TestP0AgentTrustEnvWhitelistAndAISafety(t *testing.T) {
 		t.Fatalf("untrusted MCP command was executed!")
 	}
 
-	// P0-03: AutoAnalyze defaults to false even on corrupt config, requires explicit confirmation,
-	// rejects unavailable explicit runner instead of falling back silently, and rejects invalid decisions.
-	writeDashboardFile(t, filepath.Join(home, ".slopguard", "ai-config.json"), `{corrupt-json`)
-	st := s.ai.Status()
-	if st.AutoAnalyze {
-		t.Fatalf("AutoAnalyze must default false on corrupt config")
+	// Legacy headless CLI AI runner endpoints must remain completely removed (404).
+	for _, removedEndpoint := range []string{"/api/ai/config", "/api/mistakes/analyze-all"} {
+		code, _ := postDashboardJSON(t, handler, removedEndpoint, map[string]any{})
+		if code != http.StatusNotFound {
+			t.Fatalf("POST %s = %d, want 404 (headless AI runner removed)", removedEndpoint, code)
+		}
 	}
-	unconfCode, _ := postDashboardJSON(t, handler, "/api/ai/config", map[string]any{
-		"auto_analyze": true,
-	})
-	if unconfCode != http.StatusBadRequest {
-		t.Fatalf("expected 400 when auto_analyze=true without confirmed=true, got %d", unconfCode)
-	}
-	if _, err := s.ai.SetConfig(nil, strPtr("codex")); err != nil {
-		t.Fatalf("set runner codex: %v", err)
-	}
+
+	// Invalid MCP analysis decision must be rejected and remain pending_ai.
 	if _, err := db.RecordMistake(context.Background(), contract.Mistake{
 		ProjectPath: home,
 		Fingerprint: "fp-invalid-decision",
@@ -1107,38 +992,14 @@ func TestP0AgentTrustEnvWhitelistAndAISafety(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// Fake empty PATH so codex is unavailable; production analyzer must refuse without silent failover.
-	t.Setenv("PATH", t.TempDir())
-	if _, _, _, err := s.ai.AnalyzePending(context.Background(), home); err == nil {
-		t.Fatalf("expected explicit error when preferred runner codex is unavailable")
-	}
-
-	// Invalid AI decision must stay pending_ai rather than coercing to recommend.
-	s.ai.analyzeFn = func(_ context.Context, _ AgentCLIRunner, _ string, _ []store.MistakeRecord) ([]AIAnalysisItem, error) {
-		return []AIAnalysisItem{{
-			Fingerprint: "fp-invalid-decision",
-			Decision:    "auto_fix_everything",
-			Reason:      "bogus decision",
-		}}, nil
-	}
-	if _, _, _, err := s.ai.AnalyzePending(context.Background(), home); err == nil {
+	if err := db.SubmitMistakeAnalysisScoped(context.Background(), home, "fp-invalid-decision", "auto_fix_everything", "bogus", ""); err == nil {
 		t.Fatalf("expected error on illegal decision value")
 	}
 	stillPending, _ := db.ListInboxMistakes(context.Background(), home, "pending_ai")
 	if len(stillPending) != 1 || stillPending[0].Fingerprint != "fp-invalid-decision" {
 		t.Fatalf("illegal decision must remain pending_ai, got %+v", stillPending)
 	}
-
-	// P1 Codex JSONL event parsing.
-	jsonl := `{"type":"thread.started","thread_id":"t1"}` + "\n" +
-		`{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"{\"items\":[{\"fingerprint\":\"fp1\",\"decision\":\"skip\",\"reason\":\"缓存噪音\"}]}"}}` + "\n"
-	parsedCodex, err := parseCodexJSONLOutput([]byte(jsonl))
-	if err != nil || len(parsedCodex) != 1 || parsedCodex[0].Decision != "skip" {
-		t.Fatalf("parseCodexJSONLOutput failed: items=%+v err=%v", parsedCodex, err)
-	}
 }
-
-func strPtr(s string) *string { return &s }
 
 func TestP0SafeUninstallBackupPermissionsConflictAndTOML(t *testing.T) {
 	home := t.TempDir()
@@ -1307,8 +1168,7 @@ func TestP0SafeUninstallBackupPermissionsConflictAndTOML(t *testing.T) {
 	}
 }
 
-func TestP1GitHookPathAndSessionScanGuards(t *testing.T) {
-	home := t.TempDir()
+func TestP1GitHookPathResolution(t *testing.T) {
 	proj := t.TempDir()
 
 	// Real git repo with custom core.hooksPath.
@@ -1342,28 +1202,5 @@ func TestP1GitHookPathAndSessionScanGuards(t *testing.T) {
 	block := buildGitHookBlock("/usr/local/bin/slopguard")
 	if !strings.Contains(block, `--commit "$_sg_rev"`) {
 		t.Fatalf("git hook block must pin commit SHA via --commit, got:\n%s", block)
-	}
-
-	// Session scan skips symlinks & honors cancelled context.
-	sessDir := filepath.Join(home, ".claude", "projects", "demo")
-	if err := os.MkdirAll(sessDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	secretTarget := filepath.Join(home, "secret-outside.jsonl")
-	_ = writeFileAtomic(secretTarget, []byte(`{"type":"tool_result","is_error":true,"content":"secret"}`+"\n"), 0o600)
-	_ = os.Symlink(secretTarget, filepath.Join(sessDir, "symlink.jsonl"))
-	_ = writeFileAtomic(filepath.Join(sessDir, "regular.jsonl"), []byte(`{}`+"\n"), 0o644)
-
-	files := collectRecentFiles(context.Background(), filepath.Join(home, ".claude", "projects"), ".jsonl", time.Now().Add(-time.Hour), 10)
-	for _, f := range files {
-		if strings.HasSuffix(f, "symlink.jsonl") {
-			t.Fatalf("collectRecentFiles must skip symlinks, got %v", files)
-		}
-	}
-	canceledCtx, cancel := context.WithCancel(context.Background())
-	cancel()
-	canceledFiles := collectRecentFiles(canceledCtx, filepath.Join(home, ".claude", "projects"), ".jsonl", time.Now().Add(-time.Hour), 10)
-	if len(canceledFiles) != 0 {
-		t.Fatalf("expected 0 files on canceled context, got %v", canceledFiles)
 	}
 }

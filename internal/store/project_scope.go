@@ -6,10 +6,69 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/HunterLzap/slopguard/internal/contract"
 )
+
+func projectPathVariants(projectPath string) ([]string, error) {
+	trimmed := strings.TrimSpace(projectPath)
+	if trimmed == "" {
+		return nil, nil
+	}
+	seen := make(map[string]struct{}, 5)
+	out := make([]string, 0, 5)
+	add := func(v string) {
+		if v == "" {
+			return
+		}
+		if _, ok := seen[v]; !ok {
+			seen[v] = struct{}{}
+			out = append(out, v)
+		}
+	}
+	canonical, err := canonicalProjectPathStrict(trimmed)
+	if err != nil {
+		return nil, err
+	}
+	add(canonical)
+	if abs, absErr := filepath.Abs(trimmed); absErr == nil {
+		add(filepath.Clean(abs))
+	}
+	add(filepath.Clean(trimmed))
+	if runtime.GOOS == "darwin" {
+		for _, item := range append([]string(nil), out...) {
+			if strings.HasPrefix(item, "/private/var/") {
+				add("/var/" + strings.TrimPrefix(item, "/private/var/"))
+			} else if strings.HasPrefix(item, "/var/") {
+				add("/private/var/" + strings.TrimPrefix(item, "/var/"))
+			} else if strings.HasPrefix(item, "/private/tmp/") {
+				add("/tmp/" + strings.TrimPrefix(item, "/private/tmp/"))
+			} else if strings.HasPrefix(item, "/tmp/") {
+				add("/private/tmp/" + strings.TrimPrefix(item, "/tmp/"))
+			}
+		}
+	}
+	return out, nil
+}
+
+func projectPathScopeClause(projectPath string) (clause string, args []any, err error) {
+	variants, err := projectPathVariants(projectPath)
+	if err != nil || len(variants) == 0 {
+		return "", nil, err
+	}
+	if len(variants) == 1 {
+		return "project_path = ?", []any{variants[0]}, nil
+	}
+	placeholders := make([]string, len(variants))
+	args = make([]any, len(variants))
+	for i, v := range variants {
+		placeholders[i] = "?"
+		args[i] = v
+	}
+	return "project_path IN (" + strings.Join(placeholders, ", ") + ")", args, nil
+}
 
 // ErrProjectScopeRequired 表示查询必须携带明确的项目作用域，禁止退化成全局查询。
 var ErrProjectScopeRequired = errors.New("store: project scope is required")
@@ -27,20 +86,21 @@ func (s *Store) ListCandidatesScoped(ctx context.Context, projectPath string, mi
 	if projectPath == "" {
 		return nil, ErrProjectScopeRequired
 	}
-	canonical, err := canonicalProjectPathStrict(projectPath)
+	clause, scopeArgs, err := projectPathScopeClause(projectPath)
 	if err != nil {
 		return nil, fmt.Errorf("store: normalize project scope: %w", err)
 	}
 	if minCount <= 0 {
 		minCount = 2
 	}
+	queryArgs := append(scopeArgs, minCount)
 	rows, err := s.db.QueryContext(ctx, `SELECT
 		id, project_path, fingerprint, category, summary,
 		COALESCE(bad_snippet, ''), COALESCE(good_snippet, ''),
 		source, status, created_at
 		FROM mistakes
-		WHERE project_path = ? AND count >= ? AND status = 'pending'
-		ORDER BY count DESC, created_at ASC, id ASC`, canonical, minCount)
+		WHERE `+clause+` AND count >= ? AND status = 'pending'
+		ORDER BY count DESC, created_at ASC, id ASC`, queryArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("store: list scoped candidates: %w", err)
 	}
@@ -71,6 +131,9 @@ func canonicalProjectPathStrict(p string) (string, error) {
 	p = strings.TrimSpace(p)
 	if p == "" {
 		return "", nil
+	}
+	if strings.ContainsRune(p, 0) {
+		return "", errors.New("invalid NUL byte in project path")
 	}
 	abs, err := filepath.Abs(p)
 	if err != nil {

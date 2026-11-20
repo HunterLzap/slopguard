@@ -47,17 +47,32 @@ func readTargetSnapshot(path string) (targetSnapshot, error) {
 func resolveTargetRealPath(path string) string {
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		abs = path
+		abs = filepath.Clean(path)
 	}
-	if info, statErr := os.Stat(abs); statErr == nil && !info.IsDir() {
-		if resolved, evalErr := filepath.EvalSymlinks(abs); evalErr == nil && resolved != "" {
-			return filepath.Clean(resolved)
+	abs = filepath.Clean(abs)
+	if resolved, evalErr := filepath.EvalSymlinks(abs); evalErr == nil && resolved != "" {
+		return filepath.Clean(resolved)
+	}
+	// Walk upward to the deepest existing ancestor so non-existent parent/leaf paths
+	// on macOS (/var -> /private/var) resolve identically before and after file creation.
+	var tail []string
+	curr := abs
+	for {
+		parent := filepath.Dir(curr)
+		if parent == curr {
+			break
+		}
+		tail = append(tail, filepath.Base(curr))
+		curr = parent
+		if resolved, evalErr := filepath.EvalSymlinks(curr); evalErr == nil && resolved != "" {
+			out := resolved
+			for i := len(tail) - 1; i >= 0; i-- {
+				out = filepath.Join(out, tail[i])
+			}
+			return filepath.Clean(out)
 		}
 	}
-	if dir, evalErr := filepath.EvalSymlinks(filepath.Dir(abs)); evalErr == nil && dir != "" {
-		return filepath.Join(dir, filepath.Base(abs))
-	}
-	return filepath.Clean(abs)
+	return abs
 }
 
 func inferBackupScope(targetPath string) string {

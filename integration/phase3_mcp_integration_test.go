@@ -356,8 +356,16 @@ func TestPhase3MCPStdioEndToEnd(t *testing.T) {
 	}
 	configPath, _ := applied["config_path"].(string)
 	expectedConfig := filepath.Join(root, "eslint.config.mjs")
-	if !strings.EqualFold(filepath.Clean(configPath), filepath.Clean(expectedConfig)) {
-		t.Fatalf("config_path = %q, want %q", configPath, expectedConfig)
+	gotReal, _ := filepath.EvalSymlinks(filepath.Clean(configPath))
+	if gotReal == "" {
+		gotReal = filepath.Clean(configPath)
+	}
+	wantReal, _ := filepath.EvalSymlinks(filepath.Clean(expectedConfig))
+	if wantReal == "" {
+		wantReal = filepath.Clean(expectedConfig)
+	}
+	if !strings.EqualFold(gotReal, wantReal) {
+		t.Fatalf("config_path = %q (real=%q), want %q (real=%q)", configPath, gotReal, expectedConfig, wantReal)
 	}
 	configData, err := os.ReadFile(expectedConfig)
 	if err != nil {

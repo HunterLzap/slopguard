@@ -52,7 +52,6 @@ type Server struct {
 	instanceID       string
 	startedAt        time.Time
 	guard            *GuardManager
-	ai               *AIManager
 	authMu           sync.RWMutex
 	authToken        string
 	authTickets      map[string]authTicket
@@ -74,7 +73,6 @@ func NewServer(db *store.Store, runner contract.Runner) *Server {
 		previews:         make(map[string]*previewRecord),
 	}
 	s.guard = newGuardManager(s)
-	s.ai = newAIManager(s)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(mustSubFS(assets, "assets")))))
@@ -201,10 +199,6 @@ func Run(ctx context.Context, db *store.Store, runner contract.Runner, opts Opti
 	if server.guard != nil {
 		server.guard.Start(ctx)
 		defer server.guard.Stop()
-	}
-	if server.ai != nil {
-		server.ai.Start(ctx)
-		defer server.ai.Wait()
 	}
 	errCh := make(chan error, 1)
 	go func() {
@@ -1246,9 +1240,6 @@ func (s *Server) runVerify(ctx context.Context, runner contract.Runner, project 
 		_ = s.db.RecordScan(ctx, project, result.DurationMs, totalEscapes, result.Passed)
 		if !result.Passed && len(result.Findings) > 0 {
 			autoCaptureVerifyMistakesUI(ctx, s.db, project, result.Findings, req.Source)
-			if s.ai != nil {
-				s.ai.TriggerAsync(project)
-			}
 		}
 	}
 	return result, nil

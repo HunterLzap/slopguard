@@ -33,12 +33,9 @@ func (s *Server) registerActionRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/agents/preview", s.handlePreviewAgent)
 	mux.HandleFunc("/api/agents/toggle", s.handleToggleAgent)
 	mux.HandleFunc("/api/agents/verify", s.handleVerifyAgents)
-	mux.HandleFunc("/api/ai/config", s.handleAIConfig)
 	mux.HandleFunc("/api/guard/status", s.handleGuardStatus)
 	mux.HandleFunc("/api/guard/toggle", s.handleGuardToggleSecure)
 	mux.HandleFunc("/api/guard/hook/preview", s.handlePreviewGuardHook)
-	mux.HandleFunc("/api/sessions/scan", s.handleScanSessions)
-	mux.HandleFunc("/api/mistakes/analyze-all", s.handleAnalyzeAllMistakes)
 	mux.HandleFunc("/api/mistakes/apply-recommendations", s.handleApplyAIRecommendations)
 }
 
@@ -1532,15 +1529,10 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	content, isCustom, updatedAt := loadSharedSkill(home)
-	var aiStatus any
-	if s.ai != nil {
-		aiStatus = s.ai.Status()
-	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":          true,
 		"binary_path": exe,
 		"agents":      profiles,
-		"ai_status":   aiStatus,
 		"shared_skill": map[string]any{
 			"path":            sharedSkillPath(home),
 			"content":         content,
@@ -1589,44 +1581,6 @@ func (s *Server) handleVerifyAgents(w http.ResponseWriter, r *http.Request) {
 		"ok":      true,
 		"reports": reports,
 	})
-}
-
-func (s *Server) handleAIConfig(w http.ResponseWriter, r *http.Request) {
-	if s.ai == nil {
-		writeError(w, http.StatusInternalServerError, "AI manager is not initialized")
-		return
-	}
-	switch r.Method {
-	case http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":     true,
-			"status": s.ai.Status(),
-		})
-	case http.MethodPost:
-		var req struct {
-			AutoAnalyze *bool   `json:"auto_analyze"`
-			RunnerID    *string `json:"runner_id"`
-			Confirmed   bool    `json:"confirmed"`
-		}
-		if !decodeJSONBody(w, r, &req, false) {
-			return
-		}
-		if req.AutoAnalyze != nil && *req.AutoAnalyze && !req.Confirmed {
-			writeError(w, http.StatusBadRequest, "开启自动调用本机 Agent AI 前，必须明确确认数据范围与额度消耗")
-			return
-		}
-		st, err := s.ai.SetConfig(req.AutoAnalyze, req.RunnerID)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":     true,
-			"status": st,
-		})
-	default:
-		methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
-	}
 }
 
 func normalizeAgentAction(raw string) string {
@@ -1877,39 +1831,6 @@ func (s *Server) handleToggleAgent(w http.ResponseWriter, r *http.Request) {
 		"ok":      true,
 		"agent":   updated,
 		"results": results,
-	})
-}
-
-func (s *Server) handleAnalyzeAllMistakes(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodNotAllowed(w, http.MethodPost)
-		return
-	}
-	if s.db == nil || s.ai == nil {
-		writeError(w, http.StatusInternalServerError, "store is not available")
-		return
-	}
-	var req struct {
-		Project string `json:"project"`
-	}
-	if !decodeJSONBody(w, r, &req, true) {
-		return
-	}
-	project := strings.TrimSpace(req.Project)
-
-	analyzed, recommended, skipped, err := s.ai.AnalyzePending(r.Context(), project)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	st := s.ai.Status()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":          true,
-		"runner":      st.ActiveRunner,
-		"duration_ms": st.LastDurationMS,
-		"analyzed":    analyzed,
-		"recommended": recommended,
-		"skipped":     skipped,
 	})
 }
 

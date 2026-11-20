@@ -519,9 +519,7 @@
                 </button>
               </div>
               <div class="card-header-actions">
-                <button id="btn-analyze-all" class="btn btn-primary btn-sm" type="button" hidden data-tip="调用本机已登录 Agent 大模型批量评估待处理错题，输出真实 AI 建议与规则草案">AI 分析</button>
-                <button id="btn-scan-sessions" class="btn btn-secondary btn-sm" type="button">嗅探会话</button>
-                <button type="button" class="help-tip" data-tip="纯只读扫描近 14 天本地 Agent 会话与 Git fix 提交，补充潜在错题" aria-label="嗅探说明">?</button>
+                <button id="btn-agent-prompt" class="btn btn-primary btn-sm" type="button" data-tip="生成可直接粘贴到项目会话里的 Agent 提示词：支持审查待分析错题、对话踩坑复盘、Git 历史返工嗅探及提交前体检">Agent 提示词</button>
               </div>
             </div>
 
@@ -534,11 +532,6 @@
                 <select id="mistakes-filter-source" class="compact-select" aria-label="按来源筛选">
                   <option value="">全部来源</option>
                 </select>
-                <label class="inline-switch-chip" data-tip="开启后，每次嗅探会话、立即体检或后台守护抓到新错题时，自动调用本机已登录 Agent 模型进行深度分析">
-                  <input id="ai-auto-switch" type="checkbox">
-                  <span>自动调 AI</span>
-                </label>
-                <select id="ai-runner-select" class="compact-select" aria-label="选择本机 AI 模型引擎" data-tip="指定用于后台与一键分析的本机 Agent CLI"></select>
                 <span id="mistakes-summary" class="muted" style="margin-left:auto; font-size:12px;">0 条</span>
               </div>
 
@@ -562,7 +555,7 @@
           <div id="mistakes-view-wrap" class="stack-list">
             <div id="session-scan-banner" class="banner banner-info" hidden></div>
             <div id="mistakes-list" class="stack-list"></div>
-            <p id="mistakes-empty" class="empty-state card" hidden>当前分类暂无错题 · 点击右上「立即体检」或「嗅探会话」可自动捕获</p>
+            <p id="mistakes-empty" class="empty-state card" hidden>当前分类暂无错题 · 点击右上「立即体检」或「Agent 提示词」即可捕获与复盘</p>
           </div>
 
           <div id="rules-view-wrap" class="card" hidden>
@@ -687,6 +680,40 @@
       </div>
     </div>
   </div>
+
+  <!-- Agent 对话提示词弹窗（类 Chat-Cut 模式） -->
+  <div id="agent-prompt-modal" class="lightbox" hidden role="dialog" aria-modal="true" aria-label="生成 Agent 提示词">
+    <div class="lightbox-backdrop" id="agent-prompt-backdrop"></div>
+    <div class="modal-dialog modal-wide">
+      <div class="lightbox-header">
+        <div class="title-with-tip">
+          <strong>在项目对话中分析</strong>
+          <button type="button" class="help-tip" data-tip="按项目推进阶段选择对应提示词，复制后粘贴到 Antigravity / Claude Code / Cursor / Codex 当前项目对话框发送，分析结果将自动回流至此" aria-label="提示词使用说明">?</button>
+        </div>
+        <div class="prompt-header-right">
+          <div id="agent-prompt-meta" class="prompt-meta-row"></div>
+          <button id="agent-prompt-close" class="icon-btn" type="button" aria-label="关闭">✕</button>
+        </div>
+      </div>
+      <div class="modal-body">
+        <div class="segmented prompt-stage-grid" id="agent-prompt-modes" role="group" aria-label="提示词阶段">
+          <button class="seg-btn active" data-prompt-mode="history" type="button">Git 历史嗅探</button>
+          <button class="seg-btn" data-prompt-mode="session" type="button">对话复盘</button>
+          <button class="seg-btn" data-prompt-mode="review" type="button">审查待分析</button>
+          <button class="seg-btn" data-prompt-mode="verify" type="button">提交前体检</button>
+        </div>
+        <p id="agent-prompt-guide" class="prompt-summary muted" aria-live="polite"></p>
+        <textarea id="agent-prompt-text" class="code-editor prompt-editor" rows="13" spellcheck="false" aria-label="Agent 提示词内容"></textarea>
+        <div class="prompt-footer">
+          <span id="agent-prompt-feedback" class="prompt-footer-note muted">粘贴到 Agent 发送，完成后刷新本页采纳</span>
+          <button id="btn-copy-agent-prompt" class="btn btn-primary" type="button">复制提示词</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 全局轻量提示 Toast -->
+  <div id="app-toast" class="app-toast" role="status" aria-live="polite" hidden></div>
 
   <!-- 全局悬浮提示层（避免被卡片 overflow 裁切） -->
   <div id="global-tooltip" class="floating-tooltip" role="tooltip" hidden></div>

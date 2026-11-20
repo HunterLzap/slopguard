@@ -813,7 +813,7 @@ func TestDashboardSecurityMiddlewareAndTrustBoundary(t *testing.T) {
 		t.Fatalf("bad host = %d, want 403", badHostRec.Code)
 	}
 
-	badOriginReq := httptest.NewRequest(http.MethodPost, "/api/ai/config", strings.NewReader(`{}`))
+	badOriginReq := httptest.NewRequest(http.MethodPost, "/api/mistakes/apply-recommendations", strings.NewReader(`{}`))
 	badOriginReq.Host = "127.0.0.1:7788"
 	badOriginReq.Header.Set("Origin", "https://evil.com")
 	badOriginReq.Header.Set("Content-Type", "application/json")
@@ -879,7 +879,7 @@ func TestDashboardSecurityMiddlewareAndTrustBoundary(t *testing.T) {
 	}
 
 	// Cookie POST without X-Requested-With must be rejected with 403.
-	noCSRFReq := httptest.NewRequest(http.MethodPost, "/api/ai/config", strings.NewReader(`{"auto_analyze":false}`))
+	noCSRFReq := httptest.NewRequest(http.MethodPost, "/api/mistakes/apply-recommendations", strings.NewReader(`{}`))
 	noCSRFReq.Host = "127.0.0.1:7788"
 	noCSRFReq.AddCookie(sessCookie)
 	noCSRFReq.Header.Set("Content-Type", "application/json")
@@ -890,7 +890,7 @@ func TestDashboardSecurityMiddlewareAndTrustBoundary(t *testing.T) {
 	}
 
 	// Cookie POST with X-Requested-With but non-JSON Content-Type rejected with 415.
-	badCTReq := httptest.NewRequest(http.MethodPost, "/api/ai/config", strings.NewReader(`auto_analyze=false`))
+	badCTReq := httptest.NewRequest(http.MethodPost, "/api/mistakes/apply-recommendations", strings.NewReader(`project=foo`))
 	badCTReq.Host = "127.0.0.1:7788"
 	badCTReq.AddCookie(sessCookie)
 	badCTReq.Header.Set("X-Requested-With", "SlopGuard")
@@ -902,7 +902,7 @@ func TestDashboardSecurityMiddlewareAndTrustBoundary(t *testing.T) {
 	}
 
 	// Valid cookie POST with X-Requested-With + application/json succeeds.
-	okCookieReq := httptest.NewRequest(http.MethodPost, "/api/ai/config", strings.NewReader(`{"auto_analyze":false}`))
+	okCookieReq := httptest.NewRequest(http.MethodPost, "/api/mistakes/apply-recommendations", strings.NewReader(`{"project":""}`))
 	okCookieReq.Host = "127.0.0.1:7788"
 	okCookieReq.AddCookie(sessCookie)
 	okCookieReq.Header.Set("X-Requested-With", "SlopGuard")
@@ -915,7 +915,7 @@ func TestDashboardSecurityMiddlewareAndTrustBoundary(t *testing.T) {
 
 	// 5. Oversized request body (> 2 MiB) returns 413 Request Entity Too Large.
 	bigBody := `{"project":"` + strings.Repeat("a", (2<<20)+1024) + `"}`
-	bigReq := httptest.NewRequest(http.MethodPost, "/api/mistakes/analyze-all", strings.NewReader(bigBody))
+	bigReq := httptest.NewRequest(http.MethodPost, "/api/mistakes/apply-recommendations", strings.NewReader(bigBody))
 	bigReq.Host = "127.0.0.1:7788"
 	bigReq.Header.Set(uiTokenHeaderName, s.AuthToken())
 	bigReq.Header.Set("Content-Type", "application/json")

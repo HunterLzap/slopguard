@@ -2338,8 +2338,127 @@ body.macos-frameless .workspace-topbar {
   color: var(--fail);
 }
 
+.prompt-header-right {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.prompt-meta-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.pill-action {
+  appearance: none;
+  -webkit-appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid transparent;
+  font-family: inherit;
+  line-height: inherit;
+  cursor: pointer;
+  transition: filter 0.15s ease, transform 0.1s ease, border-color 0.15s ease;
+}
+
+.pill-action.pass {
+  border-color: rgba(52, 199, 89, 0.32);
+}
+
+.pill-action.warn {
+  border-color: rgba(255, 149, 0, 0.35);
+}
+
+.pill-action:hover {
+  filter: brightness(0.95);
+}
+
+.pill-action:active {
+  transform: scale(0.98);
+}
+
+.pill-action-icon {
+  flex: 0 0 auto;
+  opacity: 0.85;
+}
+
+.prompt-stage-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 3px;
+  width: 100%;
+  padding: 3px;
+}
+
+.prompt-stage-grid .seg-btn {
+  padding: 5px 8px;
+  font-size: 12px;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.prompt-summary {
+  margin: 0;
+  padding: 0 2px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--fg-dim);
+}
+
+.prompt-editor {
+  min-height: 290px;
+  line-height: 1.55;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
+  font-size: 13px;
+}
+
+.prompt-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.prompt-footer-note {
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+
+.app-toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1200;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: var(--fg);
+  color: var(--surface);
+  font-size: 12px;
+  font-weight: 500;
+  box-shadow: var(--shadow-popover);
+  pointer-events: none;
+}
+
+.app-toast[hidden] {
+  display: none;
+}
+
 @media (max-width: 860px) {
   .onboarding-grid {
     grid-template-columns: 1fr;
+  }
+  .prompt-stage-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

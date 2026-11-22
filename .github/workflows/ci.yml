@@ -51,3 +51,59 @@ jobs:
           GOOS: windows
           GOARCH: amd64
         run: go build ./...
+
+  desktop-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: desktop/go.mod
+          cache-dependency-path: desktop/go.sum
+      - name: Vet desktop
+        run: go vet ./...
+      - name: Test desktop
+        run: go test -count=1 ./...
+      - name: Build native macOS application
+        if: runner.os == 'macOS'
+        shell: bash
+        run: bash ./scripts/build-macos.sh
+      - name: Build native Windows application
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/build-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ runner.os }}
+          path: dist/slopguard-*.zip
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [verify, desktop-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*
+          path: release-assets
+          merge-multiple: true
+      - name: Create GitHub Release draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            release-assets/slopguard-macos.zip \
+            release-assets/slopguard-windows.zip \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --draft --generate-notes

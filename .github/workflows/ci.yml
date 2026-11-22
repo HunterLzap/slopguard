@@ -25,9 +25,13 @@ jobs:
         if: runner.os != 'Windows'
         env:
           CGO_ENABLED: '1'
+          # The CLI self-scan also visits the independent desktop module.
+          GOTOOLCHAIN: auto
         run: go test -race -count=1 ./...
       - name: Test on Windows
         if: runner.os == 'Windows'
+        env:
+          GOTOOLCHAIN: auto
         shell: pwsh
         run: |
           if (Get-Command gcc -ErrorAction SilentlyContinue) {

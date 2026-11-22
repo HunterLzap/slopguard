@@ -1,0 +1,7 @@
+/bin/
+/dist/
+/slopguard
+*.exe
+*.test
+.slopguard/*.db
+.slopguard/*.db-*

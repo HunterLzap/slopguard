@@ -1,0 +1,53 @@
+name: Go CI
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Vet
+        run: go vet ./...
+      - name: Race tests on macOS and Linux
+        if: runner.os != 'Windows'
+        env:
+          CGO_ENABLED: '1'
+        run: go test -race -count=1 ./...
+      - name: Test on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (Get-Command gcc -ErrorAction SilentlyContinue) {
+            $env:CGO_ENABLED = '1'
+            go test -race -count=1 ./...
+          } else {
+            Write-Output 'GCC is unavailable. Running the Windows suite without the race detector.'
+            $env:CGO_ENABLED = '0'
+            go test -count=1 ./...
+          }
+          exit $LASTEXITCODE
+      - name: Build macOS arm64
+        env:
+          CGO_ENABLED: '0'
+          GOOS: darwin
+          GOARCH: arm64
+        run: go build ./...
+      - name: Build Windows amd64
+        env:
+          CGO_ENABLED: '0'
+          GOOS: windows
+          GOARCH: amd64
+        run: go build ./...

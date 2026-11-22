@@ -35,15 +35,15 @@ type agentDefinition struct {
 var standardMCPKey = []string{"mcpServers", "slopguard"}
 
 var agentDefinitions = []agentDefinition{
-	{id: "codex", config: ".codex/config.toml", skillDir: ".codex/skills", format: tomlConfig},
-	{id: "claude", config: ".claude.json", skillDir: ".claude/skills", detect: ".claude/settings.json", keys: standardMCPKey},
-	{id: "cursor", config: ".cursor/mcp.json", skillDir: ".cursor/skills", keys: standardMCPKey},
-	{id: "antigravity", config: ".gemini/config/mcp_config.json", skillDir: ".gemini/config/skills", keys: standardMCPKey},
-	{id: "antigravity", config: ".gemini/antigravity/mcp_config.json", skillDir: ".gemini/antigravity/skills", keys: standardMCPKey},
-	{id: "antigravity", config: ".gemini/antigravity-cli/mcp_config.json", skillDir: ".gemini/antigravity-cli/skills", keys: standardMCPKey},
-	{id: "gemini", config: ".gemini/settings.json", skillDir: ".gemini/skills", keys: standardMCPKey},
-	{id: "dsh", config: ".dsh/cordis.patch.yml", detect: ".dsh", skillDir: ".dsh/skills", format: dshConfig},
-	{id: "openclaw", config: ".openclaw/openclaw.json", skillDir: ".openclaw/skills", format: json5Config, keys: []string{"mcp", "servers", "slopguard"}},
+	{id: "codex", config: filepath.Join(".codex", "config.toml"), skillDir: filepath.Join(".codex", "skills"), format: tomlConfig},
+	{id: "claude", config: ".claude.json", skillDir: filepath.Join(".claude", "skills"), detect: filepath.Join(".claude", "settings.json"), keys: standardMCPKey},
+	{id: "cursor", config: filepath.Join(".cursor", "mcp.json"), skillDir: filepath.Join(".cursor", "skills"), keys: standardMCPKey},
+	{id: "antigravity", config: filepath.Join(".gemini", "config", "mcp_config.json"), skillDir: filepath.Join(".gemini", "config", "skills"), keys: standardMCPKey},
+	{id: "antigravity", config: filepath.Join(".gemini", "antigravity", "mcp_config.json"), skillDir: filepath.Join(".gemini", "antigravity", "skills"), keys: standardMCPKey},
+	{id: "antigravity", config: filepath.Join(".gemini", "antigravity-cli", "mcp_config.json"), skillDir: filepath.Join(".gemini", "antigravity-cli", "skills"), keys: standardMCPKey},
+	{id: "gemini", config: filepath.Join(".gemini", "settings.json"), skillDir: filepath.Join(".gemini", "skills"), keys: standardMCPKey},
+	{id: "dsh", config: filepath.Join(".dsh", "cordis.patch.yml"), detect: ".dsh", skillDir: filepath.Join(".dsh", "skills"), format: dshConfig},
+	{id: "openclaw", config: filepath.Join(".openclaw", "openclaw.json"), skillDir: filepath.Join(".openclaw", "skills"), format: json5Config, keys: []string{"mcp", "servers", "slopguard"}},
 }
 
 type AgentSwitch struct {
@@ -107,7 +107,7 @@ func (a AgentSwitch) detect(only string) ([]detectedAgent, error) {
 		if (only != "" && only != def.id) || seen[def.id] {
 			continue
 		}
-		path := filepath.Join(home, filepath.FromSlash(def.config))
+		path := filepath.Join(home, def.config)
 		f, err := readFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", def.id, err)
@@ -116,13 +116,13 @@ func (a AgentSwitch) detect(only string) ([]detectedAgent, error) {
 			if def.detect == "" {
 				continue
 			}
-			if _, err := os.Stat(filepath.Join(home, filepath.FromSlash(def.detect))); errors.Is(err, fs.ErrNotExist) {
+			if _, err := os.Stat(filepath.Join(home, def.detect)); errors.Is(err, fs.ErrNotExist) {
 				continue
 			} else if err != nil {
 				return nil, err
 			}
 		}
-		skill := filepath.Join(home, filepath.FromSlash(def.skillDir), "slopguard", "SKILL.md")
+		skill := filepath.Join(home, def.skillDir, "slopguard", "SKILL.md")
 		enabled, err := def.enabled(f.data)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", def.id, err)

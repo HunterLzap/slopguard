@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/HunterLzap/slopguard/internal/contract"
@@ -101,12 +102,6 @@ func (s Semgrep) scan(ctx context.Context, bin, root string, configs, files []st
 		if err := json.Unmarshal([]byte(r.Stdout), &output); err != nil {
 			return report, fmt.Errorf("Semgrep JSON: %w (%s)", err, processMessage(r))
 		}
-		if len(output.Errors) > 0 {
-			return report, fmt.Errorf("Semgrep scan: %s", output.Errors[0])
-		}
-		if r.ExitCode != 0 {
-			return report, fmt.Errorf("Semgrep scan: %s", processMessage(r))
-		}
 		for _, path := range output.Paths.Scanned {
 			if rel, ok := relativeFile(root, filepath.FromSlash(path)); ok && !seen[rel] {
 				seen[rel] = true
@@ -125,12 +120,22 @@ func (s Semgrep) scan(ctx context.Context, bin, root string, configs, files []st
 				Message: finding.Extra.Message, CodeSnippet: snippet(root, rel, finding.Start.Line),
 			})
 		}
+		if len(output.Errors) > 0 {
+			return report, fmt.Errorf("Semgrep scan: %s", output.Errors[0])
+		}
+		if r.ExitCode != 0 {
+			return report, fmt.Errorf("Semgrep scan: %s", processMessage(r))
+		}
 	}
 	return report, nil
 }
 
 func fileBatches(root string, files []string) [][]string {
-	const argumentBudget = 14000
+	argumentBudget := 14000
+	if runtime.GOOS == "windows" {
+		// npm and other Windows shims can use cmd.exe's shorter command line.
+		argumentBudget = 6500
+	}
 	var batches [][]string
 	var batch []string
 	size := 0

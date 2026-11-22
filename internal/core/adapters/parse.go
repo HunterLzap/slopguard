@@ -3,6 +3,7 @@ package adapters
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -17,7 +18,7 @@ var (
 	location     = regexp.MustCompile(`^(.+?):([0-9]+)(?::([0-9]+))?:\s*(.+)$`)
 	typeScript   = regexp.MustCompile(`^(?:(.+)\(([0-9]+),([0-9]+)\): )?error (TS[0-9]+): (.+)$`)
 	maven        = regexp.MustCompile(`^(.+?):\[([0-9]+),([0-9]+)\]\s*(.+)$`)
-	gradleKotlin = regexp.MustCompile(`^[ew]: (?:file:/+)?(.+?):([0-9]+):([0-9]+)\s*(.+)$`)
+	gradleKotlin = regexp.MustCompile(`^[ew]: (.+?):([0-9]+):([0-9]+)\s*(.+)$`)
 	messageRule  = regexp.MustCompile(`^(.*?)\s*\[([\w./,:-]+)\]$`)
 	ktlintRule   = regexp.MustCompile(`^(.*?)\s*\(([\w.-]+:[\w.-]+)\)$`)
 	flutterLine  = regexp.MustCompile(`^\s*(error|warning|info)\s*[•-]\s*(.*?)\s*[•-]\s*(.*?)\s*[•-]\s*(\S+)\s*$`)
@@ -49,6 +50,12 @@ func parseNative(stdout, stderr string) ([]contract.Diagnostic, error) {
 		case gradleKotlin.MatchString(line):
 			parts := gradleKotlin.FindStringSubmatch(line)
 			file, row, col, msg = parts[1], parts[2], parts[3], parts[4]
+			if uri, err := url.Parse(file); err == nil && uri.Scheme == "file" {
+				file = filepath.FromSlash(uri.Path)
+				if len(file) >= 3 && file[2] == ':' && filepath.Separator == '\\' {
+					file = file[1:]
+				}
+			}
 			if strings.HasPrefix(line, "w:") {
 				severity = "warning"
 			}

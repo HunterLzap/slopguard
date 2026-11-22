@@ -41,6 +41,11 @@ func (r *Reviewer) ApproveProposal(ctx context.Context, project, id string) (out
 			if err != nil {
 				return err
 			}
+			if _, exists, err := fileMode(path + ".disabled"); err != nil {
+				return err
+			} else if exists {
+				return fmt.Errorf("disabled rule %q already exists", p.RuleID)
+			}
 			if err := core.WriteFileAtomic(path, []byte(p.SemgrepYAML), 0600, true, nil); err != nil {
 				return err
 			}

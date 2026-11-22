@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>SlopGuard</title>
+  <link rel="icon" type="image/png" href="/slopguard.png">
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header id="topbar" class="topbar">
+    <div class="brand">
+      <img src="/slopguard.png" width="27" height="27" alt="">
+      <h1>SlopGuard</h1>
+    </div>
+    <div class="top-actions">
+      <span id="guard-state" class="guard-state" role="status"><i class="dot" aria-hidden="true"></i><span>正在读取</span></span>
+      <button id="open-settings" class="icon-button gear" type="button" aria-label="设置" title="设置" aria-haspopup="dialog" aria-controls="settings-drawer">⚙</button>
+    </div>
+  </header>
+
+  <main id="scroller">
+    <div id="sections" class="sections">
+      <section id="proposal-section" hidden aria-labelledby="proposal-heading">
+        <h2 id="proposal-heading">待审批</h2>
+        <div id="proposals" class="item-stack"></div>
+      </section>
+
+      <section aria-labelledby="agent-heading">
+        <div class="section-heading">
+          <h2 id="agent-heading">本机 Agent</h2>
+          <button id="copy-mcp" class="button plain" type="button" aria-haspopup="dialog" aria-controls="mcp-copy">复制 MCP</button>
+        </div>
+        <div id="agents" class="agent-list"></div>
+      </section>
+
+      <section aria-labelledby="project-heading">
+        <div class="section-heading">
+          <h2 id="project-heading">受保护项目</h2>
+          <button id="add-project" class="button add" type="button">＋ 添加项目</button>
+        </div>
+        <div id="projects" class="item-stack"></div>
+      </section>
+    </div>
+  </main>
+
+  <output id="toast" class="toast" role="status" aria-live="polite" hidden></output>
+
+  <dialog id="mcp-copy" class="copy-popover" aria-labelledby="copy-heading">
+    <h2 id="copy-heading">复制 MCP 配置</h2>
+    <div class="copy-options">
+      <button type="button" class="button" id="copy-json">复制 JSON</button>
+      <button type="button" class="button" id="copy-toml">复制 TOML</button>
+    </div>
+  </dialog>
+
+  <dialog id="settings-drawer" class="drawer" aria-labelledby="settings-heading">
+    <div class="drawer-heading">
+      <h2 id="settings-heading">设置</h2>
+      <button id="close-settings" class="icon-button" type="button" aria-label="关闭设置" title="关闭设置">×</button>
+    </div>
+    <form id="settings-form" autocomplete="off">
+      <label class="field" for="base-url">API Base URL
+        <input id="base-url" name="base-url" type="url" placeholder="https://api.deepseek.com/v1" required spellcheck="false">
+      </label>
+      <label class="field" for="api-key">API Key</label>
+      <div class="password-field">
+        <input id="api-key" name="api-key" type="password" autocomplete="off" spellcheck="false">
+        <button id="show-key" class="button plain" type="button" aria-controls="api-key" aria-pressed="false">显示</button>
+      </div>
+      <label class="field" for="model">Model
+        <input id="model" name="model" placeholder="deepseek-chat" required spellcheck="false">
+      </label>
+      <div class="setting-row">
+        <span id="autostart-label">开机自启</span>
+        <button id="autostart" class="switch" role="switch" type="button" aria-checked="false" aria-labelledby="autostart-label"></button>
+      </div>
+      <p id="settings-message" class="field-message" role="status" hidden></p>
+      <div class="settings-actions">
+        <button id="test-connection" class="button" type="button">测试连通性</button>
+        <button id="save-settings" class="button primary" type="submit">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="confirm-rule" class="confirm" aria-labelledby="confirm-heading">
+    <form method="dialog">
+      <h2 id="confirm-heading">删除规则？</h2>
+      <p id="confirm-name"></p>
+      <div class="confirm-actions">
+        <button class="button" value="cancel" autofocus>取消</button>
+        <button class="button danger" value="delete">删除</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

@@ -1,3 +1,5 @@
+//go:build windows || darwin
+
 package main
 
 import (
@@ -6,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -76,11 +77,15 @@ func run() (err error) {
 	if err != nil {
 		return err
 	}
+	assets, err := panelAssets()
+	if err != nil {
+		return err
+	}
 	app := application.New(application.Options{
 		Name:     "SlopGuard",
 		Icon:     appIcon,
 		Services: []application.Service{application.NewService(service)},
-		Assets:   application.AssetOptions{Handler: panelAssets()},
+		Assets:   application.AssetOptions{Handler: assets},
 		Mac:      application.MacOptions{ActivationPolicy: application.ActivationPolicyAccessory},
 		Windows: application.WindowsOptions{
 			DisableQuitOnLastWindowClosed: true, WebviewUserDataPath: filepath.Join(configDir, "webview"),
@@ -102,6 +107,16 @@ func run() (err error) {
 	tray := app.SystemTray.New()
 	tray.SetIcon(trayIcon).SetDarkModeIcon(trayIcon).AttachWindow(window).WindowOffset(trayOffset)
 	tray.SetTooltip("SlopGuard")
+	window.OnWindowEvent(events.Common.WindowShow, func(_ *application.WindowEvent) {
+		app.Event.Emit(dashboardChanged)
+	})
+	window.OnWindowEvent(events.Common.WindowDidResize, func(_ *application.WindowEvent) {
+		if window.IsVisible() {
+			if err := tray.PositionWindow(window, trayOffset); err != nil {
+				slog.Error("面板定位失败", "error", err)
+			}
+		}
+	})
 	menu := app.Menu.New()
 	menu.Add("打开面板").OnClick(func(_ *application.Context) { tray.ShowWindow() })
 	menu.Add("退出").OnClick(func(_ *application.Context) { app.Quit() })
@@ -135,13 +150,4 @@ func (p *nativePicker) PickDirectory(ctx context.Context) (string, error) {
 	defer p.open.Store(false)
 	return p.app.Dialog.OpenFile().SetTitle("选择受保护项目").
 		CanChooseFiles(false).CanChooseDirectories(true).AttachToWindow(p.window).PromptForSingleSelection()
-}
-
-func panelAssets() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if _, err := fmt.Fprint(w, "<!doctype html><meta charset=utf-8><title>SlopGuard</title><main>SlopGuard</main>"); err != nil {
-			slog.Error("读取面板失败", "error", err)
-		}
-	})
 }

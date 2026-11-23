@@ -16,6 +16,7 @@ import (
 	"github.com/HunterLzap/slopguard/internal/engine"
 	"github.com/HunterLzap/slopguard/internal/mcp"
 	"github.com/HunterLzap/slopguard/internal/store"
+	"github.com/HunterLzap/slopguard/internal/verify"
 )
 
 var openMCPStore = store.OpenDefault
@@ -354,30 +355,45 @@ type mcpVerifyResponse struct {
 	NextAction        string              `json:"next_action,omitempty"`
 }
 
+type mcpVerifyRecorder struct{}
+
+func (mcpVerifyRecorder) RecordScan(ctx context.Context, projectPath string, durationMs int64, escapes int, passed bool) error {
+	db, err := openMCPStore()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	recordCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	return db.RecordScan(recordCtx, projectPath, durationMs, escapes, passed)
+}
+
+func (mcpVerifyRecorder) RecordMistake(ctx context.Context, m contract.Mistake) (int, error) {
+	db, err := openMCPStore()
+	if err != nil {
+		return 0, err
+	}
+	defer db.Close()
+	recordCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	return db.RecordMistake(recordCtx, m)
+}
+
 func verifyForMCP(ctx context.Context, root string, all bool, paths []string, ui bool) (mcpVerifyResponse, error) {
 	scopeRoot, err := resolveMCPEnforcedRoot(root)
 	if err != nil {
 		return mcpVerifyResponse{}, err
 	}
-	var stdout, stderr bytes.Buffer
-	code := runVerifyWith(verifyOptions{
-		root:        scopeRoot,
-		all:         all,
-		json:        true,
-		autoCapture: true,
-		ui:          ui,
-		paths:       paths,
-	}, &stdout, &stderr)
-	if code == ExitError {
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = "verify failed"
-		}
-		return mcpVerifyResponse{}, errors.New(msg)
-	}
-	var result contract.VerifyResult
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
-		return mcpVerifyResponse{}, fmt.Errorf("decode verify result: %w (output=%q)", err, strings.TrimSpace(stdout.String()))
+	result, err := verify.Run(ctx, verify.Options{
+		ProjectRoot: scopeRoot,
+		All:         all,
+		Paths:       paths,
+		UI:          ui,
+		AutoCapture: true,
+		Recorder:    mcpVerifyRecorder{},
+	})
+	if err != nil {
+		return mcpVerifyResponse{}, err
 	}
 
 	out := mcpVerifyResponse{VerifyResult: result}

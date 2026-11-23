@@ -5,12 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/HunterLzap/slopguard/internal/contract"
+	"github.com/HunterLzap/slopguard/internal/ui"
 )
 
 func verifyAdapter() *stubAdapter {
@@ -123,10 +127,29 @@ func TestVerifyMissingBaseline(t *testing.T) {
 	}
 	withDeps(t, eng, &fakeAdapters{detected: []contract.Adapter{adp}})
 
+	// Default mode: missing baseline uses empty baseline and logs a non-blocking warning.
 	var stdout, stderr bytes.Buffer
-	code := runVerifyWith(verifyOptions{root: root, all: true}, &stdout, &stderr)
+	code := runVerifyWith(verifyOptions{root: root, all: true, json: true}, &stdout, &stderr)
+	if code != ExitOK {
+		t.Fatalf("default missing baseline code = %d, want %d; stderr = %s", code, ExitOK, stderr.String())
+	}
+	var res contract.VerifyResult
+	if err := json.Unmarshal(stdout.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Warnings) == 0 || !strings.Contains(res.Warnings[0], "baseline.json not found") {
+		t.Fatalf("warnings = %+v, want non-blocking baseline warning", res.Warnings)
+	}
+	if !strings.Contains(stderr.String(), "baseline.json not found") {
+		t.Fatalf("stderr = %q, want warning", stderr.String())
+	}
+
+	// StrictBaseline: true fails with ExitError.
+	stdout.Reset()
+	stderr.Reset()
+	code = runVerifyWith(verifyOptions{root: root, all: true, strictBaseline: true}, &stdout, &stderr)
 	if code != ExitError {
-		t.Fatalf("code = %d, want %d", code, ExitError)
+		t.Fatalf("strictBaseline code = %d, want %d", code, ExitError)
 	}
 	if !strings.Contains(stderr.String(), "run slopguard init first") {
 		t.Fatalf("stderr = %q", stderr.String())
@@ -531,5 +554,118 @@ func TestVerifyLastCommitAndCustomSource(t *testing.T) {
 	}
 	if len(rec.mistakes) != 1 || rec.mistakes[0].Source != "git_hook" {
 		t.Fatalf("mistakes = %+v, want source=git_hook", rec.mistakes)
+	}
+}
+
+func TestCLIVerifyAndUIVerifyProduceConsistentResults(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "package.json"), `{"name":"demo"}`)
+	writeFile(t, filepath.Join(root, "src", "a.ts"), "// @ts-ignore\nexport const x: any = 1;\n")
+	writeFile(t, filepath.Join(root, "node_modules", ".bin", "eslint"), "#!/bin/sh\necho '[]'\nexit 0\n")
+	writeFile(t, filepath.Join(root, "node_modules", ".bin", "tsc"), "#!/bin/sh\nexit 0\n")
+	if err := os.Chmod(filepath.Join(root, "node_modules", ".bin", "eslint"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(root, "node_modules", ".bin", "tsc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run via CLI path (defaultDependencies -> verify.Run, missing baseline.json).
+	var stdout, stderr bytes.Buffer
+	code := runVerifyWith(verifyOptions{root: root, all: true, json: true}, &stdout, &stderr)
+	if code != ExitFindings {
+		t.Fatalf("cli verify exit = %d, want 1; stderr = %s", code, stderr.String())
+	}
+	var cliResult contract.VerifyResult
+	if err := json.Unmarshal(stdout.Bytes(), &cliResult); err != nil {
+		t.Fatalf("decode cli result: %v", err)
+	}
+
+	// Run via UI HTTP handler path (POST /api/verify -> verify.Run).
+	srv := ui.NewServer(nil, nil)
+	srv.SetAuthToken("consistency-token")
+	reqBody, _ := json.Marshal(map[string]any{"project": root, "all": true})
+	req := httptest.NewRequest(http.MethodPost, "/api/verify", bytes.NewReader(reqBody))
+	req.Host = "127.0.0.1"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-SlopGuard-Token", "consistency-token")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ui /api/verify status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var uiResult contract.VerifyResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &uiResult); err != nil {
+		t.Fatalf("decode ui result: %v", err)
+	}
+
+	if cliResult.Passed != uiResult.Passed {
+		t.Fatalf("Passed mismatch: cli=%v ui=%v", cliResult.Passed, uiResult.Passed)
+	}
+	if !reflect.DeepEqual(cliResult.Findings, uiResult.Findings) {
+		t.Fatalf("Findings mismatch:\ncli=%+v\nui=%+v", cliResult.Findings, uiResult.Findings)
+	}
+	if !reflect.DeepEqual(cliResult.Escapes, uiResult.Escapes) {
+		t.Fatalf("Escapes mismatch:\ncli=%+v\nui=%+v", cliResult.Escapes, uiResult.Escapes)
+	}
+	if !reflect.DeepEqual(cliResult.Warnings, uiResult.Warnings) {
+		t.Fatalf("Warnings mismatch:\ncli=%+v\nui=%+v", cliResult.Warnings, uiResult.Warnings)
+	}
+}
+
+func TestCLIVerifyDegradesWithoutExternalLinters(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "pyproject.toml"), "[project]\nname='demo'\n")
+	writeFile(t, filepath.Join(root, "app.py"), "x = 1\n")
+	writeFile(t, filepath.Join(root, ".slopguard", "baseline.json"), `{"version":1,"metrics":{}}`)
+
+	// Isolate PATH to an empty directory so no external linters are found on host.
+	emptyBin := t.TempDir()
+	t.Setenv("PATH", emptyBin)
+
+	var stdout, stderr bytes.Buffer
+	code := runVerify([]string{"--all", "--json", "--root", root}, &stdout, &stderr)
+	if code != ExitOK {
+		t.Fatalf("zero-linter verify exit = %d, want 0; stderr = %s", code, stderr.String())
+	}
+	var res contract.VerifyResult
+	if err := json.Unmarshal(stdout.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	if len(res.SkippedDetails) < 2 {
+		t.Fatalf("expected skipped details for ruff/pyright, got %+v", res.SkippedDetails)
+	}
+
+	// Only ruff present (pyright missing) -> still succeeds, records pyright skipped.
+	writeFile(t, filepath.Join(root, ".venv", "bin", "ruff"), "#!/bin/sh\necho '[]'\nexit 0\n")
+	if err := os.Chmod(filepath.Join(root, ".venv", "bin", "ruff"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = runVerify([]string{"--all", "--json", "--root", root}, &stdout, &stderr)
+	if code != ExitOK {
+		t.Fatalf("only-ruff verify exit = %d, want 0; stderr = %s", code, stderr.String())
+	}
+	res = contract.VerifyResult{}
+	if err := json.Unmarshal(stdout.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	foundPyrightSkipped := false
+	for _, sk := range res.SkippedDetails {
+		if sk.ID == "pyright" && strings.Contains(sk.Reason, "pyright (not found)") {
+			foundPyrightSkipped = true
+		}
+	}
+	if !foundPyrightSkipped {
+		t.Fatalf("expected pyright (not found) in skipped_details, got %+v", res.SkippedDetails)
+	}
+
+	// --strict-tools fails with ExitError (2) when pyright is missing.
+	stdout.Reset()
+	stderr.Reset()
+	code = runVerify([]string{"--all", "--strict-tools", "--root", root}, &stdout, &stderr)
+	if code != ExitError {
+		t.Fatalf("--strict-tools verify exit = %d, want 2; stderr = %s", code, stderr.String())
 	}
 }

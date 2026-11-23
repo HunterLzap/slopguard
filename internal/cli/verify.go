@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,35 +11,43 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/HunterLzap/slopguard/internal/contract"
+	"github.com/HunterLzap/slopguard/internal/verify"
 )
 
 type verifyOptions struct {
-	root          string
-	all           bool
-	lastCommit    bool
-	commitSHA     string
-	json          bool
-	jobs          int
-	record        bool
-	autoCapture   bool
-	captureSource string
-	ui            bool
-	paths         []string
+	root           string
+	all            bool
+	staged         bool
+	lastCommit     bool
+	commitSHA      string
+	json           bool
+	jobs           int
+	record         bool
+	autoCapture    bool
+	captureSource  string
+	strictBaseline bool
+	strictTools    bool
+	ablation       bool
+	ui             bool
+	paths          []string
 }
 
 func runVerify(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	all := fs.Bool("all", false, "scan all project files instead of only git-changed files")
+	staged := fs.Bool("staged", false, "scan only git staged changes (used by pre-commit hook)")
 	lastCommit := fs.Bool("last-commit", false, "scan files touched by HEAD commit (used by post-commit hook)")
 	commitSHA := fs.String("commit", "", "scan files touched by a specific commit SHA (used by post-commit hook)")
 	jsonOut := fs.Bool("json", false, "emit a structured contract.VerifyResult as JSON")
 	jobs := fs.Int("jobs", 0, "maximum concurrent checks (default: config value or 2)")
 	record := fs.Bool("record", false, "record a scan_runs row after verify (pass or fail)")
 	source := fs.String("source", "auto_verify", "mistake source label when auto-capturing failures")
+	strictBaseline := fs.Bool("strict-baseline", false, "fail if .slopguard/baseline.json is missing")
+	strictTools := fs.Bool("strict-tools", false, "fail if required external tools are missing")
+	ablation := fs.Bool("ablation", false, "run isolated RED->GREEN test ablation in a temporary git worktree")
 	ui := fs.Bool("ui", false, "run Playwright UI smoke checks after the regular checks pass")
 	rootFlag := fs.String("root", ".", "project root directory")
 	help, err := parseFlags(fs, args)
@@ -54,6 +61,18 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 	if *jobs < 0 {
 		return commandError(stderr, "--jobs must be >= 1")
 	}
+	scopeCount := 0
+	for _, set := range []bool{*all, *staged, *lastCommit, strings.TrimSpace(*commitSHA) != ""} {
+		if set {
+			scopeCount++
+		}
+	}
+	if scopeCount > 1 {
+		return commandError(stderr, "--all, --staged, --last-commit, and --commit are mutually exclusive")
+	}
+	if *ablation && (*all || *lastCommit || strings.TrimSpace(*commitSHA) != "") {
+		return commandError(stderr, "--ablation cannot be combined with --all, --last-commit, or --commit")
+	}
 	root, err := filepath.Abs(*rootFlag)
 	if err != nil {
 		return commandError(stderr, "resolve project root: %v", err)
@@ -66,255 +85,61 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 	}
 
 	return runVerifyWith(verifyOptions{
-		root:          root,
-		all:           *all,
-		lastCommit:    *lastCommit,
-		commitSHA:     strings.TrimSpace(*commitSHA),
-		json:          *jsonOut,
-		jobs:          *jobs,
-		record:        *record,
-		captureSource: *source,
-		ui:            *ui,
+		root:           root,
+		all:            *all,
+		staged:         *staged,
+		lastCommit:     *lastCommit,
+		commitSHA:      strings.TrimSpace(*commitSHA),
+		json:           *jsonOut,
+		jobs:           *jobs,
+		record:         *record,
+		captureSource:  *source,
+		strictBaseline: *strictBaseline,
+		strictTools:    *strictTools,
+		ablation:       *ablation,
+		ui:             *ui,
 	}, stdout, stderr)
 }
 
 func runVerifyWith(opts verifyOptions, stdout, stderr io.Writer) int {
-	started := time.Now()
-
 	deps, err := newDependencies()
 	if err != nil {
 		return commandError(stderr, "prepare engine: %v", err)
 	}
-	ctx, stop := newCommandContext(deps.engine)
-	defer stop()
 
-	jobs := opts.jobs
-	cfg, cfgErr := loadConfig(opts.root)
-	if cfgErr != nil && !errors.Is(cfgErr, os.ErrNotExist) {
-		return commandError(stderr, "%v", cfgErr)
+	var rec verify.Recorder
+	if deps.recorder != nil {
+		rec = cliVerifyRecorder{recorder: deps.recorder}
 	}
-	if jobs <= 0 {
-		jobs = cfg.Verify.Jobs
-	}
-	if jobs <= 0 {
-		jobs = 2
-	}
-	if jobs < 1 {
-		return commandError(stderr, "--jobs must be >= 1")
+	var hooks *verify.Hooks
+	if !deps.isProduction {
+		hooks = buildVerifyHooks(deps)
 	}
 
-	detected, err := deps.adapters.Detect(opts.root)
+	result, err := verify.Run(context.Background(), verify.Options{
+		ProjectRoot:    opts.root,
+		All:            opts.all,
+		Staged:         opts.staged,
+		LastCommit:     opts.lastCommit,
+		CommitSHA:      opts.commitSHA,
+		Paths:          opts.paths,
+		Jobs:           opts.jobs,
+		StrictBaseline: opts.strictBaseline,
+		StrictTools:    opts.strictTools,
+		Ablation:       opts.ablation,
+		UI:             opts.ui,
+		Record:         opts.record,
+		AutoCapture:    opts.autoCapture,
+		CaptureSource:  opts.captureSource,
+		Runner:         deps.runner,
+		Recorder:       rec,
+		Hooks:          hooks,
+	})
 	if err != nil {
-		return commandError(stderr, "detect adapters: %v", err)
+		return commandError(stderr, "%v", err)
 	}
-	adapters := filterAdaptersByName(detected, cfg.Adapters)
-	if len(adapters) == 0 {
-		if len(cfg.Adapters) > 0 {
-			return commandError(stderr, "none of the configured adapters %v apply to this project; run slopguard init", cfg.Adapters)
-		}
-		result := emptyResult(started)
-		if opts.ui {
-			uiResult, uiErr := runUISmokeForVerify(ctx, deps, opts.root)
-			if uiErr != nil {
-				return commandError(stderr, "run ui smoke: %v", uiErr)
-			}
-			result.UI = &uiResult
-			if !uiResult.Skipped && !uiResult.Passed {
-				result.Passed = false
-			}
-			result.DurationMs = time.Since(started).Milliseconds()
-		}
-		if opts.record && deps.recorder != nil {
-			if err := deps.recorder.RecordScan(ctx, opts.root, result.DurationMs, 0, result.Passed); err != nil {
-				fmt.Fprintf(stderr, "slopguard: warning: record scan failed: %v\n", err)
-			}
-		}
-		writeResult(stdout, opts.json, result)
-		if result.Passed {
-			return ExitOK
-		}
-		return ExitFindings
-	}
-
-	patterns := collectEscapePatterns(adapters)
-	baseline, err := loadBaselineForVerify(deps.engine, baselinePath(opts.root))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			if len(patterns) > 0 {
-				return commandError(stderr, "%s not found; run slopguard init first", baselineRelPath)
-			}
-			baseline = baselineState{Metrics: map[string]int{}}
-		} else {
-			return commandError(stderr, "load baseline: %v", err)
-		}
-	}
-
-	extensions := collectExtensions(adapters)
-	var files []string
-	switch {
-	case len(opts.paths) > 0:
-		files = filterFilesByExtensions(resolveScopePaths(opts.root, opts.paths), extensions)
-	case opts.all:
-		files, err = deps.engine.ListFiles(opts.root, extensions)
-	case strings.TrimSpace(opts.commitSHA) != "":
-		if cfp, ok := deps.engine.(commitFilesProvider); ok {
-			files, err = cfp.CommitFiles(ctx, opts.root, opts.commitSHA)
-		} else if lcp, ok := deps.engine.(lastCommitProvider); ok {
-			files, err = lcp.LastCommitFiles(ctx, opts.root)
-		} else {
-			files, err = deps.engine.ChangedFiles(ctx, opts.root)
-		}
-		if err == nil {
-			files = filterFilesByExtensions(files, extensions)
-		}
-	case opts.lastCommit:
-		if lcp, ok := deps.engine.(lastCommitProvider); ok {
-			files, err = lcp.LastCommitFiles(ctx, opts.root)
-		} else {
-			files, err = deps.engine.ChangedFiles(ctx, opts.root)
-		}
-		if err == nil {
-			files = filterFilesByExtensions(files, extensions)
-		}
-	default:
-		files, err = deps.engine.ChangedFiles(ctx, opts.root)
-		if err == nil {
-			files = filterFilesByExtensions(files, extensions)
-		}
-	}
-	if err != nil {
-		return commandError(stderr, "resolve scan scope: %v", err)
-	}
-	files, suppressedFromChecks := filterSuppressedFiles(files, baseline)
-
-	var tasks []checkTask
-	skippedIDs := make([]string, 0)
-	skippedDetails := make([]contract.SkippedDetail, 0)
-	for _, adapter := range adapters {
-		subset := filterFilesByExtensions(files, adapter.Extensions())
-		if len(subset) == 0 {
-			continue
-		}
-		plan, err := deps.adapters.PlanChecks(opts.root, adapter.Checks(opts.root, subset))
-		if err != nil {
-			return commandError(stderr, "check toolchain: %v", err)
-		}
-		for _, skipped := range plan.Skipped {
-			skippedIDs = append(skippedIDs, skipped)
-		}
-		if len(plan.SkippedDetails) > 0 {
-			skippedDetails = append(skippedDetails, plan.SkippedDetails...)
-		} else {
-			for _, skipped := range plan.Skipped {
-				skippedDetails = append(skippedDetails, contract.SkippedDetail{ID: skipped})
-			}
-		}
-		for _, check := range plan.Runnable {
-			if len(check.Cmd) == 0 {
-				continue
-			}
-			tasks = append(tasks, checkTask{AdapterName: adapter.Name(), Check: check})
-		}
-	}
-
-	var outcomes []checkOutcome
-	if len(tasks) > 0 {
-		outcomes, err = deps.engine.RunChecks(ctx, opts.root, jobs, tasks)
-		if err != nil {
-			return commandError(stderr, "run checks: %v", err)
-		}
-	}
-
-	findings := make([]contract.Finding, 0)
-	for _, outcome := range outcomes {
-		result := outcome.Result
-		if result.Err != nil {
-			return commandError(stderr, "check %s: %v", outcome.Task.Check.ID, result.Err)
-		}
-		if result.Skipped {
-			detail := contract.SkippedDetail{
-				ID:     outcome.Task.Check.ID,
-				Reason: "tool missing at execution time",
-			}
-			if len(outcome.Task.Check.Cmd) > 0 {
-				detail.Tool = outcome.Task.Check.Cmd[0]
-			}
-			skippedIDs = append(skippedIDs, detail.ID)
-			skippedDetails = append(skippedDetails, detail)
-			continue
-		}
-		if result.ExitCode == 0 {
-			continue
-		}
-
-		var parsed []contract.Finding
-		if adapter := findAdapter(adapters, outcome.Task.AdapterName); adapter != nil {
-			parsed = deps.adapters.ParseFindings(adapter, outcome.Task.Check.ID, result)
-		}
-		if len(parsed) == 0 {
-			message := firstNonEmptyLine(result.Stderr, result.Stdout)
-			if message == "" {
-				message = fmt.Sprintf("check failed with exit code %d", result.ExitCode)
-			}
-			parsed = []contract.Finding{{
-				Rule:     outcome.Task.Check.ID,
-				Message:  message,
-				Severity: contract.SeverityError,
-			}}
-		}
-		findings = append(findings, parsed...)
-	}
-
-	escapes := map[string]int{}
-	escapeFiles := files
-	if !opts.all && (len(patterns) > 0 || baseline.HasSuppressions) {
-		// The ratchet compares project-wide escape totals with the baseline, so
-		// incremental mode still needs a full file list for counting. Only the
-		// external lint/type checks are limited to changed files.
-		escapeFiles, err = deps.engine.ListFiles(opts.root, extensions)
-		if err != nil {
-			return commandError(stderr, "list files for escape counting: %v", err)
-		}
-	}
-	escapeFiles, suppressedFromEscapes := filterSuppressedFiles(escapeFiles, baseline)
-	if len(patterns) > 0 && len(escapeFiles) > 0 {
-		escapes, err = deps.engine.ComputeEscapes(opts.root, escapeFiles, patterns)
-		if err != nil {
-			return commandError(stderr, "count escape hatches: %v", err)
-		}
-	}
-	if len(patterns) > 0 {
-		findings = append(findings, deps.engine.Ratchet(escapes, baseline.Metrics)...)
-	}
-
-	result := contract.VerifyResult{
-		Passed:         len(findings) == 0,
-		Findings:       findings,
-		Escapes:        escapes,
-		Baseline:       baseline.Metrics,
-		Suppressed:     countUniqueFiles(suppressedFromChecks, suppressedFromEscapes),
-		DurationMs:     time.Since(started).Milliseconds(),
-		Skipped:        skippedIDs,
-		SkippedDetails: skippedDetails,
-	}
-	if opts.ui && result.Passed {
-		uiResult, uiErr := runUISmokeForVerify(ctx, deps, opts.root)
-		if uiErr != nil {
-			return commandError(stderr, "run ui smoke: %v", uiErr)
-		}
-		result.UI = &uiResult
-		if !uiResult.Skipped && !uiResult.Passed {
-			result.Passed = false
-		}
-		result.DurationMs = time.Since(started).Milliseconds()
-	}
-	if opts.record && deps.recorder != nil {
-		if err := deps.recorder.RecordScan(ctx, opts.root, result.DurationMs, sumEscapes(result.Escapes), result.Passed); err != nil {
-			fmt.Fprintf(stderr, "slopguard: warning: record scan failed: %v\n", err)
-		}
-	}
-	if (opts.record || opts.autoCapture) && !result.Passed && len(result.Findings) > 0 {
-		autoCaptureVerifyMistakes(ctx, deps.recorder, opts.root, result.Findings, opts.captureSource, stderr)
+	for _, w := range result.Warnings {
+		fmt.Fprintf(stderr, "slopguard: warning: %s\n", w)
 	}
 	writeResult(stdout, opts.json, result)
 	if result.Passed {
@@ -323,108 +148,93 @@ func runVerifyWith(opts verifyOptions, stdout, stderr io.Writer) int {
 	return ExitFindings
 }
 
-func emptyResult(started time.Time) contract.VerifyResult {
-	return contract.VerifyResult{
-		Passed:     true,
-		Findings:   []contract.Finding{},
-		Escapes:    map[string]int{},
-		DurationMs: time.Since(started).Milliseconds(),
-	}
+type cliVerifyRecorder struct {
+	recorder scanRecorder
 }
 
-const maxAutoCapturedMistakesPerRun = 5
-
-func autoCaptureVerifyMistakes(ctx context.Context, recorder scanRecorder, root string, findings []contract.Finding, source string, stderr io.Writer) {
-	mr, ok := recorder.(mistakeRecorder)
-	if !ok || mr == nil {
-		return
+func (r cliVerifyRecorder) RecordScan(ctx context.Context, projectPath string, durationMs int64, escapes int, passed bool) error {
+	if r.recorder == nil {
+		return nil
 	}
-	source = strings.TrimSpace(source)
-	if source == "" {
-		source = "auto_verify"
-	}
-	seen := make(map[string]struct{}, len(findings))
-	captured := 0
-	for _, f := range findings {
-		if captured >= maxAutoCapturedMistakesPerRun {
-			break
-		}
-		category := classifyFindingCategory(f)
-		summary := buildFindingSummary(f)
-		if summary == "" {
-			continue
-		}
-		fp := mistakeFingerprint(root, category, summary)
-		if _, dup := seen[fp]; dup {
-			continue
-		}
-		seen[fp] = struct{}{}
-		badSnippet := formatFindingSnippet(f)
-		if _, err := mr.RecordMistake(ctx, contract.Mistake{
-			ProjectPath: root,
-			Fingerprint: fp,
-			Category:    category,
-			Summary:     summary,
-			BadSnippet:  badSnippet,
-			Source:      source,
-			Status:      "pending",
-		}); err != nil {
-			fmt.Fprintf(stderr, "slopguard: warning: auto-capture mistake failed: %v\n", err)
-			return
-		}
-		captured++
-	}
+	return r.recorder.RecordScan(ctx, projectPath, durationMs, escapes, passed)
 }
 
-func classifyFindingCategory(f contract.Finding) string {
-	rule := strings.ToLower(strings.TrimSpace(f.Rule))
-	msg := strings.ToLower(strings.TrimSpace(f.Message))
-	switch {
-	case strings.Contains(rule, "ratchet") || strings.Contains(rule, "escape") || strings.Contains(msg, "baseline"):
-		return "escape"
-	case strings.Contains(rule, "import") || strings.Contains(msg, "import"):
-		return "import"
-	case strings.Contains(rule, "type") || rule == "tsc" || strings.Contains(rule, "mypy") || strings.Contains(rule, "pyright"):
-		return "type"
-	case strings.Contains(rule, "syntax") || strings.Contains(msg, "syntax"):
-		return "syntax"
-	default:
-		return "lint"
+func (r cliVerifyRecorder) RecordMistake(ctx context.Context, m contract.Mistake) (int, error) {
+	if mr, ok := r.recorder.(mistakeRecorder); ok && mr != nil {
+		return mr.RecordMistake(ctx, m)
 	}
+	return 0, nil
 }
 
-func buildFindingSummary(f contract.Finding) string {
-	rule := strings.TrimSpace(f.Rule)
-	msg := strings.TrimSpace(f.Message)
-	if len(msg) > 140 {
-		msg = msg[:140] + "..."
-	}
-	if rule != "" && msg != "" {
-		return fmt.Sprintf("[%s] %s", rule, msg)
-	}
-	if rule != "" {
-		return rule
-	}
-	return msg
-}
-
-func formatFindingSnippet(f contract.Finding) string {
-	loc := strings.TrimSpace(f.File)
-	if loc != "" && f.Line > 0 {
-		if f.Column > 0 {
-			loc = fmt.Sprintf("%s:%d:%d", loc, f.Line, f.Column)
-		} else {
-			loc = fmt.Sprintf("%s:%d", loc, f.Line)
+func buildVerifyHooks(deps dependencies) *verify.Hooks {
+	hooks := &verify.Hooks{}
+	if deps.engine != nil {
+		if provider, ok := deps.engine.(signalContextProvider); ok {
+			hooks.SignalContext = provider.SignalContext
+		}
+		hooks.LoadBaseline = func(path string) (verify.BaselineState, error) {
+			b, err := loadBaselineForVerify(deps.engine, path)
+			if err != nil {
+				return verify.BaselineState{}, err
+			}
+			return verify.BaselineState{
+				Metrics:         b.Metrics,
+				IsSuppressed:    b.IsSuppressed,
+				HasSuppressions: b.HasSuppressions,
+			}, nil
+		}
+		hooks.ListFiles = deps.engine.ListFiles
+		hooks.ChangedFiles = deps.engine.ChangedFiles
+		if lcp, ok := deps.engine.(lastCommitProvider); ok {
+			hooks.LastCommitFiles = lcp.LastCommitFiles
+		}
+		if cfp, ok := deps.engine.(commitFilesProvider); ok {
+			hooks.CommitFiles = cfp.CommitFiles
+		}
+		hooks.RunChecks = func(ctx context.Context, root string, jobs int, tasks []verify.CheckTask) ([]verify.CheckOutcome, error) {
+			cliTasks := make([]checkTask, len(tasks))
+			for i, t := range tasks {
+				cliTasks[i] = checkTask{AdapterName: t.AdapterName, Check: t.Check}
+			}
+			outcomes, err := deps.engine.RunChecks(ctx, root, jobs, cliTasks)
+			if err != nil {
+				return nil, err
+			}
+			out := make([]verify.CheckOutcome, len(outcomes))
+			for i, o := range outcomes {
+				out[i] = verify.CheckOutcome{
+					Task:   verify.CheckTask{AdapterName: o.Task.AdapterName, Check: o.Task.Check},
+					Result: o.Result,
+				}
+			}
+			return out, nil
+		}
+		hooks.ComputeEscapes = deps.engine.ComputeEscapes
+		hooks.Ratchet = func(escapes, baseline map[string]int) ([]contract.Finding, []contract.MetricDelta) {
+			return deps.engine.Ratchet(escapes, baseline), nil
 		}
 	}
-	msg := strings.TrimSpace(f.Message)
-	if loc != "" && msg != "" {
-		return loc + " — " + msg
+	if deps.adapters != nil {
+		hooks.DetectAdapters = deps.adapters.Detect
+		hooks.PlanChecks = func(root string, checks []contract.Check, _ bool, _ []string) (verify.CheckPlan, error) {
+			plan, err := deps.adapters.PlanChecks(root, checks)
+			if err != nil {
+				return verify.CheckPlan{}, err
+			}
+			return verify.CheckPlan{
+				Runnable:       plan.Runnable,
+				Skipped:        plan.Skipped,
+				SkippedDetails: plan.SkippedDetails,
+			}, nil
+		}
+		hooks.ParseFindings = deps.adapters.ParseFindings
 	}
-	if loc != "" {
-		return loc
+	if deps.ui != nil {
+		hooks.RunUISmoke = func(ctx context.Context, root string) (contract.UISmokeResult, error) {
+			return deps.ui.RunUISmoke(ctx, uiOptions{ProjectRoot: root})
+		}
 	}
-	return msg
+	return hooks
 }
 
 // loadBaselineForVerify uses the richer baseline view when the engine provides
@@ -472,10 +282,23 @@ func printHumanResult(w io.Writer, result contract.VerifyResult) {
 		default:
 			fmt.Fprintf(w, "%s: %s\n", f.Rule, f.Message)
 		}
+		if f.ActionHint != "" {
+			fmt.Fprintf(w, "  action_hint: %s\n", f.ActionHint)
+		}
 	}
 
 	if len(result.Escapes) > 0 {
 		fmt.Fprintf(w, "escape hatches: %s\n", formatIntMap(result.Escapes))
+	}
+	if len(result.Improvements) > 0 {
+		parts := make([]string, 0, len(result.Improvements))
+		for _, imp := range result.Improvements {
+			parts = append(parts, fmt.Sprintf("%s (%d)", imp.Name, imp.Delta))
+		}
+		fmt.Fprintf(w, "improvements: %s\n", strings.Join(parts, ", "))
+	}
+	if result.Hint != "" {
+		fmt.Fprintf(w, "hint: %s\n", result.Hint)
 	}
 	if result.Suppressed > 0 {
 		fmt.Fprintf(w, "suppressed files: %d\n", result.Suppressed)
@@ -494,6 +317,16 @@ func printHumanResult(w io.Writer, result contract.VerifyResult) {
 	} else if len(result.Skipped) > 0 {
 		fmt.Fprintf(w, "skipped checks: %s\n", strings.Join(result.Skipped, ", "))
 	}
+	if result.Ablation != nil {
+		switch result.Ablation.Status {
+		case "passed":
+			fmt.Fprintf(w, "ablation: passed (red=%dms, green=%dms)\n", result.Ablation.RedDurationMs, result.Ablation.GreenDurationMs)
+		case "skipped":
+			fmt.Fprintf(w, "ablation: skipped (%s)\n", result.Ablation.Reason)
+		default:
+			fmt.Fprintf(w, "ablation: failed (%s)\n", result.Ablation.Reason)
+		}
+	}
 	printUISmokeResult(w, result.UI)
 
 	status := "PASS"
@@ -511,30 +344,6 @@ func printHumanResult(w io.Writer, result contract.VerifyResult) {
 	}
 	fmt.Fprintf(w, "slopguard verify: %s (%d findings, %dms)\n",
 		status, len(result.Findings), result.DurationMs)
-}
-
-func firstNonEmptyLine(values ...string) string {
-	for _, value := range values {
-		for _, line := range strings.Split(strings.ReplaceAll(value, "\r\n", "\n"), "\n") {
-			line = strings.TrimSpace(line)
-			if line != "" {
-				if len(line) > 300 {
-					line = line[:300] + "..."
-				}
-				return line
-			}
-		}
-	}
-	return ""
-}
-
-func findAdapter(adapters []contract.Adapter, name string) contract.Adapter {
-	for _, adapter := range adapters {
-		if adapter.Name() == name {
-			return adapter
-		}
-	}
-	return nil
 }
 
 // filterAdaptersByName applies an optional allowlist from config.yaml. An empty
@@ -570,24 +379,6 @@ func filterSuppressedFiles(files []string, baseline baselineState) (kept, suppre
 		kept = append(kept, file)
 	}
 	return kept, suppressed
-}
-
-func countUniqueFiles(groups ...[]string) int {
-	seen := make(map[string]struct{})
-	for _, group := range groups {
-		for _, file := range group {
-			seen[file] = struct{}{}
-		}
-	}
-	return len(seen)
-}
-
-func sumEscapes(escapes map[string]int) int {
-	total := 0
-	for _, count := range escapes {
-		total += count
-	}
-	return total
 }
 
 func collectExtensions(adapters []contract.Adapter) []string {
@@ -629,58 +420,6 @@ func collectEscapePatterns(adapters []contract.Adapter) []contract.EscapePattern
 	}
 	sort.Slice(patterns, func(i, j int) bool { return patterns[i].Name < patterns[j].Name })
 	return patterns
-}
-
-func filterFilesByExtensions(files []string, extensions []string) []string {
-	set := make(map[string]struct{}, len(extensions))
-	for _, ext := range extensions {
-		set[strings.ToLower(ext)] = struct{}{}
-	}
-	out := make([]string, 0, len(files))
-	for _, file := range files {
-		if _, ok := set[strings.ToLower(filepath.Ext(file))]; ok {
-			out = append(out, file)
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
-// resolveScopePaths normalizes explicit file paths (relative or absolute) into
-// repository-relative paths suitable for engine checks and escape counting.
-func resolveScopePaths(root string, paths []string) []string {
-	seen := make(map[string]struct{}, len(paths))
-	out := make([]string, 0, len(paths))
-	for _, raw := range paths {
-		raw = strings.TrimSpace(raw)
-		if raw == "" {
-			continue
-		}
-		file := raw
-		if filepath.IsAbs(file) {
-			rel, err := filepath.Rel(root, file)
-			if err != nil {
-				continue
-			}
-			file = rel
-		} else {
-			file = filepath.Clean(filepath.FromSlash(file))
-		}
-		if file == "." || filepath.IsAbs(file) || strings.HasPrefix(file, ".."+string(filepath.Separator)) {
-			continue
-		}
-		info, err := os.Stat(filepath.Join(root, file))
-		if err != nil || info.IsDir() {
-			continue
-		}
-		if _, ok := seen[file]; ok {
-			continue
-		}
-		seen[file] = struct{}{}
-		out = append(out, file)
-	}
-	sort.Strings(out)
-	return out
 }
 
 func formatIntMap(values map[string]int) string {

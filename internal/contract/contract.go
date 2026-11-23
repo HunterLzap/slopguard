@@ -54,8 +54,9 @@ type Check struct {
 
 // EscapePattern 描述一个"逃生舱"指标（如 @ts-ignore、eslint-disable）。
 type EscapePattern struct {
-	Name  string // 指标 key，如 "ts_ignore"、"eslint_disable"
-	Regex string // 用于在变更文件里计数的正则
+	Name   string // 指标 key，如 "ts_ignore"、"eslint_disable"
+	Regex  string // 用于在变更文件里计数的正则
+	Target string // "code" | "comment" | "raw"（为空时由引擎自动推断）
 }
 
 // Adapter 适配一种技术栈：探测项目、提供检查与逃生舱规则。
@@ -88,12 +89,13 @@ const (
 
 // Finding 是一条具体的检查问题。
 type Finding struct {
-	File     string   `json:"file"`
-	Line     int      `json:"line,omitempty"`
-	Column   int      `json:"column,omitempty"`
-	Rule     string   `json:"rule"` // 来源检查，如 "tsc"、"eslint:no-restricted-syntax"
-	Message  string   `json:"message"`
-	Severity Severity `json:"severity"`
+	File       string   `json:"file"`
+	Line       int      `json:"line,omitempty"`
+	Column     int      `json:"column,omitempty"`
+	Rule       string   `json:"rule"` // 来源检查，如 "tsc"、"eslint:no-restricted-syntax"
+	Message    string   `json:"message"`
+	Severity   Severity `json:"severity"`
+	ActionHint string   `json:"action_hint,omitempty"`
 }
 
 // SkippedDetail 描述一项因工具缺失等原因被跳过的检查。
@@ -119,6 +121,24 @@ type UISmokeResult struct {
 	DurationMs int64 `json:"duration_ms"`
 }
 
+// MetricDelta 描述单个逃生舱指标的基线/当前值差异。
+type MetricDelta struct {
+	Name     string `json:"name"`
+	Baseline int    `json:"baseline"`
+	Current  int    `json:"current"`
+	Delta    int    `json:"delta"`
+}
+
+// AblationResult 记录 --ablation 自动消融验证的结果（RED -> GREEN）。
+type AblationResult struct {
+	Status          string   `json:"status"` // "passed" | "failed" | "skipped"
+	Reason          string   `json:"reason,omitempty"`
+	TestFiles       []string `json:"test_files,omitempty"`
+	ProdFiles       []string `json:"prod_files,omitempty"`
+	RedDurationMs   int64    `json:"red_duration_ms,omitempty"`
+	GreenDurationMs int64    `json:"green_duration_ms,omitempty"`
+}
+
 // VerifyResult 是一次 verify 运行的聚合结果。
 type VerifyResult struct {
 	Passed   bool      `json:"passed"`
@@ -127,6 +147,10 @@ type VerifyResult struct {
 	Escapes map[string]int `json:"escapes"`
 	// Baseline 是基线里对应指标的上限（无基线项省略）。
 	Baseline map[string]int `json:"baseline,omitempty"`
+	// Improvements 记录低于基线或净减少的逃生舱指标，提示可收紧基线。
+	Improvements []MetricDelta `json:"improvements,omitempty"`
+	// Hint 是非阻断性的后续建议（例如提示运行 slopguard baseline --tighten）。
+	Hint string `json:"hint,omitempty"`
 	// Suppressed 是被 baseline.suppressed_files 过滤掉的文件数。
 	Suppressed int `json:"suppressed,omitempty"`
 	// DurationMs 是本次 verify 的实际耗时（毫秒）。
@@ -135,6 +159,10 @@ type VerifyResult struct {
 	Skipped []string `json:"skipped,omitempty"`
 	// SkippedDetails 提供跳过检查的工具与原因（Phase 1 新增）。
 	SkippedDetails []SkippedDetail `json:"skipped_details,omitempty"`
+	// Warnings 记录非阻断提示（如缺少 baseline.json、持久化告警等）。
+	Warnings []string `json:"warnings,omitempty"`
+	// Ablation 是启用 --ablation 时的自动消融验证结果；未启用时省略。
+	Ablation *AblationResult `json:"ablation,omitempty"`
 	// UI 是启用 --ui 时的 Playwright 烟雾验证结果；未启用时省略。
 	UI *UISmokeResult `json:"ui,omitempty"`
 }

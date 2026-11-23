@@ -145,6 +145,14 @@ type CheckPlan struct {
 	Skipped  []SkippedCheck
 }
 
+// PlanOptions 控制检查计划对缺失外部工具的严格度。
+type PlanOptions struct {
+	// StrictTools 为 true 时，主工具及未标为 optional 的检查缺失将返回配置错误。
+	StrictTools bool
+	// RequiredTools 显式列出强制要求存在的工具名或检查 ID。
+	RequiredTools []string
+}
+
 // Service 把注册表与 Runner 组合成 CLI/引擎可直接使用的适配器服务。
 type Service struct {
 	registry *Registry
@@ -187,9 +195,21 @@ func (s *Service) Registry() *Registry {
 // 缺失的 optional 检查放入 Skipped；缺失的必需检查返回聚合错误。
 // 项目内 node_modules/.bin 与 .venv 中的本地工具会被优先解析。
 func PlanChecks(runner contract.Runner, projectRoot string, checks []contract.Check) (CheckPlan, error) {
+	return planChecksInternal(runner, projectRoot, checks, false, true, nil)
+}
+
+// PlanChecksWithOptions 按给定严格度探测检查依赖。
+// 默认（StrictTools=false 且未指定 RequiredTools）下，缺失工具一律优雅降级为 Skipped，
+// 不返回致命错误；仅在 StrictTools=true 或命中 RequiredTools 时返回缺失工具错误。
+func PlanChecksWithOptions(runner contract.Runner, projectRoot string, checks []contract.Check, opts PlanOptions) (CheckPlan, error) {
+	return planChecksInternal(runner, projectRoot, checks, opts.StrictTools, opts.StrictTools, opts.RequiredTools)
+}
+
+func planChecksInternal(runner contract.Runner, projectRoot string, checks []contract.Check, strictPrimary bool, enforceNonOptional bool, requiredTools []string) (CheckPlan, error) {
 	if runner == nil {
 		return CheckPlan{}, errors.New("adapter: nil runner")
 	}
+	requiredSet := normalizeRequiredTools(requiredTools)
 	var plan CheckPlan
 	var missing []string
 	for _, c := range checks {
@@ -200,17 +220,17 @@ func PlanChecks(runner contract.Runner, projectRoot string, checks []contract.Ch
 		tool := check.Cmd[0]
 		resolved, ok := resolveExecutable(runner, projectRoot, tool)
 		if !ok {
-			if check.Optional {
+			if !isToolRequired(check, tool, strictPrimary, enforceNonOptional, requiredSet) {
 				plan.Skipped = append(plan.Skipped, SkippedCheck{
 					ID:     check.ID,
-					Tool:   tool,
+					Tool:   filepath.Base(tool),
 					Reason: missingToolReason(tool),
 				})
 				continue
 			}
-			item := fmt.Sprintf("%s（%s）", check.ID, tool)
+			item := fmt.Sprintf("%s (%s)", check.ID, filepath.Base(tool))
 			if hint := installHintFor(tool); hint != "" {
-				item += "，安装：" + hint
+				item += ", install: " + hint
 			}
 			missing = append(missing, item)
 			continue
@@ -220,9 +240,47 @@ func PlanChecks(runner contract.Runner, projectRoot string, checks []contract.Ch
 		plan.Runnable = append(plan.Runnable, check)
 	}
 	if len(missing) > 0 {
-		return plan, fmt.Errorf("adapter: 缺少必需工具：%s", strings.Join(missing, "；"))
+		return plan, fmt.Errorf("adapter: missing required tools: %s", strings.Join(missing, "; "))
 	}
 	return plan, nil
+}
+
+func normalizeRequiredTools(tools []string) map[string]struct{} {
+	if len(tools) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(tools))
+	for _, t := range tools {
+		if trimmed := strings.ToLower(strings.TrimSpace(t)); trimmed != "" {
+			set[trimmed] = struct{}{}
+		}
+	}
+	return set
+}
+
+func isToolRequired(check contract.Check, tool string, strictPrimary, enforceNonOptional bool, required map[string]struct{}) bool {
+	if len(required) > 0 {
+		if _, ok := required[strings.ToLower(strings.TrimSpace(check.ID))]; ok {
+			return true
+		}
+		if _, ok := required[strings.ToLower(filepath.Base(tool))]; ok {
+			return true
+		}
+	}
+	if enforceNonOptional && !check.Optional {
+		return true
+	}
+	if !strictPrimary {
+		return false
+	}
+	// Built-in primary linters/typecheckers are enforced under --strict-tools,
+	// while auxiliary tools (knip/jscpd/semgrep) remain optional unless listed in RequiredTools.
+	switch strings.ToLower(strings.TrimSpace(check.ID)) {
+	case "tsc", "eslint", "ruff", "pyright":
+		return true
+	default:
+		return false
+	}
 }
 
 // resolveExecutable 优先解析项目内本地二进制，其次通过 Runner.LookPath 查找。
@@ -286,10 +344,11 @@ func installHintFor(tool string) string {
 }
 
 func missingToolReason(tool string) string {
+	base := filepath.Base(tool)
 	if hint := installHintFor(tool); hint != "" {
-		return fmt.Sprintf("未找到可执行文件 %q，已按 optional 跳过；安装提示：%s", tool, hint)
+		return fmt.Sprintf("%s (not found); install: %s", base, hint)
 	}
-	return fmt.Sprintf("未找到可执行文件 %q，已按 optional 跳过；请安装并确保在 PATH 中", tool)
+	return fmt.Sprintf("%s (not found); ensure it is installed and in PATH", base)
 }
 
 // fileExists 判断路径是否为存在的普通文件。

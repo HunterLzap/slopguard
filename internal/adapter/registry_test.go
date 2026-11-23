@@ -202,6 +202,49 @@ func TestService(t *testing.T) {
 	}
 }
 
+func TestPlanChecksBuiltInsDegradeGracefullyByDefault(t *testing.T) {
+	root := t.TempDir()
+	runner := &stubRunner{lookFn: func(name string) (string, bool) {
+		if name == "ruff" {
+			return "/usr/bin/ruff", true
+		}
+		return "", false
+	}}
+
+	// Python adapter with only ruff available: pyright and semgrep must degrade to Skipped.
+	pyChecks := NewPythonAdapter().Checks(root, []string{"app.py"})
+	plan, err := PlanChecks(runner, root, pyChecks)
+	if err != nil {
+		t.Fatalf("PlanChecks should degrade missing pyright, got err: %v", err)
+	}
+	if len(plan.Runnable) != 1 || plan.Runnable[0].ID != "ruff" {
+		t.Fatalf("runnable = %+v, want only ruff", plan.Runnable)
+	}
+	if len(plan.Skipped) != 2 || plan.Skipped[0].ID != "pyright" || !strings.Contains(plan.Skipped[0].Reason, "pyright (not found)") {
+		t.Fatalf("skipped = %+v, want pyright (not found) and semgrep", plan.Skipped)
+	}
+
+	// With StrictTools=true, missing primary tools (ruff/pyright) must fail.
+	if _, err := PlanChecksWithOptions(runner, root, pyChecks, PlanOptions{StrictTools: true}); err == nil {
+		t.Fatal("expected error under StrictTools=true when pyright is missing")
+	}
+
+	// With RequiredTools=["pyright"], missing pyright must fail even when StrictTools=false.
+	if _, err := PlanChecksWithOptions(runner, root, pyChecks, PlanOptions{RequiredTools: []string{"pyright"}}); err == nil {
+		t.Fatal("expected error when pyright is explicitly listed in RequiredTools")
+	}
+
+	// TS adapter with zero external tools available: all checks skipped, no error.
+	tsChecks := NewTypeScriptAdapter().Checks(root, []string{"src/a.ts"})
+	tsPlan, err := PlanChecksWithOptions(&stubRunner{lookFn: func(string) (string, bool) { return "", false }}, root, tsChecks, PlanOptions{})
+	if err != nil {
+		t.Fatalf("TS PlanChecksWithOptions with zero tools failed: %v", err)
+	}
+	if len(tsPlan.Runnable) != 0 || len(tsPlan.Skipped) < 2 {
+		t.Fatalf("tsPlan = %+v, want 0 runnable and skipped tools", tsPlan)
+	}
+}
+
 func writeTestFile(path, content string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err

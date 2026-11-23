@@ -63,9 +63,10 @@ func (a *TypeScriptAdapter) Checks(projectRoot string, files []string) []contrac
 			args = append(args, tsFiles...)
 		}
 		checks = append(checks, contract.Check{
-			ID:      "tsc",
-			Cmd:     append([]string{resolveTool(projectRoot, "tsc")}, args...),
-			Timeout: 120 * time.Second,
+			ID:       "tsc",
+			Cmd:      append([]string{resolveTool(projectRoot, "tsc")}, args...),
+			Optional: true,
+			Timeout:  120 * time.Second,
 		})
 	}
 
@@ -76,9 +77,10 @@ func (a *TypeScriptAdapter) Checks(projectRoot string, files []string) []contrac
 		eslintArgs = append(eslintArgs, ".")
 	}
 	checks = append(checks, contract.Check{
-		ID:      "eslint",
-		Cmd:     append([]string{resolveTool(projectRoot, "eslint")}, eslintArgs...),
-		Timeout: 120 * time.Second,
+		ID:       "eslint",
+		Cmd:      append([]string{resolveTool(projectRoot, "eslint")}, eslintArgs...),
+		Optional: true,
+		Timeout:  120 * time.Second,
 	})
 
 	checks = append(checks,
@@ -101,10 +103,10 @@ func (a *TypeScriptAdapter) Checks(projectRoot string, files []string) []contrac
 // EscapePatterns 返回 TS/JS 栈的逃生舱统计规则。
 func (a *TypeScriptAdapter) EscapePatterns() []contract.EscapePattern {
 	return []contract.EscapePattern{
-		{Name: "ts_ignore", Regex: `(?m)//\s*@ts-ignore`},
-		{Name: "ts_expect_error", Regex: `(?m)//\s*@ts-expect-error`},
-		{Name: "eslint_disable", Regex: `(?m)//\s*eslint-disable(?:-next-line|-line)?`},
-		{Name: "explicit_any", Regex: `(?m):\s*any\b`},
+		{Name: "ts_ignore", Regex: `(?m)//\s*@ts-ignore`, Target: "comment"},
+		{Name: "ts_expect_error", Regex: `(?m)//\s*@ts-expect-error`, Target: "comment"},
+		{Name: "eslint_disable", Regex: `(?m)(?://|/\*)\s*eslint-disable(?:-next-line|-line)?`, Target: "comment"},
+		{Name: "explicit_any", Regex: `(?m):\s*any\b`, Target: "code"},
 	}
 }
 

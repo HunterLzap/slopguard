@@ -59,14 +59,16 @@ func (a *PythonAdapter) Checks(projectRoot string, files []string) []contract.Ch
 
 	return []contract.Check{
 		{
-			ID:      "ruff",
-			Cmd:     append([]string{resolveTool(projectRoot, "ruff"), "check", "--output-format", "json"}, targets...),
-			Timeout: 60 * time.Second,
+			ID:       "ruff",
+			Cmd:      append([]string{resolveTool(projectRoot, "ruff"), "check", "--output-format", "json"}, targets...),
+			Optional: true,
+			Timeout:  60 * time.Second,
 		},
 		{
-			ID:      "pyright",
-			Cmd:     append([]string{resolveTool(projectRoot, "pyright"), "--outputjson"}, targets...),
-			Timeout: 120 * time.Second,
+			ID:       "pyright",
+			Cmd:      append([]string{resolveTool(projectRoot, "pyright"), "--outputjson"}, targets...),
+			Optional: true,
+			Timeout:  120 * time.Second,
 		},
 		{
 			ID:       "semgrep",
@@ -80,8 +82,8 @@ func (a *PythonAdapter) Checks(projectRoot string, files []string) []contract.Ch
 // EscapePatterns 返回 Python 栈的逃生舱统计规则。
 func (a *PythonAdapter) EscapePatterns() []contract.EscapePattern {
 	return []contract.EscapePattern{
-		{Name: "type_ignore_py", Regex: `(?m)#\s*type:\s*ignore(?:\[[^\]]*\])?`},
-		{Name: "noqa", Regex: `(?m)#\s*noqa\b`},
-		{Name: "pyright_ignore", Regex: `(?m)#\s*pyright:\s*ignore`},
+		{Name: "type_ignore_py", Regex: `(?m)#\s*type:\s*ignore(?:\[[^\]]*\])?`, Target: "comment"},
+		{Name: "noqa", Regex: `(?m)#\s*noqa\b`, Target: "comment"},
+		{Name: "pyright_ignore", Regex: `(?m)#\s*pyright:\s*ignore`, Target: "comment"},
 	}
 }

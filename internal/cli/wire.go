@@ -26,13 +26,14 @@ func init() {
 func defaultDependencies() (dependencies, error) {
 	runner := engine.NewExecRunner()
 	return dependencies{
-		engine:   productionEngine{runner: runner},
-		adapters: productionAdapters{runner: runner},
-		radar:    productionRadar{runner: runner},
-		recorder: productionRecorder{},
-		presets:  productionEngine{runner: runner},
-		ui:       productionUI{runner: runner},
-		runner:   runner,
+		isProduction: true,
+		engine:       productionEngine{runner: runner},
+		adapters:     productionAdapters{runner: runner},
+		radar:        productionRadar{runner: runner},
+		recorder:     productionRecorder{},
+		presets:      productionEngine{runner: runner},
+		ui:           productionUI{runner: runner},
+		runner:       runner,
 	}, nil
 }
 

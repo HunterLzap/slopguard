@@ -44,8 +44,9 @@ type yamlCheckConfig struct {
 }
 
 type yamlEscapeConfig struct {
-	Name  string `yaml:"name"`
-	Regex string `yaml:"regex"`
+	Name   string `yaml:"name"`
+	Regex  string `yaml:"regex"`
+	Target string `yaml:"target,omitempty"`
 }
 
 // YAMLAdapter 是由声明式 YAML 定义、实现 contract.Adapter 的适配器。
@@ -254,7 +255,7 @@ func newYAMLAdapter(cfg yamlAdapterConfig) (*YAMLAdapter, error) {
 		if _, err := regexp.Compile(escape.Regex); err != nil {
 			return nil, fmt.Errorf("escape pattern %q: invalid regex: %w", escapeName, err)
 		}
-		escapes = append(escapes, contract.EscapePattern{Name: escapeName, Regex: escape.Regex})
+		escapes = append(escapes, contract.EscapePattern{Name: escapeName, Regex: escape.Regex, Target: strings.ToLower(strings.TrimSpace(escape.Target))})
 	}
 
 	return &YAMLAdapter{

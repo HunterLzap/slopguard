@@ -180,13 +180,14 @@ type mistakeRecorder interface {
 }
 
 type dependencies struct {
-	engine   engineClient
-	adapters adapterProvider
-	radar    radarProvider
-	recorder scanRecorder
-	presets  presetProvider
-	ui       uiProvider
-	runner   contract.Runner
+	isProduction bool
+	engine       engineClient
+	adapters     adapterProvider
+	radar        radarProvider
+	recorder     scanRecorder
+	presets      presetProvider
+	ui           uiProvider
+	runner       contract.Runner
 }
 
 // newDependencies is replaced in wire.go with the production wiring. Tests can

@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/HunterLzap/slopguard/internal/contract"
 )
 
 // BaselineVersion 是当前 baseline.json 的 schema 版本。
@@ -124,12 +126,7 @@ func SaveBaseline(path string, baseline *Baseline) error {
 }
 
 // MetricDelta 描述单个逃生舱指标的基线/当前值差异。
-type MetricDelta struct {
-	Name     string `json:"name"`
-	Baseline int    `json:"baseline"`
-	Current  int    `json:"current"`
-	Delta    int    `json:"delta"`
-}
+type MetricDelta = contract.MetricDelta
 
 // RatchetResult 是棘轮比对结果：存量放行，增量拦截。
 type RatchetResult struct {

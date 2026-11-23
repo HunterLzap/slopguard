@@ -50,6 +50,8 @@ func Execute(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runUI(args[1:], stdout, stderr)
 	case "service":
 		return runService(args[1:], stdout, stderr)
+	case "hook":
+		return runHook(args[1:], stdout, stderr)
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return ExitOK
@@ -65,10 +67,11 @@ func printUsage(w io.Writer) {
 
 Usage:
   slopguard init     [--yes] [--presets] [--ui] [--root DIR]
-  slopguard verify   [--all] [--json] [--jobs N] [--record] [--ui] [--root DIR]
+  slopguard verify   [--all | --staged] [--ablation] [--strict-tools] [--json] [--jobs N] [--record] [--ui] [--root DIR]
   slopguard baseline [--tighten | --reset] [--yes] [--root DIR]
   slopguard radar    [--top N] [--json] [--root DIR]
   slopguard record   --summary TEXT [--category C] [--bad-snippet S] [--good-snippet S] [--project DIR]
+  slopguard hook     install | uninstall [--pre-commit] [--root DIR]
   slopguard mcp      [--root DIR]
   slopguard ui       [--port 7788] [--no-open]
   slopguard service  install | uninstall | status [--port 7788]

@@ -117,6 +117,87 @@ func (g *Git) ChangedFiles(ctx context.Context) ([]string, error) {
 	return existingFiles(g.dir, set), nil
 }
 
+// StagedFiles 返回暂存区中新增、复制、修改或重命名的现有文件列表（--staged）。
+func (g *Git) StagedFiles(ctx context.Context) ([]string, error) {
+	out, err := g.output(ctx, "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR", "--")
+	if err != nil {
+		return nil, err
+	}
+	files := ParseNameOnly(out)
+	set := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		if file != "" {
+			set[file] = struct{}{}
+		}
+	}
+	return existingFiles(g.dir, set), nil
+}
+
+// UntrackedFiles 返回工作区中未被 Git 跟踪且未被忽略的现有文件。
+func (g *Git) UntrackedFiles(ctx context.Context) ([]string, error) {
+	changes, err := g.Status(ctx)
+	if err != nil {
+		return nil, err
+	}
+	set := make(map[string]struct{})
+	for _, change := range changes {
+		if strings.HasPrefix(change.Status, "?") && change.Path != "" {
+			set[change.Path] = struct{}{}
+		}
+	}
+	return existingFiles(g.dir, set), nil
+}
+
+// DiffOptions 控制 Unified Diff 采集模式。
+type DiffOptions struct {
+	Staged     bool
+	LastCommit bool
+	CommitSHA  string
+}
+
+// UnifiedDiff 返回对应模式下的统一 diff 文本（--unified=0 --no-color --no-renames）。
+func (g *Git) UnifiedDiff(ctx context.Context, opts DiffOptions) (string, error) {
+	switch {
+	case strings.TrimSpace(opts.CommitSHA) != "":
+		rev := strings.TrimSpace(opts.CommitSHA)
+		if strings.HasPrefix(rev, "-") {
+			return "", fmt.Errorf("engine: invalid git revision %q", rev)
+		}
+		return g.output(ctx, "show", "--format=", "--unified=0", "--no-color", "--no-renames", rev, "--")
+	case opts.LastCommit:
+		if !g.hasHEAD(ctx) {
+			return "", nil
+		}
+		return g.output(ctx, "show", "--format=", "--unified=0", "--no-color", "--no-renames", "HEAD", "--")
+	case opts.Staged:
+		return g.output(ctx, "diff", "--cached", "--unified=0", "--no-color", "--no-renames", "--")
+	default:
+		if g.hasHEAD(ctx) {
+			return g.output(ctx, "diff", "--unified=0", "--no-color", "--no-renames", "HEAD", "--")
+		}
+		return g.output(ctx, "diff", "--cached", "--unified=0", "--no-color", "--no-renames", "--")
+	}
+}
+
+// ShowObject 读取 Git 对象内容（如 ":path" 读取暂存区，"HEAD:path" 读取基线版本）。
+// 对象不存在时返回 ok=false 且 err=nil。
+func (g *Git) ShowObject(ctx context.Context, spec string) (content string, ok bool, err error) {
+	if g == nil || strings.TrimSpace(spec) == "" {
+		return "", false, nil
+	}
+	res := g.raw(ctx, "cat-file", "-p", spec)
+	if res.Skipped {
+		return "", false, errors.New("engine: git executable not found")
+	}
+	if res.Err != nil {
+		return "", false, res.Err
+	}
+	if res.ExitCode != 0 {
+		return "", false, nil
+	}
+	return res.Stdout, true, nil
+}
+
 // LastCommitFiles 返回最近一次提交（HEAD）中新增、复制、修改或重命名的文件列表，
 // 仅保留当前工作区仍存在的文件。仓库尚无 HEAD 提交时返回空切片。
 func (g *Git) LastCommitFiles(ctx context.Context) ([]string, error) {

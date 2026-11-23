@@ -272,7 +272,7 @@ func TestRunIncrementalDiffRatchetProbesAndStaged(t *testing.T) {
 	}
 
 	realRunner := engine.NewExecRunner()
-	t.Setenv("PATH", filepath.Dir(mustWhichGit(t))+":"+t.TempDir())
+	t.Setenv("PATH", filepath.Dir(mustWhichGit(t))+string(os.PathListSeparator)+t.TempDir())
 
 	// --staged sees ONLY the staged removal -> passes and reports Improvements + tighten hint!
 	stagedRes, err := Run(context.Background(), Options{ProjectRoot: repo, Staged: true, Runner: realRunner})

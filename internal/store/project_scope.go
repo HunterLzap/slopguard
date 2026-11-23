@@ -37,6 +37,7 @@ func projectPathVariants(projectPath string) ([]string, error) {
 		add(filepath.Clean(abs))
 	}
 	add(filepath.Clean(trimmed))
+	add(trimmed)
 	if runtime.GOOS == "darwin" {
 		for _, item := range append([]string(nil), out...) {
 			if strings.HasPrefix(item, "/private/var/") {
